@@ -48,9 +48,10 @@ from langgraph_agent.config import (  # noqa: E402
     AGENTS,
     get_agent_model_info,
     get_agent_status,
+    list_ollama_models,
+    ollama_model_capabilities,
     set_agent_llm,
     set_agent_thinking,
-    is_local_ollama_model,
 )
 from langgraph_agent.control import ACTIVITY, EMBEDDER_ACTIVITY, RUN_CONTROL  # noqa: E402
 from langgraph_agent.corpus_health import (  # noqa: E402
@@ -679,13 +680,25 @@ def rpc_set_thinking(params: dict[str, Any]) -> dict[str, Any]:
 
 def rpc_llm_options(_: dict[str, Any]) -> dict[str, Any]:
     """Model choices for the seat dropdowns: only those models that are
-    available locally via `ollama ls`.
+    actually downloaded and available locally via `ollama ls`.
 
-    Other tags the daemon carries are not offered, so pulling a model does not
-    put it in front of a seat.
+    The list is queried from the daemon on each call so it always reflects
+    what is currently installed. A model must be pulled before it can be
+    seated; pulling does not automatically add it to the dropdown.
     """
-    local_options = [opt for opt in AGENT_LLM_OPTIONS if is_local_ollama_model(opt["model"])]
-    return {"options": local_options}
+    local_tags = list_ollama_models()
+    if not local_tags:
+        return {"options": []}
+
+    options = []
+    for tag in local_tags:
+        # Skip embedding models -- they report no completion capability
+        caps = ollama_model_capabilities(tag)
+        if caps is not None and "completion" not in caps:
+            continue
+        options.append({"label": tag, "provider": "ollama", "model": tag, "group": "Ollama (local)"})
+
+    return {"options": options}
 
 
 def _embedding_choice() -> dict[str, Any]:

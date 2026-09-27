@@ -131,15 +131,40 @@ def test_a_seat_takes_only_a_model_the_console_offers(provider, model):
     assert get_agent_model_info("planner") == before
 
 
-def test_the_seat_dropdowns_offer_exactly_the_curated_models():
-    """Tags the daemon carries beyond the list are not offered."""
-    from langgraph_agent.config import AGENT_LLM_OPTIONS
+def test_the_seat_dropdowns_query_the_daemon_for_local_models(monkeypatch):
+    """The dropdowns are populated from `ollama list`, not a hardcoded list.
 
-    assert serve.rpc_llm_options({}) == {"options": AGENT_LLM_OPTIONS}
-    assert [o["model"] for o in AGENT_LLM_OPTIONS] == [
-        "kimi-k3:cloud", "qwen3.5:397b-cloud", "qwen3.8:latest",
-        "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M",
-    ]
+    A model must be pulled before it appears; tags the daemon carries beyond
+    what is locally installed are not offered. Embedding models (no completion
+    capability) are filtered out.
+    """
+    # Mock the daemon to return specific local models
+    def mock_list_ollama_models():
+        return ["qwen3.8:latest", "dolphin-2.9.1-yi-1.5-9b:Q4_K_M", "qwen3-embedding:latest"]
+
+    def mock_ollama_model_capabilities(model):
+        if model == "qwen3-embedding:latest":
+            return ["embedding"]  # no completion
+        return ["completion", "tools", "thinking"]
+
+    # The functions are imported at module level in serve.py, so patch there
+    monkeypatch.setattr(serve, "list_ollama_models", mock_list_ollama_models)
+    monkeypatch.setattr(serve, "ollama_model_capabilities", mock_ollama_model_capabilities)
+
+    result = serve.rpc_llm_options({})
+    options = result["options"]
+
+    # Should have 2 models (embedding model filtered out)
+    assert len(options) == 2
+    models = [o["model"] for o in options]
+    assert "qwen3.8:latest" in models
+    assert "dolphin-2.9.1-yi-1.5-9b:Q4_K_M" in models
+    assert "qwen3-embedding:latest" not in models
+
+    # All should be ollama provider with local group
+    for o in options:
+        assert o["provider"] == "ollama"
+        assert o["group"] == "Ollama (local)"
 
 
 # ---------------------------------------------------------------------------
