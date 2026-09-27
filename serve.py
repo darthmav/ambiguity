@@ -50,6 +50,7 @@ from langgraph_agent.config import (  # noqa: E402
     get_agent_status,
     set_agent_llm,
     set_agent_thinking,
+    is_local_ollama_model,
 )
 from langgraph_agent.control import ACTIVITY, EMBEDDER_ACTIVITY, RUN_CONTROL  # noqa: E402
 from langgraph_agent.corpus_health import (  # noqa: E402
@@ -677,12 +678,14 @@ def rpc_set_thinking(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def rpc_llm_options(_: dict[str, Any]) -> dict[str, Any]:
-    """Model choices for the seat dropdowns: `AGENT_LLM_OPTIONS`, and nothing else.
+    """Model choices for the seat dropdowns: only those models that are
+    available locally via `ollama ls`.
 
     Other tags the daemon carries are not offered, so pulling a model does not
     put it in front of a seat.
     """
-    return {"options": AGENT_LLM_OPTIONS}
+    local_options = [opt for opt in AGENT_LLM_OPTIONS if is_local_ollama_model(opt["model"])]
+    return {"options": local_options}
 
 
 def _embedding_choice() -> dict[str, Any]:
