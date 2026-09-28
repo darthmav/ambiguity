@@ -132,10 +132,12 @@ def test_a_seat_takes_only_a_model_the_console_offers(provider, model):
 
 
 def test_the_seat_dropdowns_query_the_daemon_for_local_models(monkeypatch):
-    """The dropdowns are populated from `ollama list`, not a hardcoded list.
+    """The dropdowns are populated from AGENT_LLM_OPTIONS (cloud models) plus
+    locally downloaded models from the daemon.
 
-    A model must be pulled before it appears; tags the daemon carries beyond
-    what is locally installed are not offered. Embedding models (no completion
+    Cloud models (tags ending in :cloud) work via the daemon proxy and don't
+    need to be pulled locally. Local models are queried from the daemon and
+    filtered for completion capability. Embedding models (no completion
     capability) are filtered out.
     """
     # Mock the daemon to return specific local models
@@ -154,15 +156,26 @@ def test_the_seat_dropdowns_query_the_daemon_for_local_models(monkeypatch):
     result = serve.rpc_llm_options({})
     options = result["options"]
 
-    # Should have 2 models (embedding model filtered out)
-    assert len(options) == 2
+    # Should have cloud models from AGENT_LLM_OPTIONS (kimi-k3:cloud, qwen3.5:397b-cloud)
+    # plus 2 local models (embedding model filtered out)
     models = [o["model"] for o in options]
+    # Cloud models from AGENT_LLM_OPTIONS
+    assert "kimi-k3:cloud" in models
+    assert "qwen3.5:397b-cloud" in models
+    # Local models from daemon
     assert "qwen3.8:latest" in models
     assert "dolphin-2.9.1-yi-1.5-9b:Q4_K_M" in models
+    # Embedding model filtered out
     assert "qwen3-embedding:latest" not in models
 
-    # All should be ollama provider with local group
-    for o in options:
+    # Cloud models should have "Ollama Cloud" group, local models "Ollama (local)"
+    # Check for both :cloud and -cloud suffixes like the implementation does
+    cloud_models = [o for o in options if o["model"].endswith((":cloud", "-cloud"))]
+    local_models = [o for o in options if not o["model"].endswith((":cloud", "-cloud"))]
+    for o in cloud_models:
+        assert o["provider"] == "ollama"
+        assert o["group"] == "Ollama Cloud"
+    for o in local_models:
         assert o["provider"] == "ollama"
         assert o["group"] == "Ollama (local)"
 

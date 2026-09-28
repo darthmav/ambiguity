@@ -637,6 +637,7 @@ def rpc_set_seat(params: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"Unknown agent: {agent!r}")
     if not provider or not model:
         raise ValueError("Provider and model are both required")
+
     # The dropdowns are the whole list, so a tab still showing an older one
     # cannot seat a model the console no longer offers. A seat's *own* current
     # model is the one exception, and it is not a courtesy: the console renders
@@ -645,6 +646,17 @@ def rpc_set_seat(params: dict[str, Any]) -> dict[str, Any]:
     # refusing it makes that option unselectable and the only way back to where
     # the process started is editing `.env` and restarting.
     allowed = {(o["provider"], o["model"]) for o in AGENT_LLM_OPTIONS}
+
+    # Also allow any locally downloaded Ollama model that reports `completion`
+    # capability. The dropdown (llm_options) is built from this same list, so
+    # anything the user can select there should be accepted here.
+    if provider == "ollama":
+        local_tags = list_ollama_models()
+        for tag in local_tags:
+            caps = ollama_model_capabilities(tag)
+            if caps is not None and "completion" in caps:
+                allowed.add(("ollama", tag))
+
     # `get_agent_model_info`, not `get_agent_status`: this asks a pure config
     # question -- which model is seated -- and the status call answers a live
     # one, reaching the daemon for `list_ollama_models` and `thinking_support`
@@ -652,8 +664,17 @@ def rpc_set_seat(params: dict[str, Any]) -> dict[str, Any]:
     # the seat the same way two lines below.
     seated = get_agent_model_info(agent)
     allowed.add((seated["provider"], seated["model"]))
+
     if (provider, model) not in allowed:
         offered = ", ".join(o["model"] for o in AGENT_LLM_OPTIONS)
+        # Include locally available models in the error message for clarity
+        local_completion = []
+        for tag in list_ollama_models():
+            caps = ollama_model_capabilities(tag)
+            if caps is not None and "completion" in caps:
+                local_completion.append(tag)
+        if local_completion:
+            offered += "; locally available: " + ", ".join(local_completion)
         raise ValueError(f"{model!r} is not a seat model the console offers: {offered}")
 
     set_agent_llm(agent, provider, model)
@@ -679,22 +700,37 @@ def rpc_set_thinking(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def rpc_llm_options(_: dict[str, Any]) -> dict[str, Any]:
-    """Model choices for the seat dropdowns: only those models that are
-    actually downloaded and available locally via `ollama ls`.
+    """Model choices for the seat dropdowns: cloud models that work via the
+    daemon proxy, plus locally downloaded models that report `completion`
+    capability.
 
-    The list is queried from the daemon on each call so it always reflects
-    what is currently installed. A model must be pulled before it can be
-    seated; pulling does not automatically add it to the dropdown.
+    Cloud models (tags ending in `:cloud` or `-cloud`) are proxied to
+    ollama.com by the local daemon and do not need to be pulled locally.
+    Local models are queried from the daemon on each call so the list always
+    reflects what is currently installed.
     """
-    local_tags = list_ollama_models()
-    if not local_tags:
-        return {"options": []}
-
     options = []
+
+    # Cloud models from AGENT_LLM_OPTIONS -- these work via the daemon proxy
+    # and don't need to be downloaded locally.
+    for opt in AGENT_LLM_OPTIONS:
+        if opt["provider"] == "ollama" and opt["model"].endswith((":cloud", "-cloud")):
+            options.append({
+                "label": opt["label"],
+                "provider": "ollama",
+                "model": opt["model"],
+                "group": opt["group"],
+            })
+
+    # Local models that report `completion` capability
+    local_tags = list_ollama_models()
     for tag in local_tags:
         # Skip embedding models -- they report no completion capability
         caps = ollama_model_capabilities(tag)
         if caps is not None and "completion" not in caps:
+            continue
+        # Don't duplicate cloud models that might also be pulled locally
+        if any(o["model"] == tag for o in options):
             continue
         options.append({"label": tag, "provider": "ollama", "model": tag, "group": "Ollama (local)"})
 
