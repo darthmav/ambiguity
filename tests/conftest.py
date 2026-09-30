@@ -163,3 +163,17 @@ def _no_planner_project_map(monkeypatch):
     that exercise the map turn it back on and answer the search themselves.
     """
     monkeypatch.setattr(_nodes, "PLANNER_PROJECT_MAP", False)
+
+
+@pytest.fixture
+def whole_root_walk(monkeypatch):
+    """Walk the whole root rather than only the archive directories.
+
+    For the tests of the walk's *mechanics* -- pruning, vector reuse, staleness,
+    the rebuild's phases -- which lay files out at the top of a scratch tree and
+    do not care which directories the real corpus is confined to. Which
+    directories that is has tests of its own (`test_corpus_roots.py`).
+    """
+    import langgraph_agent.graphrag_server as _graphrag
+
+    monkeypatch.setattr(_graphrag, "CORPUS_ROOTS", ("",))

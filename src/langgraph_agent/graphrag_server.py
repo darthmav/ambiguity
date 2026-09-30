@@ -38,7 +38,7 @@ from langgraph_agent.lexical import (
     lexical_order,
     reciprocal_rank_fusion,
 )
-from langgraph_agent.projects import embedded_projects, held_out_of_corpus
+from langgraph_agent.projects import PROJECTS_DIR, embedded_projects, held_out_of_corpus
 
 # The embedding model that builds and searches the corpus: an Ollama tag the
 # local daemon runs. Named once because three places have to agree on it: the
@@ -1876,6 +1876,14 @@ WEB_RESEARCH_DIR = "research/web"
 # written as given is a file the reindex cannot see.
 INDEXABLE_SUFFIXES = tuple(sorted({Path(pattern).suffix for pattern in PROJECT_INDEX_PATTERNS}))
 
+# The only directories the walk reads. The corpus holds researched archive data
+# -- pages the online research phase fetched -- and what the operator embedded
+# on purpose: an upload, or a generated project opted in. The checkout itself
+# (README, CLAUDE.md, install.sh, config) is the program, not knowledge, and a
+# console coming up used to embed it unasked. Everything outside these roots is
+# pruned from the store by the next rebuild.
+CORPUS_ROOTS = (WEB_RESEARCH_DIR, UPLOADS_DIR, PROJECTS_DIR)
+
 
 def _is_web_document(doc_id: str) -> bool:
     """True for a page the online research phase fetched.
@@ -2078,25 +2086,31 @@ def store_uploaded_document(
 
 
 def iter_project_files(
-    root: str = ".", exclude_dirs: tuple[str, ...] | list[str] | None = None
+    root: str = ".",
+    exclude_dirs: tuple[str, ...] | list[str] | None = None,
+    roots: tuple[str, ...] | None = None,
 ) -> list[Path]:
-    """Collect the project files worth indexing.
+    """Collect the archive files worth indexing.
 
-    A run's generated project under `projects/` is walked only once the
-    operator has opted it in -- see `langgraph_agent.projects`.
+    Only `CORPUS_ROOTS` are walked, never the checkout as a whole: the corpus
+    is research and what the operator deliberately embedded. A run's generated
+    project under `projects/` is walked only once the operator has opted it in
+    -- see `langgraph_agent.projects`. `roots` overrides `CORPUS_ROOTS` for a
+    caller that audits something other than the corpus; `("",)` is the root.
     """
     excludes = tuple(exclude_dirs) if exclude_dirs is not None else PROJECT_INDEX_EXCLUDES
     root_path = Path(root)
     embedded = embedded_projects(root_path)
 
     files: list[Path] = []
-    for pattern in PROJECT_INDEX_PATTERNS:
-        for file_path in root_path.glob(pattern):
-            if any(excluded in str(file_path) for excluded in excludes):
-                continue
-            if held_out_of_corpus(file_path.relative_to(root_path), embedded):
-                continue
-            files.append(file_path)
+    for corpus_root in CORPUS_ROOTS if roots is None else roots:
+        for pattern in PROJECT_INDEX_PATTERNS:
+            for file_path in (root_path / corpus_root).glob(pattern):
+                if any(excluded in str(file_path) for excluded in excludes):
+                    continue
+                if held_out_of_corpus(file_path.relative_to(root_path), embedded):
+                    continue
+                files.append(file_path)
     return sorted(set(files))
 
 

@@ -1326,7 +1326,9 @@ def _rebuild_the_corpus(
     """
     state, _ = corpus_state()
     files = iter_project_files()
-    if not files:
+    # An empty walk over an existing store is still work: whatever the store
+    # holds is no longer in the archive and has to be pruned.
+    if not files and state == "absent":
         return {"source": "nothing_to_index", "corpus": state, "root": str(Path.cwd())}
 
     announce(len(files))
@@ -1441,15 +1443,15 @@ def _index_the_project_at_startup(when: str = "at startup") -> None:
     # lands in. `announce` then names the count once there is one.
     with _run_lock:
         _startup_index["running"] = True
-        _startup_index["message"] = "checking the project against the corpus"
+        _startup_index["message"] = "checking the archive against the corpus"
 
     def announce(total: int) -> None:
         with _run_lock:
             _startup_index["message"] = (
-                f"checking {total} project file(s) against the corpus"
+                f"checking {total} archive file(s) against the corpus"
             )
         print(
-            f"[Corpus] Checking {total} project file(s) against the "
+            f"[Corpus] Checking {total} archive file(s) against the "
             f"{EMBEDDING_MODEL_NAME} corpus."
         )
 
@@ -1604,7 +1606,7 @@ def _index_the_project_before_the_run() -> dict[str, Any]:
         # said what it is doing rather than a silence.
         with _run_lock:
             _run_progress["messages"] = [
-                f"[Corpus] Checking {total} project file(s) against the {EMBEDDING_MODEL_NAME} "
+                f"[Corpus] Checking {total} archive file(s) against the {EMBEDDING_MODEL_NAME} "
                 "corpus before the run starts."
             ]
 
@@ -1613,7 +1615,7 @@ def _index_the_project_before_the_run() -> dict[str, Any]:
         # rather than wedged.
         with _run_lock:
             _run_progress["messages"] = [
-                f"[Corpus] Indexing with {EMBEDDING_MODEL_NAME}: {done} of {total} project file(s) "
+                f"[Corpus] Indexing with {EMBEDDING_MODEL_NAME}: {done} of {total} archive file(s) "
                 "checked."
             ]
 
@@ -1729,10 +1731,10 @@ def _corpus_feed_line(report: dict[str, Any], *, when: str = "before the run") -
         )
     if source == "nothing_to_index":
         return (
-            "[Corpus] There is nothing here to index -- no "
-            f"{', '.join(INDEXABLE_SUFFIXES)} files under "
-            f"{report.get('root', '.')}. The Researcher will find nothing; start "
-            "the console from the project you mean to work on."
+            "[Corpus] The archive is empty -- nothing researched online, "
+            f"uploaded or embedded under {report.get('root', '.')}. The Researcher "
+            "will find nothing; tick 'Research online' or upload a document to "
+            "give it something."
         )
     if source == "busy_elsewhere":
         # Neither a failure nor a no-op, and it must read as neither: the work is

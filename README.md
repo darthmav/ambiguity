@@ -54,17 +54,19 @@ reindex regenerates them.
 holding an empty index — the same shape a reindex leaves behind. It arms on the
 first click and disarms itself after a few seconds.
 
-**Every run brings the corpus up to date, and there is nothing to press.**
-There is no Reindex button. A run indexes the project before the Architect
-opens — building the corpus when there is none, and re-reading whatever has
-changed since when there is — so the seats always search the project as it is
-now. That is affordable because a document whose text has not changed keeps the
-vectors it already has: measured on this project, 52.0s to embed all 77 files
-and 0.09s for a rebuild with nothing to do. Without it a fresh install runs
-happily against no corpus at all — the search answers "no corpus", each
-Researcher falls back to its own model, and nothing reports a problem — and a
-corpus built once drifts from the project in exactly the same silence. Two things index and nothing else does — a run, and embedding a document into
-the corpus from the console; there is no script, no install step and no button.
+**The corpus is an archive, not the project.** It holds exactly three things:
+pages the online research phase fetched (`research/web/`), documents you
+uploaded (`uploads/`), and generated projects you opted in (`projects/<name>`).
+The checkout itself — README, CLAUDE.md, install.sh, config, source — is never
+walked or embedded, so a fresh install has no corpus at all until you research
+or upload something.
+
+**Every run brings that archive's index up to date, and there is nothing to
+press.** There is no Reindex button. A run, and the console coming up, re-read
+whatever has changed in those three places and prune whatever has left them. A
+document whose text has not changed keeps the vectors it already has, so a
+rebuild with nothing to do costs well under a second and never loads the
+embedding model.
 Set `INDEX_PROJECT_BEFORE_RUN=0` for a machine that wants its corpus frozen.
 Indexing being the only act that creates the store is why the header keeps
 three states apart: *absent* (nobody has indexed here),
@@ -182,8 +184,8 @@ than assuming it: the embedder embeds, the database answers a query, git and gh
 can finish the Builder's pipeline, the console starts, and every seat answers a
 test prompt. It is safe to re-run.
 
-It builds no corpus — the first run indexes the project before the Architect
-opens. The GPU driver is the machine's own setup (Omarchy installs it), but
+It builds no corpus — the corpus holds only what you research or upload.
+The GPU driver is the machine's own setup (Omarchy installs it), but
 where the embedding model runs is not left to chance: the app loads it with
 every layer on the GPU, and on NVIDIA cards below compute capability 7.5 —
 the Maxwell, Pascal and Volta cards Omarchy drives with its `nvidia-580xx`

@@ -33,6 +33,9 @@ import pytest
 import serve
 from langgraph_agent import graphrag_server
 
+# The walk's mechanics, laid out at the top of a scratch tree.
+pytestmark = pytest.mark.usefixtures("whole_root_walk")
+
 
 @pytest.fixture(autouse=True)
 def idle(monkeypatch):

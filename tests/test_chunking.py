@@ -37,6 +37,9 @@ from langgraph_agent.graphrag_server import (
     index_project_files,
 )
 
+# The walk's mechanics, laid out at the top of a scratch tree.
+pytestmark = pytest.mark.usefixtures("whole_root_walk")
+
 
 class _FakeTokenizer:
     """A word-piece stand-in: runs of non-space text, split every `piece` chars.

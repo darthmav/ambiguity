@@ -16,15 +16,20 @@ import sys
 
 import ollama
 
-from langgraph_agent.config import LLM_TIMEOUT_SECONDS, _ollama_base_url
+from langgraph_agent.config import (
+    LLM_TIMEOUT_SECONDS,
+    _ollama_base_url,
+    free_the_cards_for,
+    is_local_ollama_model,
+)
+from langgraph_agent.control import GPU_ARBITER
 
 # The same local tag the Architect/Planner/Researcher seats default to
 # (config.DEFAULT_SEATS): 5.3 GB, which loads 100% onto the cards on its own
 # (`qwen3.8:latest`, at 17 GB against 6 GB of VRAM, never does). It does not
 # fit beside `qwen3-embedding:latest` -- the two want roughly 10 GB of that
-# 6 GB, which is why the seats go through `GPU_ARBITER` and evict the embedder
-# first. This script does neither, so the placement it gets is whatever the
-# daemon makes of the cards as it finds them; `ollama ps` shows the split.
+# 6 GB, so this script takes `GPU_ARBITER` and evicts whatever else is
+# resident first, exactly as the seats do.
 DEFAULT_MODEL = "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M"
 
 
@@ -46,10 +51,14 @@ def send_prompt(prompt: str, model: str = DEFAULT_MODEL) -> str:
     any caller to catch.
     """
     client = ollama.Client(host=_ollama_base_url(), timeout=LLM_TIMEOUT_SECONDS)
-    reply = client.chat(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    # One model on the cards at a time, the same way every seat takes them.
+    with GPU_ARBITER.exclusive(f"script:{model}"):
+        if is_local_ollama_model(model):
+            free_the_cards_for(model)
+        reply = client.chat(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+        )
     return reply.message.content or ""
 
 

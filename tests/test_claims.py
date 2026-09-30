@@ -480,9 +480,14 @@ def _capital_census(root: Path = ROOT) -> dict[str, dict[str, int | set[str]]]:
     ran -- the guard that cannot run pins nothing, one level up from the guard
     that cannot fail. An audit of what the *project* is about should not move
     because somebody uploaded a PDF's worth of prose to their own console.
+
+    **It walks the checkout, not the corpus.** The corpus holds research and
+    deliberate embeds only (`CORPUS_ROOTS`), which a clean checkout has none
+    of, so a census of it would pass vacuously. What is audited is the entity
+    extractor's behaviour on the prose this project writes.
     """
     census: dict[str, dict] = {}
-    for path in iter_project_files(str(root)):
+    for path in iter_project_files(str(root), roots=("",)):
         if (not _mints_entities(str(path)) or _is_upload(str(path))
                 or _is_generated_project(str(path), root)):
             continue

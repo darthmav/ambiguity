@@ -84,6 +84,7 @@ python example_usage.py
 │   ├── test_git_dwell.py      # The ordered git pipeline, and its two refusals
 │   ├── test_claims.py         # Documentation claims, made executable
 │   ├── test_corpus_absent.py  # The two doors: reading never creates a corpus
+│   ├── test_corpus_roots.py   # The corpus is research and deliberate embeds, never the checkout
 │   ├── test_graph.py          # Pytest suite
 │   ├── test_diagnose_seats.py # Guards the seat diagnostic's verdicts
 │   ├── test_thinking.py       # Per-seat capability: the thinking switch, and tool support
@@ -320,12 +321,12 @@ a Builder that runs programs. No CORS header is sent; the page is same-origin.
   since deleting files moves it too -- and the pinned top-twenty in
   `test_claims.py` is what tells you it has.
 - `PROJECT_INDEX_EXCLUDES` entries are matched as plain substrings, not globs.
-- **The corpus never indexes this program's own source.** `src/`, `tests/`,
-  `prompts/`, `frontend/` and `spectral_graph/` are in `PROJECT_INDEX_EXCLUDES`,
-  so GraphRAG holds project knowledge -- docs, config, whatever a run is
-  actually about -- rather than the four agents' own code and prompts. An
-  operator who wants the source searchable opts it in the same way as any
-  other document: upload it, or embed a generated project explicitly.
+- **The corpus is researched archive data, never the checkout.** The walk reads
+  `CORPUS_ROOTS` alone -- `research/web/`, `uploads/`, and `projects/<name>`
+  once opted in -- so a fresh install has no corpus, and anything else in the
+  store is pruned by the next rebuild. An operator who wants a checkout file
+  searchable uploads it. The entity census in `test_claims.py` walks the
+  checkout explicitly (`roots=("",)`): it audits the extractor, not the corpus.
 - **There is exactly one embedding model** (`EMBEDDING_MODEL_NAME`), a corpus
   belongs to it, and `set_embedding_model` refuses: vectors from two models
   share no space. The chunker cuts with that model's own tokenizer.
@@ -333,7 +334,10 @@ a Builder that runs programs. No CORS header is sent; the page is same-origin.
   `OLLAMA_EMBED_OPTIONS` and `OLLAMA_SEAT_GPU_OPTIONS` force every layer onto
   the GPU, `GPU_ARBITER` (`control.py`) serializes the embedder against the
   seats and evicts the resident model, and a seat whose forced load does not
-  fit is rebuilt unforced and retried once.
+  fit is rebuilt unforced and retried once. The arbiter's wait is unbounded: a
+  waiter never runs beside the holder. Across processes the daemon enforces the
+  same through `OLLAMA_MAX_LOADED_MODELS=1` / `OLLAMA_NUM_PARALLEL=1`, a drop-in
+  `install.sh` writes.
 - **The emergency stop is cooperative.** `RUN_CONTROL` is a process-global
   checked at node tops, in the Builder's turn loop, before each verified file
   and between supersteps -- never inside a tool batch. Every exit path writes

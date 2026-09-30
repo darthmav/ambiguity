@@ -278,15 +278,12 @@ class EmbedderActivity:
 EMBEDDER_ACTIVITY = EmbedderActivity()
 
 
-# How long a piece of work waits for the cards before it gives up waiting and
-# runs anyway. The wait is bounded rather than indefinite because a seat call
-# abandoned by `_with_deadline` keeps its worker thread alive and holding this
-# arbiter until its own socket timeout fires, and a node that inherited an
-# abandoned worker's queue position would be stalled by a call nobody is
-# reading any more. `LLM_TIMEOUT_SECONDS` bounds that worker, so a wait a
-# little past it outlasts every holder that can still finish; past that the
-# guarantee is worth less than the wedge it would cause.
-GPU_WAIT_SECONDS = 150.0
+# How often a waiter re-checks the cards. Only a polling interval: a wait is
+# never cut short, because one that gave up and ran anyway was exactly the
+# overlap this arbiter exists to prevent -- two models on the cards at once.
+# Every holder is bounded on its own (a seat call by LLM_TIMEOUT_SECONDS at the
+# socket, an embed by its request timeout), so a wait always ends.
+GPU_WAIT_POLL_SECONDS = 1.0
 
 
 class GpuArbiter:
@@ -321,30 +318,29 @@ class GpuArbiter:
         self._holder = ""
         self._depth = 0
         self._since = 0.0
-        self._waited_out = 0
+        self._waiting = 0
 
     @contextmanager
-    def exclusive(self, owner: str, timeout: float = GPU_WAIT_SECONDS) -> Iterator[float]:
+    def exclusive(self, owner: str) -> Iterator[float]:
         """Hold the cards for `owner` while the block runs, however it exits.
 
-        Yields the seconds spent waiting, which the caller may report: a wait
-        is the whole visible cost of this arbiter, and one nobody can see reads
-        as the model simply being slow.
+        Waits as long as the holder takes, never less: one model on the cards
+        at a time is a guarantee, not a preference. Yields the seconds spent
+        waiting, which the caller may report: a wait is the whole visible cost
+        of this arbiter, and one nobody can see reads as the model simply
+        being slow.
         """
         start = time.monotonic()
-        taken = self._lock.acquire(timeout=timeout)
-        waited = time.monotonic() - start
-        if not taken:
-            # Ran out of patience rather than deadlocked. Proceeding is the
-            # lesser harm: the cost is the contention this class exists to
-            # avoid, while refusing would fail a run over a lock.
+        if not self._lock.acquire(blocking=False):
             with self._state:
-                self._waited_out += 1
+                self._waiting += 1
             try:
-                yield waited
+                while not self._lock.acquire(timeout=GPU_WAIT_POLL_SECONDS):
+                    pass
             finally:
-                pass
-            return
+                with self._state:
+                    self._waiting -= 1
+        waited = time.monotonic() - start
         with self._state:
             self._depth += 1
             if self._depth == 1:
@@ -361,13 +357,13 @@ class GpuArbiter:
             self._lock.release()
 
     def snapshot(self) -> dict[str, object]:
-        """Who holds the cards, for how long, and how often the wait ran out."""
+        """Who holds the cards, for how long, and how many are queued behind it."""
         with self._state:
             now = time.monotonic()
             return {
                 "holder": self._holder,
                 "held_for": round(now - self._since, 2) if self._holder else 0.0,
-                "waited_out": self._waited_out,
+                "waiting": self._waiting,
             }
 
 

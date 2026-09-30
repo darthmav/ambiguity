@@ -272,6 +272,32 @@ else
         fi
     fi
 
+    # One model resident, one request at a time, enforced by the daemon itself.
+    # GPU_ARBITER serializes this console's own seats and embedder, but only
+    # inside one process; a second console, a script or diagnose_seats.py
+    # reaches the daemon around it. With these the daemon queues the next
+    # request until the current one finishes, and unloads before it loads.
+    one_model=/etc/systemd/system/ollama.service.d/one-model.conf
+    one_model_body=$'[Service]\nEnvironment="OLLAMA_MAX_LOADED_MODELS=1"\nEnvironment="OLLAMA_NUM_PARALLEL=1"\n'
+    if [ -z "${OLLAMA_BASE_URL:-}" ] && systemctl cat ollama.service >/dev/null 2>&1; then
+        if [ "$(cat "$one_model" 2>/dev/null)"$'\n' = "$one_model_body" ]; then
+            ok "the daemon holds one model at a time ($one_model)"
+        elif [ "$SYSTEM" -eq 1 ]; then
+            echo "  limiting the daemon to one model at a time ($one_model)"
+            if sudo mkdir -p "${one_model%/*}" \
+                && printf '%s' "$one_model_body" | sudo tee "$one_model" >/dev/null \
+                && sudo systemctl daemon-reload \
+                && sudo systemctl restart ollama.service; then
+                for _ in $(seq 1 20); do daemon_up && break; sleep 0.5; done
+                ok "the daemon holds one model at a time"
+            else
+                problem "could not limit the daemon to one model; see $one_model"
+            fi
+        else
+            echo "  --no-system does not configure the daemon; for one model at a time write $one_model with OLLAMA_MAX_LOADED_MODELS=1 and OLLAMA_NUM_PARALLEL=1"
+        fi
+    fi
+
     if ! daemon_up; then
         problem "Ollama daemon unreachable at $OLLAMA_URL"
     else
@@ -432,13 +458,11 @@ print(f"  ✓ {EMBEDDING_TOKENIZER_NAME} tokenizer cached")
 PY
 then :; else problem "could not fetch the embedding tokenizer; see /tmp/ambiguity-embedder.log"; fi
 
-# The corpus is not built here, and there is no step that builds one. Two
-# things index: a run, which rebuilds before the Architect opens, and embedding
-# a document into the corpus from the console. An install-time index was a
-# third, and a third is one too many -- it is the one that decides how fresh
-# the corpus is on a machine nobody has run anything on yet, which is a
-# question the first run answers correctly by itself. The tokenizer above is
-# cached so that first run is an index and not also a download.
+# The corpus is not built here, and there is no step that builds one. It holds
+# researched archive data only -- pages online research fetched, documents the
+# operator uploaded, projects the operator opted in -- never this checkout, so
+# a fresh install has nothing to index. The tokenizer above is cached so the
+# first embed is an embed and not also a download.
 
 # ---------------------------------------------------------------------------
 # 6. Git, for the Builder's git_dwell

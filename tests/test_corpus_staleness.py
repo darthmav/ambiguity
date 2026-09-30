@@ -26,6 +26,9 @@ from langgraph_agent.corpus_health import (
 )
 from langgraph_agent.graphrag_server import MAX_INDEXABLE_BYTES, iter_project_files
 
+# The walk's mechanics, laid out at the top of a scratch tree.
+pytestmark = pytest.mark.usefixtures("whole_root_walk")
+
 
 @pytest.fixture(autouse=True)
 def _no_cached_walk():

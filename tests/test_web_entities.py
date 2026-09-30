@@ -196,14 +196,9 @@ def test_entity_free_sources_are_excluded_from_isolates_and_counted(kb):
     assert after["web_documents"] == 0
 
 
-def test_the_walk_takes_the_console_and_ci_but_not_the_git_directory(tmp_path, monkeypatch):
-    """.git as a plain substring also excluded .github/; the entry is .git/.
-
-    Application source directories (src/, tests/, prompts/, frontend/,
-    spectral_graph/) are now intentionally excluded from the walk.
-    """
-    for relative in (".github/workflows/ci.yml", "install.sh",
-                     "pyproject.toml", ".git/hooks/pre-commit.sh", ".git/config.toml"):
+def test_the_git_exclude_keeps_github_in_the_walk(tmp_path, monkeypatch, whole_root_walk):
+    """.git as a plain substring also excluded .github/; the entry is .git/."""
+    for relative in (".github/workflows/ci.yml", ".git/hooks/pre-commit.sh", ".git/config.toml"):
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("x\n")
@@ -211,8 +206,5 @@ def test_the_walk_takes_the_console_and_ci_but_not_the_git_directory(tmp_path, m
 
     walked = {str(path) for path in iter_project_files(".")}
 
-    assert {".github/workflows/ci.yml", "install.sh",
-            "pyproject.toml"} <= walked
+    assert ".github/workflows/ci.yml" in walked
     assert not any(path.startswith(".git/") for path in walked)
-    # Application source directories are intentionally excluded
-    assert "frontend/index.html" not in walked

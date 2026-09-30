@@ -25,6 +25,9 @@ from langgraph_agent.graphrag_server import (
     relevance_floor,
 )
 
+# The walk's mechanics, laid out at the top of a scratch tree.
+pytestmark = pytest.mark.usefixtures("whole_root_walk")
+
 
 class _FakeCollection:
     """The slice of the Chroma collection API these two methods use.

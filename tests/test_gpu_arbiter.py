@@ -129,25 +129,35 @@ def test_the_arbiter_is_reentrant_rather_than_deadlocking() -> None:
     assert arbiter.snapshot()["holder"] == ""
 
 
-def test_a_wait_that_runs_out_proceeds_rather_than_wedging() -> None:
-    """An abandoned `_with_deadline` worker must not stall the run behind it."""
+def test_a_waiter_never_runs_beside_the_holder() -> None:
+    """However long the holder takes, the next model waits for the cards to be free."""
     arbiter = GpuArbiter()
     released = threading.Event()
+    entered = threading.Event()
+    overlapped: list[bool] = []
 
     def squat() -> None:
         with arbiter.exclusive("squatter"):
+            entered.set()
             released.wait(5)
+
+    def wait_for_the_cards() -> None:
+        with arbiter.exclusive("seat:Builder"):
+            overlapped.append(not released.is_set())
 
     holder = threading.Thread(target=squat, daemon=True)
     holder.start()
-    time.sleep(0.05)
-    started = time.monotonic()
-    with arbiter.exclusive("seat:Builder", timeout=0.1) as waited:
-        assert waited >= 0.1
-    assert time.monotonic() - started < 2.0
-    assert arbiter.snapshot()["waited_out"] == 1
+    entered.wait(5)
+    waiter = threading.Thread(target=wait_for_the_cards, daemon=True)
+    waiter.start()
+    time.sleep(0.3)
+    assert waiter.is_alive(), "the waiter ran while the cards were held"
+    assert arbiter.snapshot()["waiting"] == 1
     released.set()
+    waiter.join(5)
     holder.join(5)
+    assert overlapped == [False]
+    assert arbiter.snapshot() == {"holder": "", "held_for": 0.0, "waiting": 0}
 
 
 # --- freeing the cards -------------------------------------------------------

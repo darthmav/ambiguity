@@ -30,17 +30,18 @@ def _walked(root):
 
 
 def test_a_generated_project_stays_out_of_the_walk_until_embedded(tmp_path):
+    # `main.py` is the checkout's own file: never walked, embedded or not.
     _tree(tmp_path)
-    assert _walked(tmp_path) == ["main.py"]
+    assert _walked(tmp_path) == []
 
     set_project_embedded("snake", True, tmp_path)
-    assert _walked(tmp_path) == ["main.py", "projects/snake/game.py"]
+    assert _walked(tmp_path) == ["projects/snake/game.py"]
 
     set_project_embedded("snake", False, tmp_path)
-    assert _walked(tmp_path) == ["main.py"]
+    assert _walked(tmp_path) == []
 
 
-def test_only_the_first_component_holds_a_file_out(tmp_path):
+def test_only_the_first_component_holds_a_file_out(tmp_path, whole_root_walk):
     # A substring match would catch `subprojects/` anywhere in the tree.
     (tmp_path / "docs" / "subprojects").mkdir(parents=True)
     (tmp_path / "docs" / "subprojects" / "a.md").write_text("kept\n")
@@ -51,7 +52,7 @@ def test_a_broken_record_embeds_nothing(tmp_path):
     _tree(tmp_path)
     (tmp_path / "projects" / "embedded.json").write_text("{not json")
     assert embedded_projects(tmp_path) == set()
-    assert _walked(tmp_path) == ["main.py"]
+    assert _walked(tmp_path) == []
 
 
 def test_list_projects_reports_files_and_state(tmp_path):

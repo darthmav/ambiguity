@@ -34,6 +34,9 @@ from langgraph_agent.graphrag_server import (
     open_knowledge_base,
 )
 
+# The walk's mechanics, laid out at the top of a scratch tree.
+pytestmark = pytest.mark.usefixtures("whole_root_walk")
+
 
 @pytest.fixture
 def nowhere(tmp_path, monkeypatch):
