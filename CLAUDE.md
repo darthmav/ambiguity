@@ -131,8 +131,7 @@ python example_usage.py
 ├── experimental/              # an agent run's own notes; out of the corpus (PROJECT_INDEX_EXCLUDES)
 ├── docker/
 │   └── entrypoint.sh          # the container's start: git identity, and what it can reach
-├── Dockerfile                 # the console as an Arch image; the daemon stays on the host
-├── Dockerfile.kali            # the same console on Kali rolling; gh from GitHub's own repo
+├── dockerfile                 # the console as an Arch image; the daemon stays on the host
 ├── docker-compose.yml         # host networking: the daemon, the database and SearxNG are on it
 ├── .dockerignore              # the venv, the caches, and every per-machine artifact
 ├── install.sh                 # Arch / Omarchy: everything, from nothing to a running console

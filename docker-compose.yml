@@ -1,12 +1,6 @@
 # The console in a container, wired to the machine it runs on.
 #
-#   docker compose up --build                    # Arch    (Dockerfile)
-#   docker compose --profile kali up --build     # Kali    (Dockerfile.kali)
-#
-# Two images, one configuration: everything below the base is identical, so the
-# settings live in one anchor and each service names only its own Dockerfile
-# and tag. They cannot both run at once -- host networking means they would
-# want the same port.
+#   docker compose up --build                    # Arch    (dockerfile)
 #
 # Host networking is the whole configuration decision here, and it is what
 # makes the database work unchanged. The postgres18 container Omarchy's
@@ -26,63 +20,51 @@
 
 name: ambiguity
 
-x-console: &console
-  network_mode: host
-
-  # The uid that owns the checkout on the host, so a run's products are not
-  # left root-owned in your working tree. 1000 is the first human account on an
-  # Arch/Omarchy install; override for any other (AMBIGUITY_UID=$(id -u)).
-  user: "${AMBIGUITY_UID:-1000}:${AMBIGUITY_GID:-1000}"
-
-  # The checkout itself, because a corpus is a function of what is on disk: the
-  # project the agents index and write to, knowledge/ (Chroma and the graph),
-  # runs/, uploads/, research/web/ and projects/ all live in it, and a container
-  # that kept them inside its own layer would throw away the corpus -- and the
-  # relevance floor measured for it -- on every rebuild. It is also what gives
-  # the Builder's git_ tools a real repository with a real origin.
-  #
-  # To let git_dwell finish its default pipeline as you rather than as the
-  # container's fallback identity, add your own credentials, read-only -- the
-  # entrypoint supplies safe.directory through the environment precisely so
-  # these need no writes. Both must exist on the host before uncommenting, or
-  # Docker creates a directory in their place.
-  #   - ${HOME}/.gitconfig:/home/agent/.gitconfig:ro
-  #   - ${HOME}/.config/gh:/home/agent/.config/gh:ro
-  volumes:
-    - .:/app
-
-  environment:
-    # These fall back to the values in .env (compose reads it for
-    # interpolation) and then to the machine defaults, so setting one in .env
-    # sets it in both halves rather than only one.
-    PORT: "${PORT:-8080}"
-    OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
-    # The URL install.sh writes into .env after proving it logs in. Nothing in
-    # the app reads it; the console exports it to everything it runs, so a
-    # script the Builder writes finds the database here.
-    DATABASE_URL: "${DATABASE_URL:-postgresql://postgres@127.0.0.1:5432/postgres}"
-
-  # A console is something you start and watch, not a service that should come
-  # back by itself: a run holds process-global state (the stop flag, the corpus
-  # rebuild claim), and its snapshot under runs/ is what a restarted console
-  # reattaches to.
-  restart: "no"
-  stop_grace_period: 30s
-
 services:
   console:
-    <<: *console
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: dockerfile
     image: ambiguity-console:latest
 
-  # Same console, Kali base. Behind a profile so it is opt-in: `docker compose
-  # up` should start one console, not two fighting over port 8080.
-  console-kali:
-    <<: *console
-    profiles: ["kali"]
-    build:
-      context: .
-      dockerfile: Dockerfile.kali
-    image: ambiguity-console:kali
+    network_mode: host
+
+    # The uid that owns the checkout on the host, so a run's products are not
+    # left root-owned in your working tree. 1000 is the first human account on an
+    # Arch/Omarchy install; override for any other (AMBIGUITY_UID=$(id -u)).
+    user: "${AMBIGUITY_UID:-1000}:${AMBIGUITY_GID:-1000}"
+
+    # The checkout itself, because a corpus is a function of what is on disk: the
+    # project the agents index and write to, knowledge/ (Chroma and the graph),
+    # runs/, uploads/, research/web/ and projects/ all live in it, and a container
+    # that kept them inside its own layer would throw away the corpus -- and the
+    # relevance floor measured for it -- on every rebuild. It is also what gives
+    # the Builder's git_ tools a real repository with a real origin.
+    #
+    # To let git_dwell finish its default pipeline as you rather than as the
+    # container's fallback identity, add your own credentials, read-only -- the
+    # entrypoint supplies safe.directory through the environment precisely so
+    # these need no writes. Both must exist on the host before uncommenting, or
+    # Docker creates a directory in their place.
+    #   - ${HOME}/.gitconfig:/home/agent/.gitconfig:ro
+    #   - ${HOME}/.config/gh:/home/agent/.config/gh:ro
+    volumes:
+      - .:/app
+
+    environment:
+      # These fall back to the values in .env (compose reads it for
+      # interpolation) and then to the machine defaults, so setting one in .env
+      # sets it in both halves rather than only one.
+      PORT: "${PORT:-8080}"
+      OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
+      # The URL install.sh writes into .env after proving it logs in. Nothing in
+      # the app reads it; the console exports it to everything it runs, so a
+      # script the Builder writes finds the database here.
+      DATABASE_URL: "${DATABASE_URL:-postgresql://postgres@127.0.0.1:5432/postgres}"
+
+    # A console is something you start and watch, not a service that should come
+    # back by itself: a run holds process-global state (the stop flag, the corpus
+    # rebuild claim), and its snapshot under runs/ is what a restarted console
+    # reattaches to.
+    restart: "no"
+    stop_grace_period: 30s

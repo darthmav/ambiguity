@@ -228,23 +228,6 @@ the SearxNG on 127.0.0.1:8888. A bridged container reaches none of them, so
 `DATABASE_URL` and `OLLAMA_BASE_URL` mean the same thing inside the container
 as outside it, and nothing has to be republished to the world.
 
-**Two bases, one configuration.** `Dockerfile` is Arch, matching the rest of
-this project; `Dockerfile.kali` is Kali rolling, which carries the same Python
-(3.14.7) and so resolves to the same dependency versions. The Kali image is
-behind a compose profile, and comes out smaller -- 913 MB against 1.22 GB --
-because Debian's base with `--no-install-recommends` carries less than Arch's:
-
-```bash
-docker compose --profile kali up --build
-```
-
-Both run the full suite inside the image (757 tests) and answer on the same
-port, so they are alternatives rather than a pair to start together. The Kali
-one installs no pentest tooling -- it is this console on that base;
-`kali-linux-headless` belongs in an image derived from it. `gh` comes from
-GitHub's own apt repository there, since Kali packages none, and without it
-`git_dwell` would stop at `push`.
-
 What stays on the host: the **Ollama daemon**. It owns the embedding model's
 placement on the GPU and holds the ollama.com credentials the `:cloud` tags are
 proxied with, so the image only ever speaks HTTP to it. The entrypoint says
