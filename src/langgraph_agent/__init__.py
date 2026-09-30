@@ -1,6 +1,6 @@
 """LangGraph Agent - 4-Agent System implementation.
 
-A cloud-only AI system for software development experiments with four specialized
+A local-first AI system for software development experiments with four specialized
 agents working in a coordinated workflow:
 
 - **Architect** — The leading authority. Sets architectural direction before planning
@@ -10,7 +10,7 @@ agents working in a coordinated workflow:
 - **Builder** — Implements the plan using research and creates working code.
 
 The system uses LangGraph for orchestration with strict system prompts, state
-injection on every turn, tool binding per agent, and cloud-only inference.
+injection on every turn, tool binding per agent, and local-first inference.
 
 Example:
     >>> from langgraph_agent import create_agent_graph, AgentState

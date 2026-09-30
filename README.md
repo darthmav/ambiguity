@@ -4,11 +4,12 @@
 
 A multi-agent system for software development experiments, powered by LangGraph + GraphRAG + MCP.
 
-Inference is **cloud only**. All four seats run Ollama Cloud tags, which the
-local daemon proxies to ollama.com using credentials it holds itself, so the
-crew runs without an API key of your own. Anthropic and OpenAI are available
-per seat if you want them. The only thing that runs on this machine is the
-embedding model.
+Inference is **local by default**. Three of the four seats run a model the
+local Ollama daemon serves from its own weights; the Builder runs a different
+local model because its work *is* tool calls, and the two local dolphin tags
+don't report `tools`. Nothing needs an API key or ollama.com credentials out
+of the box. Ollama Cloud tags, Anthropic and OpenAI are all still available
+per seat if you want them.
 
 ## 🎨 Web Console
 
@@ -151,15 +152,16 @@ Later cycles route as the Planner asks.
 
 | Agent | Responsibility | Default seat | Tools |
 |---|---|---|---|
-| **Architect** | Sets direction and constraints; rules `approved` / `revise` / `need_research` | `qwen3.5:397b-cloud` (ollama) | None (reasoning only) |
-| **Planner** | Turns goals into structured plans, routes next | `kimi-k3:cloud` (ollama) | None (reasoning only) |
-| **Researcher** | Gathers deep, relationship-aware knowledge | `kimi-k3:cloud` (ollama) | GraphRAG MCP only |
-| **Builder** | Implements the plan (writes code, edits files) | `qwen3.5:397b-cloud` (ollama) | Filesystem, Git, Terminal |
+| **Architect** | Sets direction and constraints; rules `approved` / `revise` / `need_research` | Dolphin 2.9.1 9B (ollama, local) | None (reasoning only) |
+| **Planner** | Turns goals into structured plans, routes next | Dolphin 2.9.1 9B (ollama, local) | None (reasoning only) |
+| **Researcher** | Gathers deep, relationship-aware knowledge | Dolphin 2.9.1 9B (ollama, local) | GraphRAG MCP only |
+| **Builder** | Implements the plan (writes code, edits files) | `qwen3.8:latest` (ollama, local) | Filesystem, Git, Terminal |
 
 Every seat is reassignable live from its dropdown in the console, which offers
-`kimi-k3:cloud`, `qwen3.5:397b-cloud` and `qwen3.8:latest` and nothing else;
-selections last for the life of the process. `qwen3-embedding:latest` is the
-embedder's, not a seat's: it cannot chat.
+`qwen3.8:latest`, two local dolphin tags, and `kimi-k3:cloud` and nothing
+else; selections last for the life of the process. `qwen3-embedding:latest`
+is the embedder's, not a seat's: it cannot chat. Only `qwen3.8:latest`
+reports `tools`, which is why it -- not either dolphin -- holds the Builder.
 
 ### The Three Technologies
 
@@ -315,13 +317,21 @@ account) is a different failure: the seat shows `FAILING` with the provider's ow
 message and runs abort rather than quietly producing stub text. That state is
 recorded from the actual outcome of a call, so it appears after the first run.
 
-The three Ollama seats need the daemon running and signed in, since it holds the
-ollama.com credentials for `:cloud` tags:
+The local dolphin/qwen3.8 tags need only the daemon running -- no sign-in,
+no credentials, since the daemon serves them from its own weights:
+
+```bash
+ollama pull hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M   # Architect, Planner, Researcher
+ollama pull qwen3.8:latest                                           # Builder
+```
+
+Point a seat at an Ollama Cloud tag instead (`ARCHITECT_MODEL=kimi-k3:cloud`,
+say) and it needs the daemon signed in, since `:cloud` tags proxy to
+ollama.com on credentials the daemon holds:
 
 ```bash
 ollama signin
-ollama pull qwen3.5:397b-cloud      # Architect and Builder
-ollama pull kimi-k3:cloud           # Planner and Researcher
+ollama pull kimi-k3:cloud
 ```
 
 The embedding model (`qwen3-embedding:latest`) is served by the Ollama daemon like the seats' models and pulled the same way — `install.sh` does it, or `ollama pull qwen3-embedding:latest`. Only its tokenizer is fetched from Hugging Face, so the chunker can cut passages in-process; nothing here runs or needs torch.
@@ -553,7 +563,14 @@ tool name to the external server.
 
 ## Hardware Requirements
 
-**Cloud providers:** no local GPU required. The embedding model runs locally for GraphRAG, but no conversational LLM is hosted on-device.
+**Local by default.** The embedding model and every seat run through the
+local Ollama daemon. The Builder's `qwen3.8:latest` is 17 GB against a 6 GB
+card and always takes the CPU fallback (see `AGENT_LLM_OPTIONS` in
+`config.py`); the three dolphin-seated roles are 5.3-5.7 GB and load 100% on
+the GPU. A GPU is not required -- everything still runs on CPU, just slower --
+but is what keeps the Architect/Planner/Researcher seats fast. Point any seat
+at Anthropic, OpenAI or an Ollama Cloud tag instead if you'd rather not run
+weights locally at all.
 
 ## Next Steps
 

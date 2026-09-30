@@ -37,8 +37,8 @@ from langgraph_agent.control import GpuArbiter
     [
         ("qwen3.8:latest", True),
         ("hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M", True),
+        ("hf.co/RavichandranJ/Dolphin3-Cyber-8B-GGUF:Q5_K_M", True),
         ("kimi-k3:cloud", False),
-        ("qwen3.5:397b-cloud", False),
     ],
 )
 def test_only_a_local_tag_is_run_on_these_cards(tag: str, local: bool) -> None:

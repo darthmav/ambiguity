@@ -18,12 +18,12 @@ import ollama
 
 from langgraph_agent.config import LLM_TIMEOUT_SECONDS, _ollama_base_url
 
-# A cloud tag, because the cards belong to the embedder. Inference here is
-# cloud-only, and `qwen3.8:latest` is 17 GB against 6 GB of VRAM: asking for it
-# evicts `qwen3-embedding:latest`, which `OLLAMA_EMBED_OPTIONS` deliberately
-# pins 100% onto those cards, and the next embed pays a full reload. A `:cloud`
-# tag is proxied to ollama.com by the local daemon and needs `ollama signin`.
-DEFAULT_MODEL = "kimi-k3:cloud"
+# The same local tag the Architect/Planner/Researcher seats default to
+# (config.DEFAULT_SEATS): 5.3 GB, loads 100% onto the GPU alongside
+# `qwen3-embedding:latest` without evicting it (`qwen3.8:latest`, at 17 GB
+# against 6 GB of VRAM, would). `GPU_ARBITER` still serializes the two against
+# each other; this just avoids the CPU-fallback case entirely.
+DEFAULT_MODEL = "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M"
 
 
 def send_prompt(prompt: str, model: str = DEFAULT_MODEL) -> str:

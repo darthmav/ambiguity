@@ -1,13 +1,15 @@
 """Configuration and LLM setup.
 
 Supports per-agent LLM selection so Architect, Planner, Researcher, and Builder
-can each use a different model/provider. Inference is cloud-only: every seat
-defaults to an Ollama Cloud tag, which the local daemon proxies to ollama.com
-using credentials it holds itself. Anthropic and OpenAI remain available per
-seat, but neither is needed to run the crew.
+can each use a different model/provider. Inference defaults to local: every
+seat defaults to a model the Ollama daemon on this machine serves from its own
+weights, so a fresh checkout runs with no API key and no ollama.com credentials
+at all. Ollama Cloud tags, Anthropic and OpenAI remain available per seat for
+anyone who wants them.
 
-The only thing that runs on this machine is the embedding model, which belongs
-to GraphRAG rather than to any agent seat.
+The embedding model also runs on this machine, served by the same daemon --
+it belongs to GraphRAG rather than to any agent seat, and is never a seat
+choice itself.
 """
 
 import functools
@@ -35,16 +37,16 @@ AGENTS: tuple[AgentName, ...] = ("architect", "planner", "researcher", "builder"
 
 
 # Default model per (provider, agent) when a per-agent provider is configured
-# but no model is supplied. Cloud-first defaults.
+# but no model is supplied. Local-first defaults.
 _DEFAULT_AGENT_MODELS: dict[tuple[str, str], str] = {
     ("anthropic", "architect"): "claude-opus-5",
     ("anthropic", "planner"): "claude-opus-5",
     ("anthropic", "researcher"): "claude-sonnet-5",
     ("anthropic", "builder"): "claude-sonnet-5",
-    ("ollama", "architect"): "qwen3.5:397b-cloud",
-    ("ollama", "planner"): "kimi-k3:cloud",
-    ("ollama", "researcher"): "kimi-k3:cloud",
-    ("ollama", "builder"): "qwen3.5:397b-cloud",
+    ("ollama", "architect"): "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M",
+    ("ollama", "planner"): "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M",
+    ("ollama", "researcher"): "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M",
+    ("ollama", "builder"): "qwen3.8:latest",
     ("openai", "architect"): "gpt-4o",
     ("openai", "planner"): "gpt-4o",
     ("openai", "researcher"): "gpt-4o-mini",
@@ -52,44 +54,55 @@ _DEFAULT_AGENT_MODELS: dict[tuple[str, str], str] = {
 }
 
 
-# The seat each agent takes when nothing overrides it. All four are Ollama
-# Cloud tags so a fresh checkout runs with no API key of its own -- the daemon
-# already holds the ollama.com credentials. Putting the Architect on Anthropic
-# meant the entry node, and so the whole run, died without billable credit.
-# Point a seat at Anthropic or OpenAI with {ROLE}_PROVIDER / {ROLE}_MODEL, or
-# from the console dropdown.
+# The seat each agent takes when nothing overrides it. Three of the four run a
+# model this machine's own daemon holds the weights for -- no API key, no
+# ollama.com credentials, nothing to sign in to. The Builder is the exception:
+# its work *is* tool calls, and neither dolphin tag reports `tools` (checked
+# live against this daemon -- both answer `capabilities: ["completion"]` and
+# nothing else), so it takes the one local tag that does. Point a seat at
+# Anthropic, OpenAI or an Ollama Cloud tag with {ROLE}_PROVIDER / {ROLE}_MODEL,
+# or from the console dropdown.
 DEFAULT_SEATS: dict[str, dict[str, str]] = {
-    "architect": {"provider": "ollama", "model": "qwen3.5:397b-cloud"},
-    "planner": {"provider": "ollama", "model": "kimi-k3:cloud"},
-    "researcher": {"provider": "ollama", "model": "kimi-k3:cloud"},
-    "builder": {"provider": "ollama", "model": "qwen3.5:397b-cloud"},
+    "architect": {"provider": "ollama",
+                  "model": "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M"},
+    "planner": {"provider": "ollama",
+                "model": "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M"},
+    "researcher": {"provider": "ollama",
+                   "model": "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M"},
+    "builder": {"provider": "ollama", "model": "qwen3.8:latest"},
 }
 
 
-# The models the console offers a seat, and the only ones it will set: the two
-# Ollama Cloud tags the seats default to, and qwen3.8 on the local daemon.
-# `group` drives the <optgroup> headings in the seat dropdowns. Tags the daemon
+# The models the console offers a seat, and the only ones it will set. `group`
+# drives the <optgroup> headings in the seat dropdowns. Tags the daemon
 # carries beyond these are not offered. qwen3-embedding is not a seat choice --
 # the daemon reports it with no `completion` capability, so a seat on it would
 # fail every call -- and the embedder card offers it instead. Anthropic and
 # OpenAI still work for a seat configured in .env; the console does not offer them.
 AGENT_LLM_OPTIONS: list[dict[str, str]] = [
-    {"label": "Kimi K3", "provider": "ollama", "model": "kimi-k3:cloud",
-     "group": "Ollama Cloud"},
-    {"label": "Qwen3.5 397B", "provider": "ollama", "model": "qwen3.5:397b-cloud",
-     "group": "Ollama Cloud"},
     {"label": "Qwen3.8", "provider": "ollama", "model": "qwen3.8:latest",
      "group": "Ollama (local)"},
-    # The only local tag here that fits these cards. qwen3.8 is 17 GB against
-    # 6 GB of VRAM and always takes the CPU fallback (see the seat-placement
-    # bullet in CLAUDE.md); this one is 5.3 GB and loads 100% on the GPU,
-    # measured 2026-09-20 at 2,958 + 2,975 MiB. It reports `completion` and
-    # **not** `tools`, the first offered model that does not, which is why
-    # `get_agent_status` reports tool support: a Builder cannot work without
-    # it, and the other three seats are offered no tools anyway.
+    # qwen3.8 is 17 GB against 6 GB of VRAM and always takes the CPU fallback
+    # (see the seat-placement bullet in CLAUDE.md), but it is the only local
+    # tag here that reports `tools`, which is why it -- not either dolphin --
+    # holds the Builder by default: that seat's work *is* tool calls.
     {"label": "Dolphin 2.9.1 9B", "provider": "ollama",
      "model": "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M",
      "group": "Ollama (local)"},
+    # 5.3 GB, loads 100% on the GPU, measured 2026-09-20 at 2,958 + 2,975 MiB.
+    # Holds Architect, Planner and Researcher by default -- none of the three
+    # are offered tools anyway, so `completion`-only is the right seat for
+    # them rather than a defect (same reasoning `get_agent_status` uses for
+    # the Builder's `tools_note`, just the other three seats it doesn't fire
+    # for).
+    {"label": "Dolphin3 Cyber 8B", "provider": "ollama",
+     "model": "hf.co/RavichandranJ/Dolphin3-Cyber-8B-GGUF:Q5_K_M",
+     "group": "Ollama (local)"},
+    # 5.7 GB. Also `completion`-only (checked live against this daemon, same
+    # as the 2.9.1 tag above) -- not a Builder option, but a second local
+    # choice for the three tool-free seats.
+    {"label": "Kimi K3", "provider": "ollama", "model": "kimi-k3:cloud",
+     "group": "Ollama Cloud"},
 ]
 
 
@@ -504,13 +517,11 @@ def _accepts_temperature(provider: str, model: str) -> bool:
 # Whether a seat thinks before it answers, until someone switches it. Off, so a
 # fresh console starts with every thinking box unticked. That is a real change
 # on the wire, not a relabelling: a switchable model is always sent the flag
-# (`_thinking_for_call`), and leaving it out means *on* for several of them.
-# Measured on 2026-09-11, `qwen3.5:397b-cloud` given no flag spent 336 output
-# tokens and 4.4s answering "391" to 17*23, against 3 tokens and 1.3s told not
-# to think -- and langchain_ollama discarded every token of the reasoning, so
-# the cost was paid and nothing showed it. Opus 5 and Sonnet 5 likewise think
-# when the parameter is left out. Tick a seat's box for the hard steps; the
-# choice lasts until the server restarts.
+# (`_thinking_for_call`), and leaving it out means *on* for several of them --
+# a switchable model given no flag pays for reasoning tokens langchain_ollama
+# then discards outright, so the cost is paid and nothing shows it. Opus 5 and
+# Sonnet 5 likewise think when the parameter is left out. Tick a seat's box
+# for the hard steps; the choice lasts until the server restarts.
 DEFAULT_THINKING = False
 
 # The ceiling on a pre-4.6 Claude model's thinking, the only way those models
@@ -789,7 +800,9 @@ def get_llm(
         # daemon's `thinking` field, so the reasoning is paid for and thrown
         # away. True keeps it in `additional_kwargs`, where the Builder's tool
         # loop hands it back to the model on the next turn.
-        tag = str(model or os.getenv("OLLAMA_MODEL", "qwen3.5:397b-cloud"))
+        tag = str(model or os.getenv(
+            "OLLAMA_MODEL", "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M"
+        ))
 
         # A locally-run tag is told to put every layer on the cards; a
         # `:cloud` tag is sent nothing, since the options would be forwarded
@@ -936,11 +949,11 @@ def _resolve_seat(agent: str) -> dict[str, str | None]:
 def get_agent_llm(agent: AgentName, temperature: float = 0.1) -> Any:
     """Get the LLM configured for a specific agent role.
 
-    Default seats (cloud only -- see DEFAULT_SEATS):
-        Architect  -> Ollama    qwen3.5:397b-cloud (leading authority)
-        Planner    -> Ollama    kimi-k3:cloud
-        Researcher -> Ollama    kimi-k3:cloud
-        Builder    -> Ollama    qwen3.5:397b-cloud
+    Default seats (local first -- see DEFAULT_SEATS):
+        Architect  -> Ollama    dolphin-2.9.1 9B (leading authority)
+        Planner    -> Ollama    dolphin-2.9.1 9B
+        Researcher -> Ollama    dolphin-2.9.1 9B
+        Builder    -> Ollama    qwen3.8:latest (the local tag with tools)
     """
     seat = _resolve_seat(agent)
 

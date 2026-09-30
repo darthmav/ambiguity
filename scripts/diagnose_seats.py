@@ -97,12 +97,21 @@ class Candidate:
 # dialling a configuration in, and a default that bills on every run is a
 # default nobody runs twice.
 CANDIDATES: tuple[Candidate, ...] = (
+    Candidate("dolphin-2.9.1", "ollama",
+              "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M",
+              "Local, completion-only; holds Architect, Planner and "
+              "Researcher by default"),
+    Candidate("dolphin3-cyber", "ollama",
+              "hf.co/RavichandranJ/Dolphin3-Cyber-8B-GGUF:Q5_K_M",
+              "Local, completion-only; a second choice for the three "
+              "tool-free seats"),
+    Candidate("qwen3.8", "ollama", "qwen3.8:latest",
+              "Local, the only tag here with tools; holds Builder by default"),
     Candidate("kimi-k3", "ollama", "kimi-k3:cloud",
-              "General; holds Planner and Researcher by default"),
+              "General; held Planner and Researcher before the local-first "
+              "switch"),
     Candidate("kimi-code", "ollama", "kimi-k2.7-code:cloud",
               "Code-specialised sibling of kimi-k3"),
-    Candidate("qwen", "ollama", "qwen3.5:397b-cloud",
-              "Large general; holds Architect and Builder by default"),
     Candidate("nemotron", "ollama", "nemotron-3-ultra:cloud",
               "Large reasoner; held Researcher until it probed empty"),
     Candidate("gemma", "ollama", "gemma4:cloud",

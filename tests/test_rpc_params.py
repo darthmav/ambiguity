@@ -156,12 +156,11 @@ def test_the_seat_dropdowns_query_the_daemon_for_local_models(monkeypatch):
     result = serve.rpc_llm_options({})
     options = result["options"]
 
-    # Should have cloud models from AGENT_LLM_OPTIONS (kimi-k3:cloud, qwen3.5:397b-cloud)
+    # Should have cloud models from AGENT_LLM_OPTIONS (kimi-k3:cloud)
     # plus 2 local models (embedding model filtered out)
     models = [o["model"] for o in options]
     # Cloud models from AGENT_LLM_OPTIONS
     assert "kimi-k3:cloud" in models
-    assert "qwen3.5:397b-cloud" in models
     # Local models from daemon
     assert "qwen3.8:latest" in models
     assert "dolphin-2.9.1-yi-1.5-9b:Q4_K_M" in models

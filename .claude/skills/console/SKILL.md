@@ -133,16 +133,17 @@ neither:**
    fresh Ollama daemon despite being *the* embedding model every index and
    search goes through. `ollama pull qwen3-embedding:latest` first (~4.7GB;
    `ollama list | grep embed` to check).
-2. **A seat must actually be live.** `reindex` drives a real `run_goal`, so
-   the Architect has to answer. The shipped default,
-   `qwen3.5:397b-cloud`, was retired by Ollama on 2026-09-25 and fails with
-   `status code: 410` -- immediately, before any indexing happens. Check
+2. **The Architect's seat must actually be live.** `reindex` drives a real
+   `run_goal`, so the Architect has to answer. The shipped default is a
+   local dolphin tag (see DEFAULT_SEATS in `config.py`) -- if it is not
+   pulled, `run_goal` fails before any indexing happens. Check
    `driver.py rpc list_seats` for a `"live": true` entry and
    `driver.py rpc set_seat '{"role":"architect","provider":"ollama","model":"<tag>"}'`
-   onto it. Even a live tag can still fail with `status code: 402 -- this
-   model is not included in your free usage` depending on the account's
-   Ollama Cloud credits; `driver.py rpc llm_options` lists what else is
-   pulled locally to try.
+   onto whatever is. A seat pointed at an Ollama Cloud tag instead can also
+   fail with `status code: 410` (the tag was retired upstream) or
+   `status code: 402` (the account has no credits for it) -- both are
+   provider-side, not this project's; `driver.py rpc llm_options` lists
+   what else is pulled locally to try.
 
 ## Run (human path)
 
@@ -192,11 +193,12 @@ Tests use a stub LLM — no seats, no daemon, no keys needed.
   the container with it), not just "your copy" of the server. When the
   console is containerized, restart it with `docker restart
   ambiguity-console-1`, not `driver.py restart`.
-- **The shipped default seats can be dead on arrival.** `qwen3.5:397b-cloud`
-  (Architect, Builder) was retired by Ollama on 2026-09-25 --
-  `run_goal`/`reindex` fail immediately with `status code: 410`. This is
-  independent of the "all four seats ship dead / NOT PULLED" gotcha below:
-  a *pulled*, listed tag can still be a dead tag. Check `rpc list_seats` for
+- **An Ollama Cloud tag can be dead on arrival even if you point a seat at
+  one.** Ollama retires tags outright sometimes -- `run_goal`/`reindex` then
+  fail immediately with `status code: 410`, before any indexing happens, and
+  `ollama pull` on that tag fails too ("file does not exist"). This is
+  independent of the "all four seats ship dead / NOT PULLED" gotcha below: a
+  *pulled*, listed tag can still be a dead tag. Check `rpc list_seats` for
   `"live": true` before assuming a failed run is a pull/credentials problem.
 - **Indexing from outside the server used to leave it blind, and that is why
   nothing does it any more.** A script wrote the graph to disk while a live
@@ -218,11 +220,13 @@ Tests use a stub LLM — no seats, no daemon, no keys needed.
   the console renders errors into its telemetry log. A 200 does not mean the
   call worked; look at the body.
 
-- **All four seats ship dead.** `DEFAULT_SEATS` is four Ollama seats --
-  `qwen3.5:397b-cloud` for the Architect and Builder, `kimi-k3:cloud` for the
-  Planner and Researcher -- and the default embedder is the Ollama tag
-  `qwen3-embedding:latest`. A fresh daemon has none of them pulled, so every
-  seat badges `NOT PULLED` and `run_goal` fails. Everything read-only — Graph,
+- **All four seats ship dead.** `DEFAULT_SEATS` is four local Ollama tags --
+  a dolphin tag (no tool support, but none of the three need it) for the
+  Architect, Planner and Researcher, `qwen3.8:latest` (the local tag that
+  does report tools) for the Builder -- and the default embedder is the
+  Ollama tag `qwen3-embedding:latest`. A fresh daemon has none of them
+  pulled, so every seat badges `NOT PULLED` and `run_goal` fails.
+  Everything read-only — Graph,
   Retrieval, Corpus, State, all of `smoke` — works fine without them. (The
   older `console.md` claimed the default backend was Anthropic and told you to
   set `ANTHROPIC_API_KEY`; both were wrong. `.env` holds no API keys at all,
@@ -252,7 +256,7 @@ Tests use a stub LLM — no seats, no daemon, no keys needed.
 | Shell command exits 144, server still running | `pkill -f serve.py` matched its own caller. Use `driver.py down`. |
 | `{"error": {"message": "bad JSON"}}` | Shell quoting mangled the payload, not a server fault. Use `driver.py rpc`. |
 | Seats badge `NOT PULLED`, runs fail | Expected on a fresh box. Pull the tag, or set a seat to a provider you have via `rpc set_seat`. |
-| `run failed: ... status code: 410` | The seat's tag was retired by Ollama (the shipped default, `qwen3.5:397b-cloud`, was). `rpc list_seats` for a `"live": true` tag, `rpc set_seat` onto it. |
+| `run failed: ... status code: 410` | An Ollama Cloud tag the seat points at was retired upstream. `rpc list_seats` for a `"live": true` tag, `rpc set_seat` onto it. |
 | `run failed: ... status code: 402 -- not included in your free usage` | Account has no credits for that tag. Try another from `rpc llm_options`. |
 | `driver.py rpc search_documents` errors `model "qwen3-embedding:latest" not found` | Embedder isn't pulled. `ollama pull qwen3-embedding:latest` (~4.7GB). |
 | A merged code change doesn't show up in `rag_stats`/behavior | `:8080` may be a `docker compose` container running stale in-memory code, not a process `driver.py` manages. `docker ps` for `ambiguity-console-1`; if present, `docker restart ambiguity-console-1`, not `driver.py restart`. |

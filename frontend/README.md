@@ -100,8 +100,9 @@ that document rather than adding a second copy of it.
 ## Crew rail
 
 One card per seat: role-coloured dot and border, a dropdown of the seat models
-the console offers (`kimi-k3:cloud`, `qwen3.5:397b-cloud`, `qwen3.8:latest`;
-other tags the daemon carries are left out, and `set_seat` refuses them), the provider with a
+the console offers (`qwen3.8:latest`, two local dolphin tags, `kimi-k3:cloud`;
+other tags the daemon carries are left out, and `set_seat` refuses them),
+the provider with a
 *thinking* checkbox beside it, and chips for placement (`REMOTE` / `LOCAL`)
 and `NO KEY`.
 

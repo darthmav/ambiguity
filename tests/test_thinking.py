@@ -133,9 +133,8 @@ def test_an_ollama_tag_is_switchable_exactly_when_the_daemon_says_it_thinks(
 def test_ollama_is_told_either_way_and_left_alone_when_nobody_asked():
     """Off has to be said: a thinking tag given no flag thinks.
 
-    Measured on `qwen3.5:397b-cloud` -- 336 output tokens with no flag against
-    3 told not to think. `None` stays the model's own default, which is what
-    every call sent before the switch existed.
+    `None` stays the model's own default, which is what every call sent
+    before the switch existed.
     """
     def reasoning(thinking):
         return config.get_llm(

@@ -2,17 +2,20 @@
 
 ## Project Overview
 
-This is **langgraph-agent**, a cloud-only 4-Agent AI system for software development experiments.
+This is **langgraph-agent**, a local-first 4-Agent AI system for software development experiments.
 
 - **Architect** — the leading authority. Sets architectural direction before planning, then holds the approval gate: the run ends on its `approved` verdict, not the Builder's say-so. No tools.
 - **Planner** — interprets goals, creates structured plans, routes to next agent.
 - **Researcher** — gathers context via the GraphRAG MCP tool (`search_knowledge_graph`).
 - **Builder** — implements plans using filesystem, git, terminal, and test MCP tools.
 
-Inference is cloud-only. The embedding runs locally through the Ollama daemon
-serving `qwen3-embedding:latest` -- the daemon owns the model's placement, so
-nothing in this project touches torch or a card itself. The embedding belongs
-to GraphRAG, not to a seat.
+Inference defaults to local: every seat runs a model the Ollama daemon on this
+machine serves from its own weights, so a fresh checkout needs no API key and
+no ollama.com credentials at all. Ollama Cloud tags, Anthropic and OpenAI
+remain available per seat for anyone who wants them. The embedding model also
+runs locally through the same daemon, serving `qwen3-embedding:latest` -- the
+daemon owns every model's placement, so nothing in this project touches torch
+or a card itself. The embedding belongs to GraphRAG, not to a seat.
 
 Tech stack: Python 3.12+, LangGraph, Chroma + NetworkX, MCP (local stdio-compatible tool binding).
 
@@ -157,15 +160,16 @@ python example_usage.py
 
   | Seat | Provider | Model |
   |---|---|---|
-  | Architect | ollama | `qwen3.5:397b-cloud` |
-  | Planner | ollama | `kimi-k3:cloud` |
-  | Researcher | ollama | `kimi-k3:cloud` |
-  | Builder | ollama | `qwen3.5:397b-cloud` |
+  | Architect | ollama | `hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M` |
+  | Planner | ollama | `hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M` |
+  | Researcher | ollama | `hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M` |
+  | Builder | ollama | `qwen3.8:latest` |
 
-  Anthropic and OpenAI remain optional cloud providers; no seat uses either by
-  default, so a fresh checkout runs without an API key of its own. `:cloud`
-  tags are proxied to ollama.com by the local daemon, which holds the
-  credentials.
+  Three seats run local weights the daemon holds itself; the Builder is the
+  exception, since its work *is* tool calls and neither dolphin tag reports
+  `tools` -- `qwen3.8:latest` does. Anthropic, OpenAI and Ollama Cloud tags
+  remain available per seat; no seat uses any of them by default, so a fresh
+  checkout runs without an API key or ollama.com credentials of its own.
 - **Never send `temperature` to a modern Anthropic model.** Sampling parameters
   were removed on the Opus 5 / Sonnet 5 / 4.6+ families and are rejected with a
   400 that reads like an auth failure. `_accepts_temperature()` gates this.

@@ -299,12 +299,21 @@ else
         # fails its run; an embedding tag that is missing fails the corpus
         # phase every run starts with. The embedder is always the one Ollama
         # tag graphrag_server names.
+        #
+        # `AGENT_LLM_OPTIONS` widens that to every tag a seat could be
+        # reassigned to from the console dropdown, not only what it starts
+        # on: the two dolphin tags, the two Ollama Cloud tags, and
+        # `qwen3.8:latest` are all pulled up front so switching a seat live
+        # never needs a mid-run pull. `set_seat` refuses anything outside
+        # this list anyway, so nothing pulled here is unreachable from the
+        # UI, and nothing reachable from the UI is left unpulled.
+        #
         # Captured rather than streamed into mapfile: a process substitution
         # hides its exit status, so a broken import would pull nothing and
         # say so nowhere.
         seat_models=()
         if model_list="$("$PY" - <<'PY'
-from langgraph_agent.config import AGENTS, get_agent_model_info
+from langgraph_agent.config import AGENTS, AGENT_LLM_OPTIONS, get_agent_model_info
 from langgraph_agent.graphrag_server import EMBEDDING_MODEL_NAME
 
 seen: list[str] = []
@@ -312,6 +321,9 @@ for agent in AGENTS:
     info = get_agent_model_info(agent)
     if info["provider"] == "ollama" and info["model"] not in seen:
         seen.append(info["model"])
+for option in AGENT_LLM_OPTIONS:
+    if option["provider"] == "ollama" and option["model"] not in seen:
+        seen.append(option["model"])
 if EMBEDDING_MODEL_NAME not in seen:
     seen.append(EMBEDDING_MODEL_NAME)
 print("\n".join(seen))
