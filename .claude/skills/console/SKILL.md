@@ -73,16 +73,22 @@ server      up
 ```
   PASS  status responds  embedding=qwen3-embedding:latest
   PASS  corpus indexed  corpus=indexed
-  PASS  graph has nodes  nodes=1134 edges=2272
+  PASS  graph has nodes  nodes=358 edges=449
   PASS  graph not stale
-  PASS  documents listed  n=75
-  PASS  semantic search returns hits  top=src/langgraph_agent/graph.py
+  PASS  documents listed  n=20
+  PASS  semantic search returns hits  top=README.md
   PASS  four seats configured  n=4
   note  0/4 seats live -- run_goal will fail until a tag is pulled
   PASS  unknown method returns error envelope, not 500
 
 SMOKE OK
 ```
+
+(`n=20`, not the 75 an older run of this skill saw: `PROJECT_INDEX_EXCLUDES`
+now keeps `src/`, `tests/`, `prompts/`, `frontend/` and `spectral_graph/` out
+of the corpus, so only project-level docs/config get indexed. `top=README.md`
+follows from the same change -- there is no `src/langgraph_agent/graph.py` in
+the corpus to match anymore.)
 
 Any of the 20 RPC methods directly:
 
@@ -115,10 +121,28 @@ because a
 document whose text has not changed keeps the vectors it has. Expect:
 
 ```
-[Corpus] There was no corpus on this machine, so the project was indexed
-         before the run: 77 document(s), 1618 passage(s) in 57.4s.
-corpus: indexed -- 77 documents, 1618 chunks, 1190 nodes
+[Corpus] The corpus on this machine was empty, so the project was indexed
+         before the run: 20 document(s), 351 passage(s) in 295.3s.
+corpus: indexed -- 20 documents, 351 chunks, 358 nodes
 ```
+
+**This needs two things live before it works, and a fresh daemon has
+neither:**
+
+1. **The embedder must be pulled.** `qwen3-embedding:latest` is not on a
+   fresh Ollama daemon despite being *the* embedding model every index and
+   search goes through. `ollama pull qwen3-embedding:latest` first (~4.7GB;
+   `ollama list | grep embed` to check).
+2. **A seat must actually be live.** `reindex` drives a real `run_goal`, so
+   the Architect has to answer. The shipped default,
+   `qwen3.5:397b-cloud`, was retired by Ollama on 2026-09-25 and fails with
+   `status code: 410` -- immediately, before any indexing happens. Check
+   `driver.py rpc list_seats` for a `"live": true` entry and
+   `driver.py rpc set_seat '{"role":"architect","provider":"ollama","model":"<tag>"}'`
+   onto it. Even a live tag can still fail with `status code: 402 -- this
+   model is not included in your free usage` depending on the account's
+   Ollama Cloud credits; `driver.py rpc llm_options` lists what else is
+   pulled locally to try.
 
 ## Run (human path)
 
@@ -141,14 +165,39 @@ Five tabs: Engineer, Graph (default), Retrieval, Corpus, State.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-Observed: ruff clean, `mypy` — no issues in 20 source files, pytest
-**501 passed, 1 warning in 32.09s** (the warning is chromadb calling the
+Observed: ruff clean, `mypy` — no issues in 21 source files, pytest
+**789 passed, 1 warning in ~36s** (the warning is chromadb calling the
 deprecated `asyncio.iscoroutinefunction` on 3.14; upstream, ignore it).
 
 Tests use a stub LLM — no seats, no daemon, no keys needed.
 
 ## Gotchas
 
+- **A container can be "up" and healthy while running stale code.** If
+  `:8080` is being served by the project's own `docker compose` setup
+  (`docker ps` shows `ambiguity-console-1`), the checkout is bind-mounted so
+  the *files* on disk are current, but the *process* only re-imports them on
+  its own restart -- an hours-old container keeps running whatever
+  `graphrag_server.py` looked like when it last started. `driver.py doctor`'s
+  `server up` cannot tell the difference; it only checks that something
+  answers `/api/status`. Confirmed this session: `rag_stats` kept reporting
+  pre-fix behavior until `docker restart ambiguity-console-1` (not
+  `driver.py restart` -- see next bullet) picked up a merged code change.
+- **`driver.py up`/`down`/`restart` assume they own the process**, via a
+  `subprocess.Popen` + HTTP liveness poll (`is_up()`). Against a container:
+  `up` sees the container already answering and no-ops (`"already up at
+  ..."`) rather than starting anything of its own; `down`/`restart` call the
+  app's own `shutdown` RPC, which the container's `serve.py` answers the same
+  as a bare process -- so it *will* stop the container's main process (and
+  the container with it), not just "your copy" of the server. When the
+  console is containerized, restart it with `docker restart
+  ambiguity-console-1`, not `driver.py restart`.
+- **The shipped default seats can be dead on arrival.** `qwen3.5:397b-cloud`
+  (Architect, Builder) was retired by Ollama on 2026-09-25 --
+  `run_goal`/`reindex` fail immediately with `status code: 410`. This is
+  independent of the "all four seats ship dead / NOT PULLED" gotcha below:
+  a *pulled*, listed tag can still be a dead tag. Check `rpc list_seats` for
+  `"live": true` before assuming a failed run is a pull/credentials problem.
 - **Indexing from outside the server used to leave it blind, and that is why
   nothing does it any more.** A script wrote the graph to disk while a live
   `serve.py` kept the NetworkX graph it had built at startup and never re-read
@@ -203,4 +252,8 @@ Tests use a stub LLM — no seats, no daemon, no keys needed.
 | Shell command exits 144, server still running | `pkill -f serve.py` matched its own caller. Use `driver.py down`. |
 | `{"error": {"message": "bad JSON"}}` | Shell quoting mangled the payload, not a server fault. Use `driver.py rpc`. |
 | Seats badge `NOT PULLED`, runs fail | Expected on a fresh box. Pull the tag, or set a seat to a provider you have via `rpc set_seat`. |
+| `run failed: ... status code: 410` | The seat's tag was retired by Ollama (the shipped default, `qwen3.5:397b-cloud`, was). `rpc list_seats` for a `"live": true` tag, `rpc set_seat` onto it. |
+| `run failed: ... status code: 402 -- not included in your free usage` | Account has no credits for that tag. Try another from `rpc llm_options`. |
+| `driver.py rpc search_documents` errors `model "qwen3-embedding:latest" not found` | Embedder isn't pulled. `ollama pull qwen3-embedding:latest` (~4.7GB). |
+| A merged code change doesn't show up in `rag_stats`/behavior | `:8080` may be a `docker compose` container running stale in-memory code, not a process `driver.py` manages. `docker ps` for `ambiguity-console-1`; if present, `docker restart ambiguity-console-1`, not `driver.py restart`. |
 | `driver.py shot` says "no chromium on PATH" | Install chromium, or screenshot from a browser against http://localhost:8080. |
