@@ -72,7 +72,7 @@ import re
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -568,7 +568,7 @@ def _render_document(title: str, url: str, query: str, body: str) -> str:
     the passage, and comes back attached to whatever chunk matched -- which is
     what lets a Researcher finding say which page it came from.
     """
-    retrieved = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    retrieved = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     return (
         f"# {title or url}\n\n"
         f"- Source: {url}\n"
@@ -772,11 +772,17 @@ def research_online(
     # the loop creates one for a phase that stores nothing.
     kb: GraphRAGKnowledgeBase | None = None
     for page in selected:
+        # Any failure is this page's, not the phase's. The embedder reports its
+        # own as RuntimeError ("Ollama could not embed ..."), which the old
+        # `(ValueError, OSError)` let through: the first page the daemon
+        # refused abandoned every page after it, and the report of the pages
+        # already embedded went with it -- the caller saw only "the phase
+        # failed", with documents sitting in the corpus that nothing named.
         try:
             if kb is None:
                 kb = open_kb()
             stored.append(store_web_document(kb, page, goal, root))
-        except (ValueError, OSError) as exc:
+        except Exception as exc:
             failed.append({"url": page.get("url", ""), "error": str(exc)})
 
     return {

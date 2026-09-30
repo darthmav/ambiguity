@@ -6,8 +6,9 @@
 # starts without Ollama and reports each seat's real state itself, and nothing
 # in the app reads DATABASE_URL at all -- so a probe that blocked the start
 # would turn a warning into an outage. What a probe must not do is stay quiet:
-# a seat with no daemon behind it silently becomes StubLLM and completes a run
-# on canned text, which is the one failure that looks like success.
+# with no daemon behind them every default seat fails its first call and the
+# corpus cannot be embedded, and the log a container leaves is the first place
+# anyone looks for why.
 
 set -e
 
@@ -54,8 +55,9 @@ ollama_url="${OLLAMA_BASE_URL:-http://localhost:11434}"
 if curl -fsS --max-time 3 "${ollama_url%/}/api/tags" >/dev/null 2>&1; then
     echo "  ollama: ${ollama_url} answers"
 else
-    echo "  ollama: ${ollama_url} does not answer -- every seat will fall back"
-    echo "          to StubLLM and the corpus cannot be embedded."
+    echo "  ollama: ${ollama_url} does not answer -- every Ollama seat will fail"
+    echo "          its runs (the console shows OFFLINE) and the corpus cannot"
+    echo "          be embedded."
     echo "          On the host: systemctl status ollama. Off host networking,"
     echo "          the daemon must listen beyond loopback (OLLAMA_HOST=0.0.0.0)"
     echo "          and OLLAMA_BASE_URL must name it."

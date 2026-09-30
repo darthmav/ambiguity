@@ -174,8 +174,9 @@ python example_usage.py
   were removed on the Opus 5 / Sonnet 5 / 4.6+ families and are rejected with a
   400 that reads like an auth failure. `_accepts_temperature()` gates this.
 - **Tool specialization (critical):** Architect and Planner get no tools; the
-  Researcher gets GraphRAG read-only tools only; the Builder gets filesystem,
-  git, terminal and test tools only. Keep GraphRAG out of `BUILDER_TOOLS`.
+  Researcher's node calls GraphRAG read-only tools only, and its seat is handed
+  what they returned rather than the tools; the Builder gets filesystem, git,
+  terminal and test tools only. Keep GraphRAG out of `BUILDER_TOOLS`.
 - **`self_healing` is a standalone utility, not wired into any node.** Reach
   for its `retry_with_backoff` / `circuit_breaker` decorators at a *new*
   integration point, never retrofitted onto the seat or MCP call paths, which
@@ -233,6 +234,10 @@ Parameters are typed, bounded and refused by name (`_int_param`, `_float_param`,
 `_bool_param`, `_str_param`), parsed before anything is touched.
 `run_goal` blocks its own thread for the whole run -- hence
 `ThreadingHTTPServer` -- and a second one is refused while it is in flight.
+It listens on loopback (`CONSOLE_HOST` overrides) and `_foreign_request`
+refuses a write whose Origin is another site, and on loopback any request whose
+Host is not loopback (DNS rebinding): the console runs goals, and a goal reaches
+a Builder that runs programs. No CORS header is sent; the page is same-origin.
 
 ## Important Notes
 
@@ -244,9 +249,11 @@ Parameters are typed, bounded and refused by name (`_int_param`, `_float_param`,
   `builder_node` is this pass alone, and a path no longer on disk is retracted
   from the record and named in the report. "Described but not written" compares
   both spellings through `_report_path_key`.
-- **Writes cannot leave the project.** `_resolve_write_path` resolves the
-  parent, not the leaf; on a run given a project, `_outside_output_dir` confines
-  writes to `projects/<name>`.
+- **Writes cannot leave the project.** `_resolve_write_path` resolves the whole
+  path, leaf included, so a symlinked parent or leaf that leads out is refused;
+  on a run given a project, `_outside_output_dir` confines writes to
+  `projects/<name>`. Reads are not confined, deliberately: `terminal_execute`
+  runs any program, so the tool belt is not a sandbox (see `_filesystem_read`).
 - **What a pass writes is run and linted.** `_verify_written_files` executes
   every `RUNNABLE_SUFFIXES` file (a module inside a package is imported, not
   executed) and `_lint_written_files` runs `ruff check` with the project's own
@@ -281,7 +288,9 @@ Parameters are typed, bounded and refused by name (`_int_param`, `_float_param`,
   the Researcher.
 - **Retrieval decides whether a seat is consulted at all.** `_gather_research`
   returns the retrieved chunks without invoking the Researcher's model whenever
-  the top hit clears `relevance_floor()` -- measured per corpus into
+  the top hit clears `relevance_floor()`, marking any passage under it; below
+  it, the seat judges the passages that came back (`_retrieval_for_the_seat`).
+  The floor is measured per corpus into
   `floor_calibration.json`, `None` until it has been, and never borrowed
   between embedding models. Search is hybrid: BM25 re-ranks the dense window
   (`lexical.py`), ranks fused rather than scores, so every result keeps the

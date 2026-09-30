@@ -19,6 +19,8 @@ The corpus bootstrap is switched off here for the same reason -- see
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 import langgraph_agent.nodes as _nodes
@@ -99,6 +101,55 @@ def _no_corpus_bootstrap(monkeypatch):
     """
     import serve
     monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", False)
+
+
+def _no_daemon() -> list:
+    raise OSError("tests do not ask the Ollama daemon what it has loaded")
+
+
+# The corpus a developer's own console builds in this checkout.
+_CHECKOUT_STORE = (Path(__file__).resolve().parent.parent / "knowledge").resolve()
+
+
+@pytest.fixture(autouse=True)
+def _no_developer_corpus(monkeypatch, tmp_path_factory):
+    """No test searches the developer's corpus, or touches the cards it runs on.
+
+    `knowledge/` is the default store, and any checkout that has run the
+    console has one -- so every graph test's Researcher searched it for real:
+    Chroma opened, the plan embedded through the Ollama daemon, and the
+    embedder's `free_the_cards_for` unloaded whatever model the operator's own
+    console had resident at that moment, a run in flight included. Results
+    then depended on what that corpus held, which is the reason the Planner's
+    project map is switched off below. CI has no `knowledge/`, so the suite
+    already has to pass without one; this makes every checkout run it that way.
+
+    Only *this checkout's* store is hidden: a request that resolves to it is
+    answered with a directory that does not exist, so the reading door
+    (`open_knowledge_base`) finds no corpus there. Every other store resolves
+    as before -- the many tests that `chdir` into a temporary project and use a
+    relative `knowledge/` there, its floor record and its lock included. And
+    asking the daemon what it has loaded fails, which every caller already
+    reads as "unknown" and which `free_the_cards_for` answers by evicting
+    nothing. Tests that mean to exercise either patch them themselves.
+    """
+    import serve
+    from langgraph_agent import config, graphrag_server
+
+    hidden = tmp_path_factory.getbasetemp() / "no-developer-corpus"
+    real = graphrag_server.resolve_persist_dir
+
+    def resolve(persist_dir=None):
+        path = real(persist_dir)
+        return hidden if path.resolve() == _CHECKOUT_STORE else path
+
+    # Both names: serve imports the function rather than the module.
+    monkeypatch.setattr(graphrag_server, "resolve_persist_dir", resolve)
+    monkeypatch.setattr(serve, "resolve_persist_dir", resolve)
+    monkeypatch.setattr(graphrag_server, "_kb_instance", None)
+    monkeypatch.setattr(serve, "kb", None)
+    monkeypatch.setattr(config, "_ollama_ps", _no_daemon)
+    monkeypatch.setattr(config, "unload_ollama_model", lambda model: False)
 
 
 @pytest.fixture(autouse=True)

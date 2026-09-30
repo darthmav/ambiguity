@@ -555,3 +555,33 @@ def test_shift_invert_survives_the_singular_shift() -> None:
     evals = smallest_eigsh(laplacian_matrix(G), k=2, return_eigenvectors=False)
     dense = np.sort(np.linalg.eigvalsh(laplacian_matrix(G).toarray()))
     assert np.allclose(evals, dense[:2], rtol=1e-8, atol=1e-9)
+
+
+def test_the_dense_path_returns_the_k_eigenvalues_asked_for():
+    """Under 50 nodes the dense solver answered with the whole spectrum.
+
+    `topics()` reads the largest gap in what it is handed, so on a small
+    corpus it searched every eigenvalue rather than the low end -- and could
+    propose more clusters than `MAX_AUTO_CLUSTERS` allows.
+    """
+    G = nx.karate_club_graph()  # 34 nodes: the dense path
+    everything = np.sort(np.linalg.eigvalsh(normalized_laplacian_matrix(G).toarray()))
+
+    low = compute_spectrum(G, k=5, normalized=True, which="SM")
+    high = compute_spectrum(G, k=3, normalized=True, which="LA")
+
+    assert low.shape == (5,) and np.allclose(low, everything[:5])
+    assert high.shape == (3,) and np.allclose(high, everything[-3:])
+    assert compute_spectrum(G).shape == (34,)
+
+
+def test_dense_eigenpairs_honour_which():
+    """The dense path took the first k whatever `which` asked for."""
+    G = nx.karate_club_graph()
+
+    values, vectors = compute_eigenpairs(G, k=2, which="LA")
+    L = laplacian_matrix(G).toarray()
+
+    assert np.allclose(values, np.sort(np.linalg.eigvalsh(L))[-2:])
+    assert vectors.shape == (34, 2)
+    assert np.allclose(L @ vectors, vectors * values, atol=1e-8)

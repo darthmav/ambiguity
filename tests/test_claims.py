@@ -30,10 +30,10 @@ a fixture would test the checker.
 from __future__ import annotations
 
 import re
+import tomllib
 from pathlib import Path, PurePosixPath
 
 import pytest
-import tomllib
 
 from langgraph_agent.config import DEFAULT_SEATS
 from langgraph_agent.graphrag_server import (
@@ -612,11 +612,27 @@ def test_no_capital_forced_by_position_becomes_a_hub_entity():
 # "Verification script for ..." three times over) -- the word describes a
 # class of thing (a count, a category of script), not a thing the project has
 # one of. All four joined `ENTITY_STOPWORDS` instead.
+#
+# Redone on 2026-09-30, after the example scripts caught up with the seats
+# moving to local models (0b2152f): `example_usage.py` stopped warning that a
+# missing cloud key meant canned stub output, and both it and `test_cloud.py`
+# now read the seats and the recursion backstop off the package. `AGENTS`
+# (config's tuple of the four seats) and `RECURSION_LIMIT` (the graph's
+# superstep backstop) arrived at 3 documents each -- `serve.py`,
+# `example_usage.py`, `test_cloud.py` -- and both are identifiers this project
+# defines, so both stay. `ANTHROPIC_API_KEY` and `StubLLM` left on
+# subtraction, falling to 2 documents each when that warning went, not by
+# losing an argument about what the project is about. Later the same day the
+# console stopped listening on every interface: `CONSOLE_HOST`, the variable
+# that says where it listens, arrived at 3 documents -- `serve.py`, CLAUDE.md,
+# README.md -- and is an identifier this project defines, so it stays.
+# `ValueError` left without losing a document: still at 3, it is the tie at
+# the twentieth slot, which the ranking settles by name.
 AUDITED_TOP_ENTITIES = frozenset({
     "Architect", "Builder", "Researcher", "Laplacian", "Planner", "System",
-    "ValueError", "Fiedler", "AgentState", "Exception", "ANTHROPIC_API_KEY",
+    "CONSOLE_HOST", "Fiedler", "AgentState", "Exception", "AGENTS",
     "Anthropic", "Python", "Cloud", "Corpus", "OpenAI", "Ollama", "Search",
-    "State", "StubLLM",
+    "State", "RECURSION_LIMIT",
 })
 
 

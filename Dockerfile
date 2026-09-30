@@ -19,10 +19,11 @@
 FROM archlinux:base AS base
 
 # The runtime half of install.sh's REQUIRED list. What is deliberately absent:
-#   ollama      -- the daemon stays on the host. It owns the embedding model's
-#                  placement on the GPU and holds the ollama.com credentials
-#                  for the `:cloud` tags every default seat runs; this image
-#                  only ever speaks HTTP to it (OLLAMA_BASE_URL).
+#   ollama      -- the daemon stays on the host. It holds the weights every
+#                  default seat runs, owns the embedding model's placement on
+#                  the GPU, and holds the ollama.com credentials for any
+#                  `:cloud` tag; this image only ever speaks HTTP to it
+#                  (OLLAMA_BASE_URL).
 #   xdg-utils   -- a container has no browser to open.
 #   base-devel  -- build stage only.
 # postgresql-libs is here for the reason install.sh puts it on the host: psql

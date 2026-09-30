@@ -10,9 +10,11 @@
 # repos, Python packages from PyPI, the embedding model from the local Ollama
 # daemon (its tokenizer from Hugging Face -- the chunker cuts passages with it
 # in-process), the SearxNG and PostgreSQL images from Docker Hub, and inference
-# from Ollama Cloud tags through that daemon, which a free ollama.com account
-# can run. No seat needs an API key and nothing here asks for one: Anthropic
-# and OpenAI stay optional, and unconfigured.
+# from models that daemon runs from its own weights. No default seat needs an
+# account: an Ollama Cloud tag -- which a free ollama.com account can run -- is
+# pulled as an extra seat choice only when the daemon is signed in, and a
+# sign-in is asked for only when a seat is set up to use one. Nothing here asks
+# for an API key: Anthropic and OpenAI stay optional, and unconfigured.
 #
 # The driver is the machine's own setup, not this script's -- Omarchy installs
 # it. Nothing in this project touches torch or a card itself: the daemon owns
@@ -275,75 +277,102 @@ else
     else
         ok "daemon answering at $OLLAMA_URL ($(ollama --version 2>/dev/null | awk '{print $NF}'))"
 
-        # `:cloud` tags run on ollama.com, so the daemon has to be signed in.
-        # /api/me answers 200 only when it is; a daemon too old to have the
-        # route answers 404, and then the pulls below are the test instead.
-        me_status() { curl -s -m 5 -o /dev/null -w '%{http_code}' -X POST "$OLLAMA_URL/api/me"; }
-        signed="$(me_status || true)"
-        if [ "$signed" != "200" ] && [ "$signed" != "404" ]; then
-            if interactive; then
-                echo "  the daemon is not signed in to ollama.com (a free account is enough)"
-                ollama signin || true
-                signed="$(me_status || true)"
-            fi
-        fi
-        case "$signed" in
-            200) ok "signed in to ollama.com" ;;
-            404) echo "  (this daemon cannot report its sign-in; the pulls will tell)" ;;
-            *)   problem "Ollama is not signed in: run 'ollama signin', then re-run ./install.sh" ;;
-        esac
-
-        # Pull what the seats and the embedder actually use -- config.py and
-        # graphrag_server plus any .env override -- rather than a list kept
-        # here. A seat whose tag is not on the daemon shows NOT PULLED and
-        # fails its run; an embedding tag that is missing fails the corpus
-        # phase every run starts with. The embedder is always the one Ollama
-        # tag graphrag_server names.
-        #
-        # `AGENT_LLM_OPTIONS` widens that to every tag a seat could be
-        # reassigned to from the console dropdown, not only what it starts
-        # on: the two dolphin tags, the two Ollama Cloud tags, and
-        # `qwen3.8:latest` are all pulled up front so switching a seat live
-        # never needs a mid-run pull. `set_seat` refuses anything outside
-        # this list anyway, so nothing pulled here is unreachable from the
-        # UI, and nothing reachable from the UI is left unpulled.
+        # What there is to pull, and what each tag is for -- read from
+        # config.py and graphrag_server plus any .env override, rather than a
+        # list kept here. A `seat` tag is what a seat runs now: missing, it
+        # shows NOT PULLED and fails its run. The `embed` tag is the one
+        # embedding model: missing, every run's corpus phase fails. An
+        # `option` is a tag AGENT_LLM_OPTIONS suggests moving a seat onto,
+        # pulled up front so a live switch never waits on a download; the
+        # console's dropdowns -- and `set_seat` -- offer whatever `ollama ls`
+        # reports, so pulling one here is also what puts it in them. A seat or
+        # the embedder that cannot be pulled is a problem; an option is a note.
         #
         # Captured rather than streamed into mapfile: a process substitution
         # hides its exit status, so a broken import would pull nothing and
         # say so nowhere.
-        seat_models=()
+        wanted_models=()
         if model_list="$("$PY" - <<'PY'
 from langgraph_agent.config import AGENTS, AGENT_LLM_OPTIONS, get_agent_model_info
 from langgraph_agent.graphrag_server import EMBEDDING_MODEL_NAME
 
-seen: list[str] = []
+roles: dict[str, str] = {}
 for agent in AGENTS:
     info = get_agent_model_info(agent)
-    if info["provider"] == "ollama" and info["model"] not in seen:
-        seen.append(info["model"])
+    if info["provider"] == "ollama":
+        roles.setdefault(info["model"], "seat")
+roles.setdefault(EMBEDDING_MODEL_NAME, "embed")
 for option in AGENT_LLM_OPTIONS:
-    if option["provider"] == "ollama" and option["model"] not in seen:
-        seen.append(option["model"])
-if EMBEDDING_MODEL_NAME not in seen:
-    seen.append(EMBEDDING_MODEL_NAME)
-print("\n".join(seen))
+    if option["provider"] == "ollama":
+        roles.setdefault(option["model"], "option")
+print("\n".join(f"{role}\t{model}" for model, role in roles.items()))
 PY
         )"; then
-            mapfile -t seat_models <<<"$model_list"
+            mapfile -t wanted_models <<<"$model_list"
         else
             problem "could not read the seat and embedding models from config.py, so nothing was pulled"
         fi
+
+        is_cloud_tag() { case "$1" in *:cloud|*-cloud) return 0 ;; *) return 1 ;; esac; }
+        cloud_seats=()
+        for entry in "${wanted_models[@]}"; do
+            if [ "${entry%%$'\t'*}" = seat ] && is_cloud_tag "${entry#*$'\t'}"; then
+                cloud_seats+=("${entry#*$'\t'}")
+            fi
+        done
+
+        # ollama.com is needed only for `:cloud` tags. Every default seat runs
+        # on weights this daemon holds, so a machine with no account is a
+        # complete install, and is asked to sign in only when a seat it is set
+        # up to use is a cloud tag. /api/me answers 200 only when the daemon is
+        # signed in; one too old to have the route answers 404, and then the
+        # pulls below are the test instead.
+        me_status() { curl -s -m 5 -o /dev/null -w '%{http_code}' -X POST "$OLLAMA_URL/api/me"; }
+        signed="$(me_status || true)"
+        if [ "$signed" != "200" ] && [ "$signed" != "404" ] && [ "${#cloud_seats[@]}" -gt 0 ] && interactive; then
+            echo "  ${cloud_seats[*]} runs on ollama.com, and the daemon is not signed in (a free account is enough)"
+            ollama signin || true
+            signed="$(me_status || true)"
+        fi
+        cloud_ready=1
+        case "$signed" in
+            200) ok "signed in to ollama.com" ;;
+            404) echo "  (this daemon cannot report its sign-in; the pulls will tell)" ;;
+            *)
+                cloud_ready=0
+                if [ "${#cloud_seats[@]}" -gt 0 ]; then
+                    problem "${cloud_seats[*]} runs on ollama.com and the daemon is not signed in: run 'ollama signin', then re-run ./install.sh"
+                else
+                    echo "  not signed in to ollama.com: no seat needs it, so Ollama Cloud choices are skipped"
+                fi
+                ;;
+        esac
+
         pulled="$(ollama list 2>/dev/null | awk 'NR > 1 {print $1}')"
-        for model in "${seat_models[@]}"; do
-            [ -z "$model" ] && continue
+        skipped_cloud=()
+        for entry in "${wanted_models[@]}"; do
+            [ -z "$entry" ] && continue
+            role="${entry%%$'\t'*}"
+            model="${entry#*$'\t'}"
             if grep -qxF "$model" <<<"$pulled"; then
                 ok "$model already on the daemon"
+            elif is_cloud_tag "$model" && [ "$cloud_ready" -eq 0 ]; then
+                # A cloud seat is already a problem above; a cloud option is
+                # only skipped, and named once below.
+                if [ "$role" = option ]; then
+                    skipped_cloud+=("$model")
+                fi
             elif ollama pull "$model"; then
                 ok "pulled $model"
+            elif [ "$role" = option ]; then
+                NOTES+=("could not pull $model, an optional seat choice: the console offers it once 'ollama pull $model' succeeds")
             else
                 problem "could not pull $model (signed in? tag spelled right?)"
             fi
         done
+        if [ "${#skipped_cloud[@]}" -gt 0 ]; then
+            NOTES+=("Ollama Cloud choices not pulled (${skipped_cloud[*]}): run 'ollama signin' and re-run ./install.sh to offer them")
+        fi
 
         # Older NVIDIA cards need Ollama's CUDA 12 runner. Arch's ollama-cuda
         # is built with CUDA 13, which dropped compute capability below 7.5 --
@@ -897,12 +926,15 @@ step "Console"
 # The promise at the top of this script is a console that runs, and nothing
 # above starts one. So serve.py is started on a free port, asked for
 # /api/status -- what launch_console.sh waits on -- and for the page itself,
-# then stopped. Starting the server opens no corpus and writes nothing, so the
-# machine is left as it was found. SIGTERM, not SIGINT: bash starts background
-# jobs with SIGINT ignored, and the server would never see it.
+# then stopped. INDEX_PROJECT_BEFORE_RUN=0 is what leaves the machine as it was
+# found: a console brings the corpus up to date as soon as it is serving, so
+# without it this check started a first build -- the embedding model loaded
+# onto the cards, knowledge/ created -- and then killed it seconds in. SIGTERM,
+# not SIGINT: bash starts background jobs with SIGINT ignored, and the server
+# would never see it.
 console_log=/tmp/ambiguity-console-check.log
 console_port="$("$PY" -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
-PORT="$console_port" "$PY" serve.py >"$console_log" 2>&1 &
+PORT="$console_port" INDEX_PROJECT_BEFORE_RUN=0 "$PY" serve.py >"$console_log" 2>&1 &
 console_pid=$!
 console_up=0
 for _ in $(seq 1 60); do

@@ -150,3 +150,20 @@ def test_entities_are_decoded_before_words_are_counted():
 
     assert "&amp;" not in page.text
     assert "Ranking & retrieval" in page.text
+
+
+def test_an_icons_title_does_not_join_the_pages():
+    """Only the first <title> names the page.
+
+    An inline <svg> carries a title of its own for accessibility, and every
+    one of them used to be appended to the page's, so the provenance header
+    of a stored page read "Hybrid retrieval Search Close".
+    """
+    page = extract(
+        "<html><head><title>Hybrid retrieval</title></head><body>"
+        "<svg><title>Search</title><path d='M0'/></svg>"
+        f"<p>{ARTICLE}</p><svg><title>Close</title></svg></body></html>"
+    )
+
+    assert page.title == "Hybrid retrieval"
+    assert "Search" not in page.text and "Close" not in page.text

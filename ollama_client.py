@@ -19,10 +19,12 @@ import ollama
 from langgraph_agent.config import LLM_TIMEOUT_SECONDS, _ollama_base_url
 
 # The same local tag the Architect/Planner/Researcher seats default to
-# (config.DEFAULT_SEATS): 5.3 GB, loads 100% onto the GPU alongside
-# `qwen3-embedding:latest` without evicting it (`qwen3.8:latest`, at 17 GB
-# against 6 GB of VRAM, would). `GPU_ARBITER` still serializes the two against
-# each other; this just avoids the CPU-fallback case entirely.
+# (config.DEFAULT_SEATS): 5.3 GB, which loads 100% onto the cards on its own
+# (`qwen3.8:latest`, at 17 GB against 6 GB of VRAM, never does). It does not
+# fit beside `qwen3-embedding:latest` -- the two want roughly 10 GB of that
+# 6 GB, which is why the seats go through `GPU_ARBITER` and evict the embedder
+# first. This script does neither, so the placement it gets is whatever the
+# daemon makes of the cards as it finds them; `ollama ps` shows the split.
 DEFAULT_MODEL = "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M"
 
 

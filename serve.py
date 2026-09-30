@@ -24,7 +24,7 @@ from collections.abc import Callable, Iterator
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 # Upstream libraries (langsmith, chromadb) emit DeprecationWarnings on Python 3.14+
 # about asyncio.iscoroutinefunction. They are harmless and outside our control,
@@ -1922,51 +1922,14 @@ def rpc_run_goal(params: dict[str, Any]) -> dict[str, Any]:
             stopping=False,
         )
 
-    # The corpus first, then online research, then the Architect opens. Both
-    # phases write to the corpus and both run outside `graph.stream`, because
-    # `_refuse_while_a_run_is_in_flight` forbids every other writer from
-    # touching it once the stream starts -- doing them here is not a way around
-    # that rule but the only ordering that obeys it. Which of the two goes
-    # first is itself load-bearing: see `_index_the_project_before_the_run`.
-    corpus_report = _index_the_project_before_the_run()
-    corpus_line = _corpus_feed_line(corpus_report)
-    if corpus_line:
-        print(f"[run] corpus -> {corpus_line}")
-
-    # The embedder has no relevance floor until its corpus is whole, so it is
-    # measured here: after the corpus phase, before any seat searches.
-    calibration_report = _calibrate_the_floor_before_the_run(corpus_report)
-    calibration_line = _calibration_feed_line(calibration_report)
-    if calibration_line:
-        print(f"[run] calibration -> {calibration_line}")
-
-    # Online research is off unless the caller asks, the same shape as
-    # `expect_failures` below and for the same reason: what this turns on
-    # cannot be judged from the goal. A discussion run never researches online
-    # whatever the box says -- the phase writes pages under research/web/ and
-    # embeds them, which is a change to this machine and to every later run's
-    # corpus. "No actions" has to mean that too, so the two flags are resolved
-    # here rather than left to the operator to keep consistent.
-    research_report = _research_online_before_the_run(
-        goal, research_web and not discuss_only
-    )
-    research_line = _research_feed_line(research_report)
-    print(f"[run] research -> {research_line}")
-    opening = [
-        line
-        for line in (corpus_line, calibration_line, research_line)
-        if line
-    ]
-    with _run_lock:
-        _run_progress["messages"] = list(opening)
-
     state: AgentState = {
         "goal": goal,
-        # Seeded rather than pushed only to `_run_progress`, which every node
-        # update overwrites wholesale: these lines have to survive into the
-        # final payload and the snapshot, because what the run was told is part
-        # of how its result should be read.
-        "messages": list(opening),
+        # Seeded below with what the pre-run phases said, rather than pushed
+        # only to `_run_progress`, which every node update overwrites
+        # wholesale: those lines have to survive into the final payload and the
+        # snapshot, because what the run was told is part of how its result
+        # should be read.
+        "messages": [],
         "architecture": "",
         "verdict": "",
         "plan": "",
@@ -1998,17 +1961,66 @@ def rpc_run_goal(params: dict[str, Any]) -> dict[str, Any]:
     # that ran for minutes and produced real work reported nothing at all --
     # from the console it was indistinguishable from a request never sent.
     last = state
+    research_report: dict[str, Any] = {}
     started = time.monotonic()
     over_budget = False
     stopped = False
     node_at_stop = ""
 
-    # Everything below is in a try/finally so the bookkeeping runs even when the
-    # graph raises. Without it a run that died left `running` True forever and
-    # the console polled a run that no longer existed -- and the snapshot, which
-    # is the whole recovery story, would only ever be written by runs that did
-    # not need recovering.
+    # Everything from the claim above to the end is in a try/finally, so the
+    # bookkeeping runs whatever raises. Without it a run that died left
+    # `running` True forever and the console polled a run that no longer
+    # existed -- and the snapshot, which is the whole recovery story, would only
+    # ever be written by runs that did not need recovering. The pre-run phases
+    # are inside it too: they used to run between the claim and the `try`, so
+    # one that raised left the run claimed with nothing behind it -- every later
+    # run refused as "already in flight", every upload and clear refused, and
+    # an exit waiting on a `finally` that would never come.
     try:
+        # The corpus first, then online research, then the Architect opens.
+        # Both phases write to the corpus and both run outside `graph.stream`,
+        # because `_refuse_while_a_run_is_in_flight` forbids every other writer
+        # from touching it once the stream starts -- doing them here is not a
+        # way around that rule but the only ordering that obeys it. Which of
+        # the two goes first is itself load-bearing: see
+        # `_index_the_project_before_the_run`.
+        corpus_report = _index_the_project_before_the_run()
+        corpus_line = _corpus_feed_line(corpus_report)
+        if corpus_line:
+            print(f"[run] corpus -> {corpus_line}")
+
+        # The embedder has no relevance floor until its corpus is whole, so it
+        # is measured here: after the corpus phase, before any seat searches.
+        calibration_report = _calibrate_the_floor_before_the_run(corpus_report)
+        calibration_line = _calibration_feed_line(calibration_report)
+        if calibration_line:
+            print(f"[run] calibration -> {calibration_line}")
+
+        # Online research is off unless the caller asks, the same shape as
+        # `expect_failures` and for the same reason: what this turns on cannot
+        # be judged from the goal. A discussion run never researches online
+        # whatever the box says -- the phase writes pages under research/web/
+        # and embeds them, which is a change to this machine and to every later
+        # run's corpus. "No actions" has to mean that too, so the two flags are
+        # resolved here rather than left to the operator to keep consistent.
+        research_report = _research_online_before_the_run(
+            goal, research_web and not discuss_only
+        )
+        research_line = _research_feed_line(research_report)
+        print(f"[run] research -> {research_line}")
+        opening = [
+            line
+            for line in (corpus_line, calibration_line, research_line)
+            if line
+        ]
+        state["messages"] = list(opening)
+        with _run_lock:
+            _run_progress["messages"] = list(opening)
+
+        # The budget is the graph's, as it always was: RUN_BUDGET_SECONDS is
+        # checked between supersteps, and the phases above are bounded by
+        # their own limits. Reset here so their time is not charged to it.
+        started = time.monotonic()
         if output_dir:
             Path(output_dir).mkdir(parents=True, exist_ok=True)
         try:
@@ -2160,11 +2172,86 @@ QUIET_METHODS = {
 }
 
 
+# Where the console listens. Loopback unless the operator says otherwise, and
+# the reason is what the console *is*: it runs goals, and a goal reaches a
+# Builder that runs programs, so an address anyone on the network can reach is
+# a shell for anyone on the network. It listened on 0.0.0.0, with nothing in
+# front of it. `CONSOLE_HOST=0.0.0.0` restores that for an operator who wants
+# it -- a bridged container publishing its port, a machine behind a firewall
+# they trust. Not `HOST`: some shells and container runtimes export that as the
+# machine's own name, which would have bound a LAN address without anyone
+# asking for one.
+CONSOLE_HOST = os.getenv("CONSOLE_HOST", "127.0.0.1").strip() or "127.0.0.1"
+
+# The names a browser gives this machine's loopback, as a Host header carries
+# them once the port is gone (`urlsplit` lowercases, and strips an IPv6 address
+# of its brackets).
+_LOOPBACK_NAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _listening_on_loopback() -> bool:
+    return CONSOLE_HOST in _LOOPBACK_NAMES or CONSOLE_HOST.startswith("127.")
+
+
+def _foreign_request(headers: Any, *, writes: bool) -> str | None:
+    """Why this request did not come from the console's own page, or None.
+
+    Two checks, each closing a way for a web page the operator merely *visits*
+    to drive the console -- which, since the console runs goals, is a way to
+    run programs on this machine:
+
+    - **Origin**, on anything that writes. A browser names the page a request
+      came from, and a page on another site had only to POST with a `text/plain`
+      body -- a "simple" request, sent without asking first -- to reach
+      `run_goal`; the handler never looked at the content type, and the wildcard
+      `Access-Control-Allow-Origin` it answered with let that page read the
+      reply as well. The console's own page is the same origin as the server,
+      so its Origin names the Host it asked.
+    - **Host**, while listening on loopback. A page that re-points its own
+      domain at 127.0.0.1 (DNS rebinding) makes its requests same-origin by the
+      browser's account, and its Host header is the one thing that still names
+      the site that sent it. Off loopback the operator chose other names for
+      this machine, and this check steps aside.
+
+    Nothing without those headers is refused: curl, the launcher's readiness
+    poll and the tests send no Origin, and a Host is only judged when present.
+    """
+    host = str(headers.get("Host") or "")
+    if host and _listening_on_loopback():
+        name = urlsplit(f"//{host}").hostname or ""
+        if name not in _LOOPBACK_NAMES:
+            return (
+                f"Host {host!r} is not this machine's loopback, and the console "
+                "listens only there. Open it at http://localhost instead."
+            )
+    origin = headers.get("Origin")
+    if writes and origin is not None:
+        if urlsplit(str(origin)).netloc.lower() != host.lower():
+            return (
+                f"A page at {origin!r} may not drive this console: only the "
+                "console's own page can. Nothing was run."
+            )
+    return None
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, directory="frontend", **kwargs)
 
+    def _refused_as_foreign(self, *, writes: bool) -> bool:
+        """Refuse a request from anywhere but the console's own page; True if refused."""
+        reason = _foreign_request(self.headers, writes=writes)
+        if reason is None:
+            return False
+        print(f"[API] refused {self.command} {self.path}: {reason}")
+        # The reason goes in the body: `send_error`'s message is the status
+        # line's reason phrase, which is no place for a sentence.
+        self.send_error(403, "Refused", reason)
+        return True
+
     def do_GET(self) -> None:
+        if self._refused_as_foreign(writes=False):
+            return
         parsed = urlparse(self.path)
 
         if parsed.path == "/api/status":
@@ -2180,6 +2267,8 @@ class Handler(SimpleHTTPRequestHandler):
             super().do_GET()
 
     def do_POST(self) -> None:
+        if self._refused_as_foreign(writes=True):
+            return
         parsed = urlparse(self.path)
         # A body whose length is unusable is refused before it is read, and one
         # that is not a JSON object after. `data.get` on a list or a string
@@ -2288,7 +2377,9 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # No Access-Control-Allow-Origin. The console's page is served from
+        # this same origin and needs none; the `*` this sent let any other
+        # site read every reply, run results included.
         self.end_headers()
         self.wfile.write(payload)
 
@@ -2338,12 +2429,17 @@ def main() -> None:
     sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
 
     port = int(os.getenv("PORT", "8080"))
-    print(f"Serving at http://localhost:{port}")
+    if _listening_on_loopback():
+        print(f"Serving at http://localhost:{port}")
+    else:
+        # Said, because it is the one setting that makes the console reachable
+        # from other machines -- see CONSOLE_HOST.
+        print(f"Serving at http://{CONSOLE_HOST}:{port} (CONSOLE_HOST: reachable beyond this machine)")
     print("Press Ctrl+C to stop, or use the console's exit button")
 
-    # Threaded: a run takes as long as four cloud models take, and a
+    # Threaded: a run takes as long as four seat models take, and a
     # single-threaded server would stall every status poll behind it.
-    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    server = ThreadingHTTPServer((CONSOLE_HOST, port), Handler)
     # `serve_forever` moves off the main thread so the main thread is free to
     # wait on both ways out: Ctrl+C, and the console asking to exit. Calling
     # `shutdown()` from the request thread that asked for it would deadlock --

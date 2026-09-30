@@ -21,7 +21,8 @@ permissions:
 jobs:
   # Ruff needs none of the project's dependencies, so it runs on its own and
   # reports in well under a minute. The test job below spends most of its time
-  # installing torch; a formatting mistake should not wait for that.
+  # installing the scientific and vector-store stack; a formatting mistake
+  # should not wait for that.
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 5

@@ -698,3 +698,162 @@ def test_sync_tool_call(tmp_path, monkeypatch):
     )
     assert result["success"]
     assert (tmp_path / "sync.txt").read_text(encoding="utf-8") == "sync ok"
+
+
+def test_a_tool_raising_runtime_error_is_reported_as_itself(monkeypatch):
+    """The bridge used to catch any RuntimeError as "a loop is already running".
+
+    Its fallback then asked for an event loop that does not exist on a worker
+    thread -- or on any thread, from Python 3.14 -- and raised "There is no
+    current event loop" in place of the tool's own error. The embedder reports
+    every failure as RuntimeError, so that was the error most often lost.
+    """
+    from langgraph_agent import mcp_client as module
+    from langgraph_agent.nodes import _call_mcp_tool_sync
+
+    async def broken(self, args):
+        raise RuntimeError("Ollama could not embed with the model: refused")
+
+    monkeypatch.setattr(module.MCPClient, "_filesystem_read", broken)
+
+    with pytest.raises(RuntimeError, match="could not embed"):
+        _call_mcp_tool_sync("filesystem_read", {"path": "x"})
+
+
+@pytest.mark.asyncio
+async def test_the_sync_bridge_works_under_a_running_loop(tmp_path, monkeypatch):
+    """`asyncio.run` refuses to nest, so a caller already in a loop gets a thread."""
+    monkeypatch.chdir(tmp_path)
+    from langgraph_agent.nodes import _call_mcp_tool_sync
+
+    result = _call_mcp_tool_sync("filesystem_write", {"path": "in_loop.txt", "content": "ok"})
+
+    assert result["success"]
+    assert (tmp_path / "in_loop.txt").read_text(encoding="utf-8") == "ok"
+
+
+def _git_repo(path: Path) -> None:
+    """A repository with one committed file, isolated from the user's git config."""
+    import subprocess
+
+    def git(*argv: str) -> None:
+        subprocess.run(
+            ["git", "-c", "commit.gpgsign=false", "-c", "user.email=t@example.com",
+             "-c", "user.name=t", *argv],
+            cwd=path, check=True, capture_output=True,
+        )
+
+    git("init", "-q")
+    (path / "a.txt").write_text("one\n", encoding="utf-8")
+    git("add", "a.txt")
+    git("commit", "-qm", "init")
+
+
+@pytest.mark.asyncio
+async def test_git_diff_with_no_path_shows_the_whole_diff(client: MCPClient, tmp_path, monkeypatch):
+    """`git_diff()` ran `git diff ""`, which git refuses outright.
+
+    The exit status went unread, so the refusal's empty stdout came back as
+    success with "No changes" -- on every call, however much had changed.
+    """
+    _git_repo(tmp_path)
+    (tmp_path / "a.txt").write_text("two\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    whole = await client.call_tool("git_diff", {})
+    one = await client.call_tool("git_diff", {"path": "a.txt"})
+
+    assert whole["success"] and "+two" in whole["diff"]
+    assert one["success"] and "+two" in one["diff"]
+
+
+@pytest.mark.asyncio
+async def test_git_status_outside_a_repository_is_a_failure(client: MCPClient, tmp_path, monkeypatch):
+    """Nothing on stdout is what a clean tree prints -- and what a failure prints."""
+    monkeypatch.chdir(tmp_path)
+
+    status = await client.call_tool("git_status", {})
+
+    assert not status["success"]
+    assert "not a git repository" in status["error"]
+
+
+@pytest.mark.asyncio
+async def test_run_tests_runs_the_suite_in_the_directory_it_is_given(
+    client: MCPClient, tmp_path, monkeypatch
+):
+    """A generated project's Builder is told to pass `cwd`, and the tool ignored it.
+
+    It ran this checkout's own `tests/` instead, reporting on a suite the
+    project never had while the project's own went unrun. Asserted on what
+    `subprocess.run` is handed rather than by running pytest: under the old
+    behaviour a real run is this very suite, which contains this test, and it
+    recursed.
+    """
+    calls: list[tuple[list[str], dict]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        return SimpleNamespace(returncode=0, stdout="1 passed", stderr="")
+
+    monkeypatch.setattr("langgraph_agent.mcp_client.subprocess.run", fake_run)
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    result = await client.call_tool("run_tests", {"cwd": str(project)})
+    missing = await client.call_tool("run_tests", {"cwd": str(tmp_path / "nope")})
+    await client.call_tool("run_tests", {})
+
+    assert result["success"]
+    (in_project, in_project_kwargs), (checkout, checkout_kwargs) = calls
+    assert in_project_kwargs["cwd"] == str(project)
+    assert in_project[-2:] == [".", "-q"]
+    assert checkout_kwargs["cwd"] is None and checkout[-2:] == ["tests/", "-q"]
+    # Refused before anything is spawned, naming the directory's problem.
+    assert not missing["success"] and "does not exist" in missing["error"]
+
+
+@pytest.mark.asyncio
+async def test_run_tests_clamps_the_timeout_it_is_asked_for(client: MCPClient, monkeypatch):
+    """A tool call is never abandoned, so an unclamped timeout outlives every deadline."""
+    seen: dict = {}
+
+    def fake_run(argv, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="1 passed", stderr="")
+
+    monkeypatch.setattr("langgraph_agent.mcp_client.subprocess.run", fake_run)
+
+    for asked in (99999, None, "soon"):
+        await client.call_tool("run_tests", {} if asked is None else {"timeout": asked})
+        # A malformed value falls back to the suite's own default, the ceiling,
+        # rather than to the one-command default a test suite would outrun.
+        assert seen["timeout"] == TERMINAL_TIMEOUT_MAX_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_a_file_too_large_to_read_whole_is_refused_with_a_way_to_read_part(
+    client: MCPClient, tmp_path, monkeypatch
+):
+    """A dump the size of the disk was read into memory whole, to be cut at 20,000."""
+    from langgraph_agent import mcp_client as module
+
+    monkeypatch.setattr(module, "FILESYSTEM_READ_MAX_BYTES", 10)
+    (tmp_path / "big.log").write_text("x" * 11, encoding="utf-8")
+    (tmp_path / "small.txt").write_text("0123456789", encoding="utf-8")
+
+    refused = await client.call_tool("filesystem_read", {"path": str(tmp_path / "big.log")})
+    read = await client.call_tool("filesystem_read", {"path": str(tmp_path / "small.txt")})
+
+    assert not refused["success"] and "head -n 200" in refused["error"]
+    assert read["success"] and read["content"] == "0123456789"
+
+
+def test_builder_can_ask_for_a_directory_to_run_tests_in():
+    """The schema must expose `cwd`, or OUTPUT_DIR_NOTE asks for what cannot be sent."""
+    from langgraph_agent.nodes import BUILDER_TOOLS, OUTPUT_DIR_NOTE
+
+    tool = next(t for t in BUILDER_TOOLS if t["function"]["name"] == "run_tests")
+
+    assert "cwd" in tool["function"]["parameters"]["properties"]
+    assert "run_tests" in OUTPUT_DIR_NOTE

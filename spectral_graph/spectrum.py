@@ -88,6 +88,24 @@ def smallest_eigsh(
     return eigenvalues[idx], eigenvectors[:, idx]
 
 
+def _dense_window(n: int, k: int, which: str) -> slice:
+    """The k eigenpairs `which` asks for, out of all n a dense solver returns.
+
+    The dense solvers return the whole spectrum in ascending order, so a
+    caller that asked for k of them has to be handed k -- the end `which`
+    names -- or the dense path answers a different question from the sparse
+    one. It did: `compute_spectrum(G, k=13)` on a graph under 50 nodes came
+    back with every eigenvalue the graph has, and `topics()`, which reads the
+    largest gap in what it is handed, searched the whole spectrum rather than
+    the low end -- proposing more clusters than `MAX_AUTO_CLUSTERS` allows on
+    any corpus small enough to take this path. On a Laplacian, which is
+    positive semi-definite, "LM"/"LA" are the top of the spectrum and
+    "SM"/"SA" the bottom.
+    """
+    k = min(k, n)
+    return slice(n - k, n) if which in ("LM", "LA") else slice(0, k)
+
+
 def compute_spectrum(
     G: nx.Graph,
     k: int | None = None,
@@ -108,7 +126,8 @@ def compute_spectrum(
     normalized : bool, default False
         If True, use normalized Laplacian; otherwise use unnormalized.
     which : str, default 'SM'
-        Which eigenvalues to compute (for sparse solver):
+        Which k eigenvalues to return. Honoured on both paths -- the dense
+        solver computes them all and returns the end asked for:
         - 'SM': smallest magnitude
         - 'LM': largest magnitude
         - 'SA': smallest algebraic
@@ -117,7 +136,8 @@ def compute_spectrum(
     Returns
     -------
     numpy.ndarray
-        Array of eigenvalues in ascending order
+        Array of eigenvalues in ascending order: all n when `k` is None,
+        otherwise min(k, n) of them.
 
     Examples
     --------
@@ -130,6 +150,8 @@ def compute_spectrum(
     >>> # First eigenvalue should be 0 (or very close)
     >>> abs(eigenvalues[0]) < 1e-10
     True
+    >>> compute_spectrum(G, k=2).shape
+    (2,)
     """
     n = G.number_of_nodes()
 
@@ -141,9 +163,11 @@ def compute_spectrum(
 
     # Use dense solver for small graphs, sparse for large
     if k is None or k >= n - 1 or n < 50:
-        # Dense solver - compute all eigenvalues
+        # Dense solver - compute all eigenvalues, then keep the k asked for.
         L_dense = L.toarray() if sparse.issparse(L) else L
         eigenvalues = np.linalg.eigvalsh(L_dense)
+        if k is not None:
+            eigenvalues = eigenvalues[_dense_window(n, k, which)]
     elif which == "SM":
         # Shift-invert; see `smallest_eigsh` for why the default path does not
         # hand "SM" to ARPACK directly.
@@ -177,7 +201,8 @@ def compute_eigenpairs(
     normalized : bool, default False
         If True, use normalized Laplacian; otherwise use unnormalized.
     which : str, default 'SM'
-        Which eigenvalues to compute (for sparse solver):
+        Which k eigenpairs to return. Honoured on both paths -- the dense
+        solver computes them all and returns the end asked for:
         - 'SM': smallest magnitude
         - 'LM': largest magnitude
         - 'SA': smallest algebraic
@@ -187,7 +212,7 @@ def compute_eigenpairs(
     -------
     tuple
         (eigenvalues, eigenvectors) where:
-        - eigenvalues: 1D array of shape (k,)
+        - eigenvalues: 1D array of shape (k,), ascending
         - eigenvectors: 2D array of shape (n, k), column i is eigenvector for eigenvalue i
 
     Examples
@@ -214,9 +239,11 @@ def compute_eigenpairs(
         # Dense solver
         L_dense = L.toarray() if sparse.issparse(L) else L
         eigenvalues, eigenvectors = eigh(L_dense)
-        # Take first k
-        eigenvalues = eigenvalues[:k]
-        eigenvectors = eigenvectors[:, :k]
+        # The k `which` asks for. This took the first k whatever `which` said,
+        # so a dense "LM" returned the smallest eigenpairs.
+        window = _dense_window(n, k, which)
+        eigenvalues = eigenvalues[window]
+        eigenvectors = eigenvectors[:, window]
     elif which == "SM":
         eigenvalues, eigenvectors = smallest_eigsh(L, k=k)
     else:

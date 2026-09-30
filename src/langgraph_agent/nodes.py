@@ -36,6 +36,16 @@ def _call_mcp_tool_sync(tool_name: str, arguments: dict[str, Any]) -> Any:
     """Call an MCP tool from a synchronous LangGraph node.
 
     The MCP client is async, so this helper bridges sync and async contexts.
+
+    The branch is decided by asking whether a loop is running, never by
+    catching `RuntimeError` from `asyncio.run`. That is what this used to do,
+    and a tool raising `RuntimeError` of its own -- the embedder's "Ollama
+    could not embed ...", say -- landed in the fallback, whose
+    `get_event_loop()` has no loop to return on a worker thread (or on any
+    thread, from Python 3.14) and raised "There is no current event loop"
+    in its place. The caller was told about a loop nobody asked for, and the
+    tool's own error was gone. A loop that *is* running on this thread cannot
+    be re-entered either, so that case runs the call on a thread of its own.
     """
 
     async def _call() -> Any:
@@ -43,11 +53,25 @@ def _call_mcp_tool_sync(tool_name: str, arguments: dict[str, Any]) -> Any:
             return await client.call_tool(tool_name, arguments)
 
     try:
-        return asyncio.run(_call())
+        asyncio.get_running_loop()
     except RuntimeError:
-        # Already running inside an event loop (e.g., some test runners).
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_call())
+        return asyncio.run(_call())
+
+    box: list[Any] = []
+    error: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            box.append(asyncio.run(_call()))
+        except BaseException as exc:  # re-raised on the caller's thread below
+            error.append(exc)
+
+    worker = threading.Thread(target=_run, name="mcp-tool-call")
+    worker.start()
+    worker.join()
+    if error:
+        raise error[0]
+    return box[0]
 
 
 _T = TypeVar("_T")
@@ -151,8 +175,6 @@ def _load_prompt(name: str, fallback: str) -> str:
     Falls back to the inline string so the module works even if the prompt
     files are not present (e.g., during distribution).
     """
-    from pathlib import Path
-
     try:
         prompt_path = Path(__file__).parent.parent.parent / "prompts" / f"{name}.txt"
         return prompt_path.read_text(encoding="utf-8")
@@ -245,21 +267,23 @@ work is done; treat its constraints as binding.
 
 Your only job:
 Gather high-quality, relevant knowledge so the Builder can implement the plan.
-Use tools. Prefer the GraphRAG tool for anything involving relationships, architecture, or multiple files.
+You have no tools. The knowledge base (GraphRAG) has already been searched for
+the plan before you are asked, and what that search returned is given to you
+below the plan, with the reason none of it was accepted automatically. You are
+asked only when retrieval did not clearly answer the plan, so judging those
+passages is the work.
 
 You must:
-- Call GraphRAG (or the knowledge-search tool) before answering, unless the plan is purely about creating a brand-new isolated file with no existing context.
-- Search for entities, relationships, and source passages that match the plan's steps.
-- Summarize what you found. Quote or cite paths and entity names.
+- Read each retrieved passage and decide whether it bears on the plan's steps.
+- Summarize what the relevant passages say. Cite the path of every passage you rely on.
 - Give the Builder concrete recommendations: what to change, where, what to reuse, what not to break.
-- If the graph has little or nothing relevant, say so explicitly. Do not invent a codebase.
+- If the passages have little or nothing relevant, say so explicitly and answer no_relevant_knowledge. Do not invent a codebase.
 - If you need a different question or a replan, say so in Recommendations.
 
 You must not:
 - Write or modify code.
-- Call filesystem write tools or git write tools.
+- Claim to have searched, read or retrieved anything beyond the passages you were given.
 - Make the final implementation decision as if you were the Builder.
-- Pretend you read files you did not retrieve.
 
 Output exactly this format and nothing else:
 
@@ -267,7 +291,7 @@ Output exactly this format and nothing else:
 - ...
 
 ## Relevant Context
-[summary of retrieved entities, relationships, and passages]
+[summary of the passages that bear on the plan, with their paths]
 
 ## Recommendations for Builder
 [what to implement, which files/entities, constraints]
@@ -379,6 +403,17 @@ Step: {state.get("step_count", 0)}
 """
 
 
+# What may stand between a one-word section's heading and its word. The value
+# is read, not merely found: a model writes it on the heading's own line
+# (`## Verdict: revise`) as readily as below it, and decorates a lone word the
+# way it decorates any emphasis -- `**revise**`, `` `revise` ``, `- revise`.
+# Each of those read as no answer at all, and no answer has a fallback: the
+# gate's is `approved`, so an Architect ruling `**revise**` on the Builder's
+# report ended the run as approved, and a Researcher's `**need_replan**` read
+# as ready_for_builder.
+_SECTION_VALUE_LEAD = r"[ \t]*:?\s*(?:[-*+>][ \t]+)?[*_`\"']*"
+
+
 def _parse_planner_output(content: str) -> dict[str, Any]:
     """Parse Planner output into structured format.
 
@@ -407,12 +442,13 @@ def _parse_planner_output(content: str) -> dict[str, Any]:
     if steps_match:
         result["plan"] = steps_match.group(1).strip()
 
-    # Extract next agent
+    # Extract next agent. Capitalised on the way in, so state holds the one
+    # spelling AgentState documents whatever case the seat wrote it in.
     agent_match = re.search(
-        r"## Next Agent\s*\n(Researcher|Builder)(?:\s|$)", content, re.IGNORECASE
+        rf"## Next Agent{_SECTION_VALUE_LEAD}(Researcher|Builder)\b", content, re.IGNORECASE
     )
     if agent_match:
-        result["next_agent"] = agent_match.group(1).strip()
+        result["next_agent"] = agent_match.group(1).strip().capitalize()
 
     # Extract notes
     notes_match = re.search(r"## Notes\s*\n(.*?)(?=##|$)", content, re.DOTALL | re.IGNORECASE)
@@ -465,7 +501,7 @@ def _parse_researcher_output(content: str) -> dict[str, Any]:
         result["recommendations"] = recs_match.group(1).strip()
 
     status_match = re.search(
-        r"## Status\s*\n(ready_for_builder|need_replan|no_relevant_knowledge)",
+        rf"## Status{_SECTION_VALUE_LEAD}(ready_for_builder|need_replan|no_relevant_knowledge)\b",
         content,
         re.IGNORECASE,
     )
@@ -615,7 +651,7 @@ def _parse_architect_output(content: str, reviewing: bool = False) -> dict[str, 
 
     verdicts = "|".join(verdict.value for verdict in Verdict)
     verdict_match = re.search(
-        rf"## Verdict\s*\n({verdicts})\b", content, re.IGNORECASE
+        rf"## Verdict{_SECTION_VALUE_LEAD}({verdicts})\b", content, re.IGNORECASE
     )
     if verdict_match:
         result["verdict"] = verdict_match.group(1).strip().lower()
@@ -651,7 +687,8 @@ def architect_node(state: AgentState) -> AgentState:
 
     No tools. Runs twice per cycle -- as the entry authority before the Planner,
     and as the approval gate after the Builder reports. A populated builder
-    report is what tells the two passes apart.
+    report is what tells the seat which pass it is on. Whatever it answers, the
+    opening pass rules `plan` -- see the comment where that is enforced.
 
     Bounded by `NODE_DEADLINE_SECONDS`. The fallback verdict is never
     `approved`, and that is the whole point of choosing one here: this gate is
@@ -687,6 +724,21 @@ def architect_node(state: AgentState) -> AgentState:
                 Verdict.REVISE.value if state.get("plan") else Verdict.PLAN.value
             ),
         }
+
+    # The opening pass has exactly one ruling, and the prompt says so: `plan`.
+    # Nothing has been planned or built, so there is nothing to approve -- an
+    # opening `approved` ended the run before any seat but this one had worked
+    # -- and `need_research` routed around the Planner, sending the Researcher
+    # an empty `plan` to search on. That second path does not end: the gate
+    # counts a step only while a plan exists (below), and a Planner that never
+    # runs never writes one, so the Researcher -> Builder -> Architect loop went
+    # uncounted until LangGraph's recursion limit killed the run by exception.
+    # A missing plan marks the opening pass, for the reason the step count
+    # gives. What the seat actually said is kept in the feed line.
+    opening = not state.get("plan")
+    answered = parsed["verdict"]
+    if opening and answered != Verdict.PLAN.value:
+        parsed["verdict"] = Verdict.PLAN.value
 
     # Keep the opening architecture if the gate pass did not restate it --
     # losing it mid-run would strip the constraints out of every later prompt.
@@ -758,6 +810,11 @@ def architect_node(state: AgentState) -> AgentState:
         note = (
             f" (no response within {int(NODE_DEADLINE_SECONDS)}s -- "
             "not a ruling, and never an approval)"
+        )
+    elif opening and answered != state["verdict"]:
+        note = (
+            f" (the seat answered `{answered}`, but the opening pass rules "
+            "`plan`: nothing has been planned or built yet)"
         )
     elif overridden:
         note = f" (approval blocked: {'; '.join(reasons)})"
@@ -1088,6 +1145,70 @@ def _research_snippet(content: str) -> str:
     return text[:RESEARCH_SNIPPET_CHARS].rstrip() + f"\n   [... passage truncated at {RESEARCH_SNIPPET_CHARS} characters]"
 
 
+# How much of what retrieval returned the Researcher's seat is shown when it is
+# asked to judge it -- a search whose best hit fell under the relevance floor.
+# Smaller than what reaches the Builder, deliberately: the seat is a local model
+# with a few thousand tokens of window, the prompt and the state already fill
+# part of it, and the question it answers is whether these passages bear on the
+# plan at all, which their opening lines settle.
+RESEARCHER_SEAT_PASSAGES = 3
+RESEARCHER_SEAT_EXCERPT_CHARS = 600
+
+
+def _passage_source(result: dict[str, Any]) -> str:
+    """Where a retrieved passage came from, to the line when the search could tell."""
+    source = str(result.get("id") or "unknown source")
+    if result.get("line"):
+        source += f":{result['line']}"
+    return source
+
+
+def _retrieval_for_the_seat(
+    results: list[dict[str, Any]], floor: float | None, why_none: str
+) -> str:
+    """What retrieval found, put in front of the Researcher's seat to judge.
+
+    The seat is asked only when the search did not clearly answer the plan, and
+    it used to be asked with nothing: its prompt told it to call GraphRAG, it
+    was offered no tool, and the passages the search *had* returned were
+    dropped before it saw them -- so a local model with no evidence was left to
+    invent a codebase or narrate a tool call it could not make. It is now
+    shown what came back, told why none of it was accepted automatically, and
+    judges it; `why_none` says why there is nothing, when there is nothing.
+    """
+    if not results:
+        return (
+            f"Retrieval: nothing to judge -- {why_none}. Do not present anything "
+            "as retrieved. If the plan depends on knowing existing code or docs, "
+            "answer `no_relevant_knowledge`."
+        )
+
+    top = float(results[0].get("score") or 0.0)
+    if floor is None:
+        verdict = (
+            "This corpus has no measured relevance floor yet, so none of them "
+            "could be accepted automatically"
+        )
+    else:
+        verdict = (
+            f"The best scored {top:.2f}, under the relevance floor of "
+            f"{floor:.2f}, so none was accepted automatically"
+        )
+    lines = [
+        f"Retrieval: the knowledge base was searched for this plan and returned "
+        f"the passages below. {verdict}. Judge each yourself: cite a path only "
+        "where its passage supports the point, and answer "
+        "`no_relevant_knowledge` if none bears on the plan.",
+    ]
+    for i, result in enumerate(results[:RESEARCHER_SEAT_PASSAGES], 1):
+        text = str(result.get("content") or "").strip()
+        if len(text) > RESEARCHER_SEAT_EXCERPT_CHARS:
+            text = text[:RESEARCHER_SEAT_EXCERPT_CHARS].rstrip() + " [...]"
+        score = float(result.get("score") or 0.0)
+        lines.append(f"\n{i}. {_passage_source(result)} (score {score:.2f})\n{text}")
+    return "\n".join(lines)
+
+
 def _gather_research(state: AgentState) -> tuple[str, str]:
     """Retrieve for the Researcher and return `(findings, status)`.
 
@@ -1101,12 +1222,22 @@ def _gather_research(state: AgentState) -> tuple[str, str]:
 
     # Call GraphRAG through the MCP tool boundary
     graphrag_results: dict[str, Any] | None = None
+    # What the Researcher's seat is shown when the search did not answer: the
+    # passages it returned, the floor they were held to, and -- when there are
+    # none -- why.
+    results: list[dict[str, Any]] = []
+    floor: float | None = None
+    why_none = "the search returned nothing for this plan"
+    if not plan.strip():
+        why_none = "the plan is empty, so there was nothing to search on"
 
     try:
         search_response: dict[str, Any] = _call_mcp_tool_sync(
             "search_knowledge_graph", {"query": plan, "top_k": RESEARCH_RESULTS}
         )
-        results = search_response.get("results", [])
+        results = list(search_response.get("results") or [])
+        if search_response.get("source") == "no_corpus":
+            why_none = "no corpus has been built on this machine"
 
         # Imported here rather than at module scope for the reason
         # `mcp_client` does the same: `graphrag_server` pulls in chromadb, and
@@ -1124,17 +1255,17 @@ def _gather_research(state: AgentState) -> tuple[str, str]:
         if floor is not None and results and results[0].get("score", 0) > floor:
             graphrag_results = {"results": results, "source": "local_graphrag"}
 
-            # Try to get graph info too via the MCP query tool
+            # Try to get graph info too via the MCP query tool. The top hit's
+            # id is its document's node in the graph, so it is asked for by
+            # that id. A name derived from it used to be asked for instead --
+            # the file's stem, or for a file at the root the plan's first
+            # word ("1.") -- and a stem can resolve to an entity of the same
+            # name rather than the document (`CLAUDE` to `Claude`).
             try:
                 first_doc = results[0].get("id", "")
                 if first_doc:
-                    entity = (
-                        first_doc.split("/")[-1].split(".")[0]
-                        if "/" in first_doc
-                        else plan.split()[0] if plan else "code"
-                    )
                     graph_response = _call_mcp_tool_sync(
-                        "query_knowledge_graph", {"entity": entity, "hops": 2}
+                        "query_knowledge_graph", {"entity": first_doc, "hops": 2}
                     )
                     graphrag_results["graph"] = graph_response
             except Exception:
@@ -1142,6 +1273,7 @@ def _gather_research(state: AgentState) -> tuple[str, str]:
     except Exception as e:
         # GraphRAG MCP tool unavailable or failed; will use LLM fallback
         graphrag_results = {"error": str(e)}
+        why_none = f"the knowledge-base search failed ({e})"
 
     # Check if we got real results from GraphRAG
     has_real_results = (
@@ -1152,27 +1284,40 @@ def _gather_research(state: AgentState) -> tuple[str, str]:
     )
 
     if has_real_results:
-        assert graphrag_results is not None
+        assert graphrag_results is not None and floor is not None
         # Format GraphRAG results into Researcher output format
-        results = graphrag_results.get("results", [])
+        shown = graphrag_results.get("results", [])[:RESEARCH_RESULTS]
         research_findings = "## Key Findings\n"
 
-        for i, result in enumerate(results[:RESEARCH_RESULTS], 1):
+        above = 0
+        for i, result in enumerate(shown, 1):
             content = _research_snippet(result.get("content", ""))
-            score = result.get('score', 0)
+            score = float(result.get("score") or 0.0)
             # Where it came from, to the line when the search could tell. The
             # passages used to arrive with no source, so the Builder was handed
             # code it could not open the file of.
-            source = str(result.get("id") or "unknown source")
-            if result.get("line"):
-                source += f":{result['line']}"
-            research_findings += f"\n{i}. {source}\n{content}"
+            research_findings += f"\n{i}. {_passage_source(result)}\n{content}"
             if result.get("related_entities"):
-                research_findings += f"\n   Related: {result['related_entities'][:3]}"
-            research_findings += f"\n   Score: {score:.2f}\n"
+                research_findings += (
+                    f"\n   Related: {', '.join(str(e) for e in result['related_entities'][:3])}"
+                )
+            # Only the top hit has to clear the floor for retrieval to count as
+            # an answer, and the rest ride along -- they are the diverse hits
+            # SEARCH_ESCALATION widens the window for. So each says which side
+            # of the floor it is on, rather than all of them being announced as
+            # relevant: the Builder weighs one under the floor as weaker.
+            if score > floor:
+                above += 1
+                research_findings += f"\n   Score: {score:.2f}\n"
+            else:
+                research_findings += f"\n   Score: {score:.2f} (under the relevance floor)\n"
 
         research_findings += "\n## Relevant Context\n"
-        research_findings += f"Found {len(results)} relevant documents in knowledge base.\n"
+        research_findings += (
+            f"Retrieved {len(shown)} passage(s) from the knowledge base; {above} "
+            f"scored over its relevance floor of {floor:.2f}, and any under it is "
+            "marked above.\n"
+        )
 
         graph_response = graphrag_results.get("graph", {})
         if graph_response and graph_response.get("subgraph_nodes", 0) > 0:
@@ -1188,10 +1333,14 @@ def _gather_research(state: AgentState) -> tuple[str, str]:
         research_status = "ready_for_builder"
 
     else:
-        # Fallback to LLM when GraphRAG has no real data
+        # The seat judges what the search returned, when it did not clearly
+        # answer the plan -- see `_retrieval_for_the_seat`.
+        retrieval = _retrieval_for_the_seat(results, floor, why_none)
         messages = [
             SystemMessage(content=RESEARCHER_PROMPT),
-            HumanMessage(content=f"{state_injection}\n\nPlan to research:\n{plan}"),
+            HumanMessage(
+                content=f"{state_injection}\n\nPlan to research:\n{plan}\n\n{retrieval}"
+            ),
         ]
 
         llm = get_agent_llm("researcher")
@@ -1493,10 +1642,23 @@ BUILDER_TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "run_tests",
-            "description": "Run the pytest suite, optionally limited to one path.",
+            "description": (
+                "Run the pytest suite, optionally limited to one path. Pass cwd "
+                "to run a separate project's suite in its own directory."
+            ),
             "parameters": {
                 "type": "object",
-                "properties": {"path": {"type": "string", "description": "Optional test path."}},
+                "properties": {
+                    "path": {"type": "string", "description": "Optional test path."},
+                    "cwd": {
+                        "type": "string",
+                        "description": (
+                            "Directory to run pytest in. Defaults to the project "
+                            "root, where the suite is tests/; given a cwd and no "
+                            "path, pytest collects from that directory."
+                        ),
+                    },
+                },
             },
         },
     },
@@ -1775,10 +1937,15 @@ def _run_builder_tools(
 RUNNABLE_SUFFIXES = (".py",)
 
 # Rules ruff may fix on the Builder's behalf: only those that cannot change what
-# the code does -- trailing whitespace, a missing final newline, import order.
-# Everything else ruff reports is the Builder's to fix, because a fix ruff marks
-# "safe" can still delete an import that was kept for its side effect.
-LINT_AUTOFIX_RULES = ("W291", "W292", "W293", "I001")
+# the code does -- trailing whitespace, a missing final newline, import order,
+# and two spellings of the same object: `datetime.UTC` for `timezone.utc`
+# (UP017) and `TimeoutError` for its aliases (UP041), each the identical object
+# since 3.11. Those two arrived with ruff's target moving to 3.12, and without
+# them a correct file using the older name would block approval over a
+# spelling. Everything else ruff reports is the Builder's to fix, because a fix
+# ruff marks "safe" can still delete an import that was kept for its side
+# effect.
+LINT_AUTOFIX_RULES = ("W291", "W292", "W293", "I001", "UP017", "UP041")
 
 # Per-file ceiling for the lint pass. ruff answers in milliseconds; this bounds
 # a wedged interpreter, not the linter.
@@ -2318,7 +2485,7 @@ def builder_node(state: AgentState) -> AgentState:
                 )
         if lint_fixed:
             builder_report += (
-                "\n- trailing whitespace and import order fixed automatically in: "
+                "\n- whitespace, import order and alias spellings fixed automatically in: "
                 + ", ".join(lint_fixed)
             )
 

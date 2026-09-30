@@ -142,3 +142,35 @@ def test_self_healing_wrapper_combines_retry_and_circuit():
         assert result == "succeeded"
     except ConnectionError:
         pass  # retries exhausted before success is an acceptable outcome
+
+
+def test_a_retry_logs_the_attempt_that_succeeded_and_no_other(caplog):
+    """Success hung on tenacity's `after` hook, which runs after a *failed* attempt.
+
+    So "Retry succeeded on attempt 2" was logged exactly when attempt 2
+    failed, and the attempt that did succeed was never logged at all.
+    """
+    calls = [0]
+
+    @retry_with_backoff(max_attempts=3, min_wait=0, max_wait=0)
+    def flaky() -> str:
+        calls[0] += 1
+        if calls[0] < 3:
+            raise ConnectionError(f"attempt {calls[0]}")
+        return "ok"
+
+    with caplog.at_level("INFO", logger=get_healing_logger().logger.name):
+        assert flaky() == "ok"
+
+    successes = [r.getMessage() for r in caplog.records if "succeeded" in r.getMessage()]
+    assert successes == ["Retry succeeded for 'flaky' on attempt 3"]
+
+
+def test_each_logger_name_gets_its_own_logger():
+    """A single global handed every caller whichever name asked first."""
+    first = get_healing_logger("healing_a")
+    second = get_healing_logger("healing_b")
+
+    assert first is not second
+    assert second.logger.name == "healing_b"
+    assert get_healing_logger("healing_a") is first

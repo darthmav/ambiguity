@@ -601,3 +601,29 @@ def test_a_goal_the_web_cannot_answer_is_not_a_failed_phase(monkeypatch, kb, tmp
     assert report["documents"] == 0
     assert report["failed"] == []
     assert kb.added == []
+
+
+def test_a_page_the_embedder_refuses_costs_that_page_alone(monkeypatch, tmp_path):
+    """The embedder fails with RuntimeError, which the per-page catch let through.
+
+    The first refused page abandoned every page after it, and the report of
+    the ones already embedded went with it.
+    """
+    _standard_web(monkeypatch, {
+        "https://example.com/retrieval": ON_TOPIC,
+        "https://example.com/ranking": ON_TOPIC,
+    })
+
+    class _RefusesTheFirst(_RecordingKB):
+        def add_document(self, doc_id, content, metadata):
+            if not self.added and not getattr(self, "refused", False):
+                self.refused = True
+                raise RuntimeError("Ollama could not embed with the model: out of memory")
+            return super().add_document(doc_id, content, metadata)
+
+    kb = _RefusesTheFirst()
+    report = research_online(lambda: kb, GOAL, str(tmp_path))
+
+    assert report["documents"] == 1
+    assert len(report["failed"]) == 1
+    assert "could not embed" in report["failed"][0]["error"]

@@ -248,8 +248,8 @@ GitHub's own apt repository there, since Kali packages none, and without it
 What stays on the host: the **Ollama daemon**. It owns the embedding model's
 placement on the GPU and holds the ollama.com credentials the `:cloud` tags are
 proxied with, so the image only ever speaks HTTP to it. The entrypoint says
-whether it answers, because a seat with no daemon behind it silently becomes
-`StubLLM` and finishes a run on canned text.
+whether it answers, because with no daemon behind them every default seat fails
+its first call and the corpus cannot be embedded.
 
 What is mounted: the **checkout itself**, at `/app`. A corpus is a function of
 what is on disk -- `knowledge/`, the relevance floor measured for it, `runs/`,
@@ -284,9 +284,17 @@ docker network connect ambiguity-net postgres18
 # then, in docker-compose.yml: drop network_mode, join ambiguity-net, and set
 #   DATABASE_URL=postgresql://postgres@postgres18:5432/postgres
 #   OLLAMA_BASE_URL=http://host.docker.internal:11434
-# with extra_hosts: ["host.docker.internal:host-gateway"], and the daemon
-# started with OLLAMA_HOST=0.0.0.0 so it answers off loopback.
+#   CONSOLE_HOST=0.0.0.0          # the container's own interfaces
+# with ports: ["127.0.0.1:8080:8080"] so the host reaches the console on its
+# loopback only, extra_hosts: ["host.docker.internal:host-gateway"], and the
+# daemon started with OLLAMA_HOST=0.0.0.0 so it answers off loopback.
 ```
+
+The console listens on loopback unless `CONSOLE_HOST` says otherwise, because
+it runs goals and the Builder runs programs. Inside a bridged container
+loopback is the container's own, hence `CONSOLE_HOST=0.0.0.0` there -- with the
+published port bound to the host's `127.0.0.1`, so nothing else on the network
+reaches it.
 
 That is three changes to solve one problem, and the first of them is what the
 database's missing password rests on -- which is why it is not the default.
@@ -519,7 +527,7 @@ unified MCP-style interface:
 | `git_diff` | Builder | `git diff` |
 | `git_dwell` | Builder | The whole git flow in order: survey, branch, stage, commit, push, open a PR, merge it. Never commits onto the default branch. Runs every stage by default; name `stages` without `merge` to stop at the PR |
 | `terminal_execute` | Builder | Run one program, no shell (killed after `TERMINAL_TIMEOUT_SECONDS`, default 60; pass `timeout` to raise) |
-| `run_tests` | Builder | Run `pytest` |
+| `run_tests` | Builder | Run `pytest`, in the project root or in a `cwd` it is given (a generated project's own suite) |
 
 The Researcher and Builder nodes call these tools through `MCPClient`, preserving
 the documented specialization:

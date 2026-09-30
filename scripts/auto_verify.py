@@ -82,10 +82,18 @@ def main():
         print(r)
     print("=" * 50)
 
-    # Quick usage example
-    print("\nQuick test (set ANTHROPIC_API_KEY or OPENAI_API_KEY for real runs):")
+    # Quick usage example. The default seats run on the local Ollama daemon,
+    # so a real run needs no API key.
+    print("\nQuick test:")
     print("  python example_usage.py")
-    print("\nThe corpus builds itself on the first run; nothing else builds one.")
+    print("\nThe console brings the corpus up to date when it starts, and every run")
+    print("checks it again before the Architect opens.")
+
+    # Silent, but not mute: a caller reading only the exit status -- a CI
+    # step, an install check -- must not read "verified" from a run that
+    # just printed a failure.
+    if any(r.startswith("✗") for r in results):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

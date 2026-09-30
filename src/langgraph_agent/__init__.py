@@ -14,24 +14,34 @@ injection on every turn, tool binding per agent, and local-first inference.
 
 Example:
     >>> from langgraph_agent import create_agent_graph, AgentState
+    >>> from langgraph_agent.graph import RECURSION_LIMIT
     >>> graph = create_agent_graph()
     >>> initial_state = AgentState(
     ...     goal="Create a Python module",
     ...     messages=[],
     ...     architecture="",
-    ...     verdict="plan",
+    ...     verdict="",
     ...     plan="",
     ...     research="",
     ...     builder_report="",
     ...     next_agent="Researcher",
-    ...     research_status="ready_for_builder",
+    ...     research_status="",  # set by the Researcher; see _route_from_planner
     ...     blockers="",
     ...     files_changed=[],
     ...     failed_verification=[],
+    ...     unverified=[],
+    ...     builder_cut_off="",
+    ...     lint_failed=[],
+    ...     discuss_only=False,
+    ...     output_dir="",
     ...     expect_failures=False,
     ...     step_count=0,
     ... )
-    >>> result = graph.invoke(initial_state)
+    >>> result = graph.invoke(initial_state, {"recursion_limit": RECURSION_LIMIT})
+
+    `research_status` starts empty because it is what marks the Researcher as
+    having run: an initial state that already carries a status skips the
+    opening cycle's retrieval.
 
 Attributes:
     __version__: The package version string.

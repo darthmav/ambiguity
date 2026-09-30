@@ -52,23 +52,33 @@ TERMINAL_TIMEOUT_SECONDS = float(os.getenv("TERMINAL_TIMEOUT_SECONDS", "60"))
 TERMINAL_TIMEOUT_MAX_SECONDS = float(os.getenv("TERMINAL_TIMEOUT_MAX_SECONDS", "600"))
 
 
-def _resolve_timeout(requested: Any) -> float:
+# The largest file `filesystem_read` returns whole: fifty times what reaches the
+# model (`MAX_TOOL_RESULT_CHARS`, 20,000), so any source file or document a
+# Builder works on is read in one piece, and only a log or a dump is turned away.
+FILESYSTEM_READ_MAX_BYTES = 1_000_000
+
+
+def _resolve_timeout(requested: Any, default: float | None = None) -> float:
     """Clamp a requested command timeout to [1, TERMINAL_TIMEOUT_MAX_SECONDS].
 
-    A missing or malformed value falls back to the default instead of raising.
-    The number arrives as JSON from a model, and refusing the call to complain
-    about it costs a whole tool turn to say what a clamp says for nothing.
-    Non-finite is rejected here rather than left to `min`: `min(nan, 600)` is
-    `nan`, which reaches `subprocess.run` as no timeout at all.
+    A missing or malformed value falls back to `default` --
+    `TERMINAL_TIMEOUT_SECONDS` unless the caller names another -- instead of
+    raising. The number arrives as JSON from a model, and refusing the call to
+    complain about it costs a whole tool turn to say what a clamp says for
+    nothing. Non-finite is rejected here rather than left to `min`:
+    `min(nan, 600)` is `nan`, which reaches `subprocess.run` as no timeout at
+    all.
     """
+    if default is None:
+        default = TERMINAL_TIMEOUT_SECONDS
     if requested is None:
-        return TERMINAL_TIMEOUT_SECONDS
+        return default
     try:
         seconds = float(requested)
     except (TypeError, ValueError):
-        return TERMINAL_TIMEOUT_SECONDS
+        return default
     if not math.isfinite(seconds) or seconds <= 0:
-        return TERMINAL_TIMEOUT_SECONDS
+        return default
     return min(seconds, TERMINAL_TIMEOUT_MAX_SECONDS)
 
 
@@ -279,9 +289,11 @@ def _resolve_write_path(requested: Any) -> tuple[Path | None, str | None]:
     The path is resolved *before* the write rather than checked after, and
     `resolve()` is what does it: a check on the literal string would pass
     `project/link/x` where `link` points at `/etc`, because only resolution
-    knows where a symlink lands. The parent is resolved rather than the file
-    itself, since the file is usually about to be created and
-    `strict=False` resolution of a missing leaf is exactly what we want.
+    knows where a symlink lands. The whole path is resolved, leaf included:
+    a leaf that already exists as a symlink out of the project is refused,
+    which a check of the parent alone would miss -- `write_text` follows it.
+    A leaf that does not exist yet is fine, since `strict=False` resolution
+    resolves the part of the path that exists and keeps the rest as written.
 
     `~` is not expanded, for the reason `_resolve_cwd` gives: there is no shell
     here, and a path that quietly expanded what an argument on the same line
@@ -291,8 +303,8 @@ def _resolve_write_path(requested: Any) -> tuple[Path | None, str | None]:
         return None, f"Invalid path: {requested!r}. Pass a file path inside the project."
     root = _project_root()
     candidate = Path(requested)
-    # Resolve the parent, not the leaf: the leaf normally does not exist yet,
-    # and a symlinked *parent* is the way out of the root that matters.
+    # The whole path, leaf included -- see the docstring for why the leaf
+    # matters as much as the parent.
     resolved = (root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
     try:
         resolved.relative_to(root)
@@ -497,9 +509,35 @@ class MCPClient:
     # Real filesystem implementations
 
     async def _filesystem_read(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Read file contents."""
+        """Read file contents.
+
+        Not confined to the project the way `filesystem_write` is, and on
+        purpose. `terminal_execute` runs any program with this server's
+        permissions -- `cat` reads whatever this tool would -- so a fence here
+        would be a safety claim the tool belt cannot keep. Writes are confined
+        for what they feed, `files_changed` and the corpus, which are about the
+        project; they are not a sandbox either. What bounds a run is where its
+        seats run (local by default, so nothing read leaves this machine) and
+        the console listening only on loopback.
+
+        A file over `FILESYSTEM_READ_MAX_BYTES` is refused unread rather than
+        loaded whole to be cut at `MAX_TOOL_RESULT_CHARS` on its way to the
+        model -- a log or a data dump that size is memory and time for text
+        nobody sees -- and the refusal says how to read part of it.
+        """
         path = args.get("path", "")
         try:
+            size = Path(path).stat().st_size
+            if size > FILESYSTEM_READ_MAX_BYTES:
+                return {
+                    "success": False,
+                    "path": path,
+                    "error": (
+                        f"{path} is {size:,} bytes, past the {FILESYSTEM_READ_MAX_BYTES:,} "
+                        "this tool reads whole. Read part of it with terminal_execute: "
+                        f"`head -n 200 {path}`, or `sed -n 200,400p {path}` for a range."
+                    ),
+                }
             content = Path(path).read_text(encoding="utf-8")
             return {"success": True, "content": content, "path": path}
         except Exception as e:
@@ -527,30 +565,55 @@ class MCPClient:
     # Real git implementations
 
     async def _git_status(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Git status."""
+        """Git status.
+
+        git's exit status is read before its output is. A command that failed
+        prints nothing on stdout, and "nothing" is exactly what a clean tree
+        prints too -- so a directory that is not a repository came back as
+        `success` with "Working tree clean".
+        """
         try:
             result = subprocess.run(
                 ["git", "status", "--porcelain"],
                 capture_output=True,
                 text=True,
                 timeout=10,
+                stdin=subprocess.DEVNULL,
             )
-            return {"success": True, "status": result.stdout or "Working tree clean"}
         except Exception as e:
             return {"success": False, "error": str(e)}
+        if result.returncode != 0:
+            return {"success": False, "error": (result.stderr or result.stdout).strip()
+                    or f"git status exited {result.returncode}"}
+        return {"success": True, "status": result.stdout or "Working tree clean"}
 
     async def _git_diff(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Git diff."""
+        """Git diff, of the whole tree or of one path.
+
+        The path goes after `--`, and only when there is one. With no path this
+        used to run `git diff ""`, which git refuses outright (an empty string
+        is not a pathspec) -- and because the exit status went unread, the
+        refusal's empty stdout came back as `success` with "No changes". So
+        the Builder's plain `git_diff()` reported a clean tree on every call,
+        however much it had changed. Without `--`, a path that also names a
+        branch or a commit is read as a revision.
+        """
+        path = str(args.get("path") or "").strip()
+        command = ["git", "diff"] + (["--", path] if path else [])
         try:
             result = subprocess.run(
-                ["git", "diff", args.get("path", "")],
+                command,
                 capture_output=True,
                 text=True,
                 timeout=10,
+                stdin=subprocess.DEVNULL,
             )
-            return {"success": True, "diff": result.stdout or "No changes"}
         except Exception as e:
             return {"success": False, "error": str(e)}
+        if result.returncode != 0:
+            return {"success": False, "error": (result.stderr or result.stdout).strip()
+                    or f"git diff exited {result.returncode}"}
+        return {"success": True, "diff": result.stdout or "No changes"}
 
     # The ordered git pipeline (`git_dwell`)
 
@@ -575,10 +638,14 @@ class MCPClient:
         return done.returncode == 0, ((done.stdout or "") + (done.stderr or "")).strip()
 
     def _default_branch(self) -> str:
-        """The branch a PR targets. `origin/HEAD` first, then the usual names."""
+        """The branch a PR targets. `origin/HEAD` first, then the usual names.
+
+        The remote's prefix is removed rather than everything up to the last
+        slash, which cut a default branch named `release/2.0` down to `2.0`.
+        """
         ok, out = self._run_vcs("git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
-        if ok and out:
-            return out.rsplit("/", 1)[-1]
+        if ok and out.startswith("refs/remotes/origin/"):
+            return out.removeprefix("refs/remotes/origin/")
         for name in ("main", "master"):
             ok, _ = self._run_vcs("git", "show-ref", "--verify", f"refs/heads/{name}")
             if ok:
@@ -858,14 +925,31 @@ class MCPClient:
             return {"success": False, "error": str(e), "command": command}
 
     async def _run_tests(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Run the pytest test suite."""
-        target = args.get("path", "tests/")
+        """Run the pytest test suite.
+
+        `cwd` runs it in another directory -- a generated project under
+        `projects/`, whose Builder is told to pass it (`OUTPUT_DIR_NOTE`). It
+        was told that while this tool took no `cwd` at all, so every such call
+        silently ran *this checkout's* suite instead. With a `cwd` and no
+        `path`, pytest collects from that directory; with neither, `tests/`.
+
+        `timeout` is clamped like `terminal_execute`'s, for its reason: a tool
+        call is never abandoned, so an unclamped request hangs the pass past
+        every deadline. The default is the ceiling, the longest a suite is
+        allowed.
+        """
+        cwd, cwd_error = _resolve_cwd(args.get("cwd"))
+        if cwd_error is not None:
+            return {"success": False, "error": cwd_error}
+        target = str(args.get("path") or ("." if cwd else "tests/"))
+        timeout = _resolve_timeout(args.get("timeout"), default=TERMINAL_TIMEOUT_MAX_SECONDS)
         try:
             result = subprocess.run(
                 [sys.executable, "-m", "pytest", target, "-q"],
                 capture_output=True,
                 text=True,
-                timeout=args.get("timeout", 600),
+                timeout=timeout,
+                cwd=cwd,
                 # Same reason as _terminal_execute: a suite that stops to ask
                 # something would otherwise hang until its timeout.
                 stdin=subprocess.DEVNULL,

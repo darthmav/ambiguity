@@ -2321,7 +2321,13 @@ function staleChip(stats){
         + "change this - split the file or raise MAX_INDEXABLE_BYTES.\n\n"
         + (s.oversized || []).join("\n")).replace(/"/g,"&quot;")}">${s.oversized_count} too large</span>`
     : "";
-  if(!s.stale) return big;
+  // The same kind of permanent absence, for a file that is not UTF-8 text.
+  const odd = s.unreadable_count
+    ? `<span class="stale" title="${esc("Not UTF-8 text, or not readable, so the indexer skips it and it is "
+        + "absent from the corpus. Rebuilding will not change this - convert the file, or move it out "
+        + "of the walk.\n\n" + (s.unreadable || []).join("\n"))}">${s.unreadable_count} unreadable</span>`
+    : "";
+  if(!s.stale) return big + odd;
   const parts = [];
   if(s.missing_count) parts.push(`${s.missing_count} not indexed`);
   // "not in the walk", not "no longer on disk": `extra` is a document the walk
@@ -2338,7 +2344,7 @@ function staleChip(stats){
     + `renamed or newly excluded. Restarting the console brings the corpus up to `
     + `date, and so does the next run, before the Architect opens.`
     + (sample ? `\n\n${sample}` : "");
-  return `<span class="stale" title="${title.replace(/"/g,"&quot;")}">stale: ${parts.join(", ")}</span>`+big;
+  return `<span class="stale" title="${title.replace(/"/g,"&quot;")}">stale: ${parts.join(", ")}</span>`+big+odd;
 }
 
 // The upload controls accept what the corpus indexes, and only the server knows

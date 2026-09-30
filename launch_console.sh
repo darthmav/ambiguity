@@ -14,9 +14,6 @@ if [ -f ".venv/bin/activate" ]; then
     . .venv/bin/activate
 fi
 
-PORT=8080
-URL="http://localhost:${PORT}"
-
 echo "============================================"
 echo "  Ambiguity 4-Agent Console"
 echo "============================================"
@@ -36,6 +33,14 @@ if [ -f ".env" ]; then
     set +a
     echo "✓ Loaded .env"
 fi
+
+# After .env, so a PORT set there -- or in the shell -- moves the address this
+# script polls and opens along with the one serve.py binds. It was fixed at
+# 8080 before .env was read: serve.py took the new port while this kept
+# waiting on 8080, and opened whatever else was answering there.
+PORT="${PORT:-8080}"
+export PORT
+URL="http://localhost:${PORT}"
 
 # Report the seats from config.py rather than re-deriving them from env vars.
 # Guessing here is how this line ended up claiming a Claude model for seats
@@ -86,8 +91,18 @@ fi
 echo ""
 echo "Starting frontend server on ${URL}..."
 
-echo "  (No corpus is loaded by starting the server. The first run indexes"
-echo "   this directory before the Architect opens.)"
+# The values serve.py reads as off.
+case "${INDEX_PROJECT_BEFORE_RUN:-1}" in
+    0|false|no)
+        echo "  (INDEX_PROJECT_BEFORE_RUN is off: nothing rebuilds the corpus, at"
+        echo "   startup or before a run.)"
+        ;;
+    *)
+        echo "  (The server brings the corpus up to date with this directory once it"
+        echo "   is up -- the header shows the rebuild -- and every run checks it"
+        echo "   again before the Architect opens.)"
+        ;;
+esac
 
 python serve.py > /tmp/ambiguity-console.log 2>&1 &
 SERVER_PID=$!

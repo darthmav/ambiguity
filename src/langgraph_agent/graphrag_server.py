@@ -13,8 +13,9 @@ import asyncio
 import functools
 import hashlib
 import json
+import os
 from collections.abc import Callable, Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, ParamSpec, TypeVar
 
@@ -336,7 +337,7 @@ def calibrate_relevance_floor(kb: "GraphRAGKnowledgeBase") -> dict[str, Any]:
         "answered": answered,
         "unanswerable": unanswerable,
         "floor": round((low + high) / 2, 3) if high > low else None,
-        "measured_at": datetime.now(timezone.utc).isoformat(),
+        "measured_at": datetime.now(UTC).isoformat(),
     }
     path = _floor_calibration_path(kb.persist_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -502,9 +503,11 @@ CHUNK_MAX_TOKENS = 254
 # absorbs the cosmetic cost.
 CHUNK_OVERLAP_TOKENS = 48
 
-# Separates a document id from its chunk number: `CLAUDE.md#0003`. The document
-# id is a project-relative path, which cannot contain "#" on any filesystem
-# this runs on, so the split back to a document is unambiguous.
+# Separates a document id from its chunk number: `CLAUDE.md#0003`. A filename
+# may itself contain "#" -- every filesystem this runs on allows it -- so the
+# id alone is not what maps a chunk back to its document: each chunk carries
+# `doc_id` in its metadata, `_document_id_of` reads that first, and the id is
+# split only as a fallback, at the last "#" and only when a number follows it.
 CHUNK_ID_SEPARATOR = "#"
 
 
@@ -772,15 +775,28 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         """Load graph from disk if exists."""
         graph_path = self.persist_dir / "knowledge_graph.json"
         if graph_path.exists():
-            self.graph = nx.readwrite.json_graph.node_link_graph(
-                json.load(open(graph_path))
-            )
+            with open(graph_path, encoding="utf-8") as handle:
+                self.graph = nx.readwrite.json_graph.node_link_graph(json.load(handle))
 
     def _save_graph(self) -> None:
-        """Save graph to disk."""
+        """Save graph to disk, whole or not at all.
+
+        Written to a temporary file and renamed over the real one, the way
+        `calibrate_relevance_floor` writes its record. `json.dump` straight
+        into the file truncated it first and filled it after, and the thread
+        doing that can die in between: the console's exit and install.sh's
+        start-up check both end the process under a rebuild that is still
+        running on a daemon thread, and this is called once per document. A
+        file cut off mid-write does not load (`_load_graph` raises on it), and
+        a corpus whose graph does not load cannot be opened at all -- by the
+        header, the Researcher, or the rebuild that would have repaired it.
+        """
         graph_path = self.persist_dir / "knowledge_graph.json"
         node_link_data = nx.readwrite.json_graph.node_link_data(self.graph)
-        json.dump(node_link_data, open(graph_path, "w"))
+        temporary = graph_path.with_suffix(".json.tmp")
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(node_link_data, handle)
+        os.replace(temporary, graph_path)
 
     def chunk_text(self, content: str) -> list[str]:
         """Split a document into passages the embedder can actually read whole.
@@ -1043,9 +1059,10 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         path -- the thing callers index the graph with, print as a filename and
         derive an entity from -- while `content` becomes the passage that
         actually matched rather than the document's first 200 characters. That
-        is the half of chunking the Researcher feels: it forwards
-        `content[:300]` to the Builder, which used to be 300 characters of
-        whichever file's *header* scored best.
+        is the half of chunking the Researcher feels: what it forwards to the
+        Builder (up to `RESEARCH_SNIPPET_CHARS` of each passage, in `nodes.py`)
+        used to be the opening characters of whichever file's *header* scored
+        best.
 
         Chunks are oversampled and then collapsed onto their documents, keeping
         each document's best-scoring chunk. Collapsing is what makes `top_k`
@@ -1732,7 +1749,7 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
             errors.append(f"reading chunks: {exc}")
 
         return {
-            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "exported_at": datetime.now(UTC).isoformat(),
             "note": (
                 "Embeddings are omitted; re-indexing regenerates them locally "
                 f"with {self.embedding_model}."

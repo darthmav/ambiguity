@@ -2850,3 +2850,104 @@ def test_a_discussion_builder_s_blockers_stay_in_its_proposal(monkeypatch):
 
     assert result["blockers"] == ""
     assert "requires approval from the Architect" in result["builder_report"]
+
+
+class _Answers:
+    """A seat that answers every call with the same text."""
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    def invoke(self, messages):
+        return SimpleNamespace(content=self._text)
+
+
+@pytest.mark.parametrize(
+    "answered",
+    [Verdict.APPROVED.value, Verdict.NEED_RESEARCH.value, Verdict.REVISE.value],
+)
+def test_the_opening_pass_rules_plan_whatever_the_seat_answers(monkeypatch, answered):
+    """Nothing has been planned or built yet, so `plan` is the only ruling.
+
+    An opening `approved` ended the run before any other seat had worked, and
+    an opening `need_research` routed around the Planner: the Researcher got an
+    empty `plan` to search on, and since the gate counts a step only while a
+    plan exists, that loop went uncounted until LangGraph's recursion limit
+    killed the run.
+    """
+    from langgraph_agent import nodes
+
+    monkeypatch.setattr(
+        nodes, "get_agent_llm",
+        lambda agent, temperature=0.1: _Answers(
+            f"## Architecture\nOne module.\n\n## Constraints\n- none\n\n## Verdict\n{answered}"
+        ),
+    )
+
+    state = nodes.architect_node(initial_state("Create hello.txt"))
+
+    assert state["verdict"] == Verdict.PLAN.value
+    assert state["step_count"] == 0
+    assert "One module." in state["architecture"]
+    # What the seat actually said is kept where the operator reads the run.
+    assert f"`{answered}`" in state["messages"][-1]
+
+
+def test_the_gate_pass_still_rules_what_the_seat_answered(monkeypatch):
+    """Only the opening pass is held to `plan`; the gate's ruling stands."""
+    from langgraph_agent import nodes
+
+    monkeypatch.setattr(
+        nodes, "get_agent_llm",
+        lambda agent, temperature=0.1: _Answers("## Architecture\nx\n\n## Verdict\nneed_research"),
+    )
+    state = initial_state("Create hello.txt")
+    state["plan"] = "1. Write the file."
+    state["builder_report"] = "Wrote nothing yet."
+
+    result = nodes.architect_node(state)
+
+    assert result["verdict"] == Verdict.NEED_RESEARCH.value
+    assert result["step_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        "## Verdict\n**revise**",
+        "## Verdict: revise",
+        "## Verdict\n`revise`",
+        "## Verdict\n- revise",
+        "## Verdict\n\nRevise -- the plan missed the tests.",
+    ],
+)
+def test_a_decorated_verdict_is_read_rather_than_defaulted(written):
+    """The gate's fallback is `approved`, so a verdict it could not read ended the run.
+
+    `**revise**` is how a model emphasises one word, and reading that as no
+    verdict at all turned the Architect's refusal into an approval.
+    """
+    from langgraph_agent.nodes import _parse_architect_output
+
+    assert _parse_architect_output(written, reviewing=True)["verdict"] == "revise"
+
+
+def test_the_value_is_not_taken_from_the_next_section():
+    """An empty Verdict section is still no verdict, not the next section's word."""
+    from langgraph_agent.nodes import _parse_architect_output
+
+    parsed = _parse_architect_output("## Verdict\n\n## Notes\nrevise later", reviewing=True)
+
+    assert parsed["verdict"] == "approved"
+
+
+def test_decorated_routing_words_are_read_for_the_planner_and_researcher():
+    """Both parsers default to a route, so an unread word was a silent wrong turn."""
+    from langgraph_agent.nodes import _parse_planner_output, _parse_researcher_output
+
+    planned = _parse_planner_output("## Steps\n1. x\n\n## Next Agent\n**researcher**")
+    assert planned["next_agent"] == "Researcher"
+    assert _parse_planner_output("## Steps\n1. x\n\n## Next Agent: Builder")["next_agent"] == "Builder"
+
+    researched = _parse_researcher_output("## Key Findings\n- a\n\n## Status\n`need_replan`")
+    assert researched["status"] == "need_replan"

@@ -407,10 +407,9 @@ class CorpusSpectralMixin:
           nodes below are real.
         - `inconclusive` -- the bound permits a bottleneck and the sweep cut did
           not find one. Cheeger brackets the true conductance between
-          `mu_2 / 2` and `sqrt(2 * mu_2)`, and that bracket is wide (measured
-          from 4x to 546x across graph shapes in
-          measured across the benchmark's eight architectures), so the sweep cut
-          genuinely can miss. Saying so is the honest answer; collapsing it
+          `mu_2 / 2` and `sqrt(2 * mu_2)`, and that bracket is wide (from 4x
+          to 546x, measured across the benchmark's eight architectures), so
+          the sweep cut genuinely can miss. Saying so is the honest answer; collapsing it
           into "no bottleneck" would report a gap in the evidence as a finding.
 
         Runs on the largest connected component, for the same reason

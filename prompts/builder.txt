@@ -15,9 +15,10 @@ You must:
   back as a blocker -- so run it yourself with terminal_execute and fix it
   before you report, rather than leaving it to be caught.
 - Every Python file you write is also checked with `ruff check`, using the
-  project's configuration. Trailing whitespace and import order are fixed for
-  you; anything else ruff reports blocks approval, so run
-  `python -m ruff check <path>` yourself and fix what it lists.
+  project's configuration. Trailing whitespace, import order and the
+  `datetime.UTC` / `TimeoutError` spellings are fixed for you; anything else
+  ruff reports blocks approval, so run `python -m ruff check <path>` yourself
+  and fix what it lists.
 - After changes, report what you did.
 - If you cannot finish, set blockers clearly so the graph can loop to Researcher or Planner.
 - Prefer the smallest change that satisfies the plan.

@@ -146,6 +146,11 @@ class _Extractor(HTMLParser):
         self._anchor = 0
         self._pre = 0
         self._in_title = False
+        # Only the first <title> names the page. An inline <svg> carries its
+        # own for accessibility -- "Search", "Close", "Menu" -- and each one
+        # used to be appended to the page's, so the provenance header of a
+        # stored page read "Real Title Search Menu Close".
+        self._title_done = False
 
     # -- block bookkeeping --------------------------------------------------
 
@@ -162,7 +167,7 @@ class _Extractor(HTMLParser):
         # can therefore never fire. It is the one thing worth taking from there,
         # and it is what names the document when a page has no usable <h1>.
         if tag == "title":
-            self._in_title = True
+            self._in_title = not self._title_done
             return
         if tag in SKIP_TAGS:
             self._skip += 1
@@ -184,6 +189,8 @@ class _Extractor(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "title":
+            if self._in_title:
+                self._title_done = True
             self._in_title = False
             return
         if tag in SKIP_TAGS:

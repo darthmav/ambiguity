@@ -124,8 +124,9 @@ LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
 def _ollama_base_url() -> str:
     """Where the local Ollama daemon listens.
 
-    The daemon is a proxy here, not a runtime: every seat that uses it runs a
-    `:cloud` tag, which it forwards to ollama.com.
+    Every default seat runs through it: a local tag from weights the daemon
+    holds itself, or a `:cloud` tag it forwards to ollama.com. The embedder is
+    served by the same daemon.
     """
     return os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 
@@ -404,6 +405,9 @@ class _SeatLLM:
     `build` is kept beside the built model so a forced load that did not fit
     can be rebuilt unforced -- the fallback that lets `num_gpu: 999` be the
     default without making an oversized seat a failed run.
+
+    `provider` is the seat's provider, which `bind_tools` needs: whether a
+    model can call tools is asked of the Ollama daemon, and only of it.
     """
 
     def __init__(
@@ -414,12 +418,14 @@ class _SeatLLM:
         *,
         force_gpu: bool = True,
         bound: "tuple[Any, dict[str, Any]] | None" = None,
+        provider: str = "",
     ) -> None:
         self._agent = agent
         self._inner = inner
         self._build = build
         self._force_gpu = force_gpu
         self._bound = bound
+        self._provider = provider
 
     def _model_tag(self) -> str:
         """The tag this seat calls, for the arbiter and the eviction."""
@@ -486,16 +492,29 @@ class _SeatLLM:
 
         The bound seat carries `build` and the tools forward, or an unforced
         rebuild would come back without the belt the Builder is mid-turn with.
+
+        An Ollama tag the daemon says cannot call tools raises here too. The
+        attribute check alone never caught one: `bind_tools` is ChatOllama's
+        own method, so binding succeeds for every tag, and it is the daemon
+        that refuses -- answering the first call with a 400 ("does not support
+        tools") that failed the whole run, where a model without tools was
+        meant to report its work and change nothing. Asked through
+        `tool_support`, which caches the daemon's answer; "could not ask"
+        (None) binds as before, since it is not a no.
         """
         inner_bind = getattr(self._inner, "bind_tools", None)
         if inner_bind is None:
             raise AttributeError("bind_tools")
+        tag = self._model_tag()
+        if self._provider == "ollama" and tag and tool_support("ollama", tag)[0] is False:
+            raise AttributeError(f"bind_tools: {tag} cannot call tools")
         return _SeatLLM(
             self._agent,
             inner_bind(tools, **kwargs),
             self._build,
             force_gpu=self._force_gpu,
             bound=(tools, kwargs),
+            provider=self._provider,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -532,9 +551,16 @@ DEFAULT_THINKING = False
 THINKING_BUDGET_TOKENS = int(os.getenv("THINKING_BUDGET_TOKENS", "4096"))
 
 # Claude models that think on every call. Anthropic rejects an explicit
-# "disabled" on them, so the card shows the box ticked and locked rather than
-# offering a switch whose "off" would fail every call.
-_ALWAYS_THINKING_CLAUDE = ("claude-fable", "claude-mythos")
+# "disabled" on them -- Opus 5.5 at every effort level -- so the card shows the
+# box ticked and locked rather than offering a switch whose "off" would fail
+# every call. Opus 5.5 was missing, so a seat moved onto it was sent
+# `{"type": "disabled"}` by default and every call came back a 400.
+_ALWAYS_THINKING_CLAUDE = ("claude-fable", "claude-mythos", "claude-opus-5-5")
+
+# Claude models whose "off" is not spelled `disabled`. Sonnet 5.5 answers
+# `{"type": "disabled"}` with a 400 and turns thinking off with `between_tools`,
+# which takes no other field and is accepted at the default effort.
+_CLAUDE_THINKING_OFF = {"claude-sonnet-5-5": {"type": "between_tools"}}
 
 # Both orders Anthropic has named models in (`claude-3-7-sonnet`,
 # `claude-opus-4-1`). The minor version is one or two digits, so a date suffix
@@ -556,16 +582,24 @@ def _claude_thinking(model: str, on: bool) -> dict[str, Any] | None:
     """The `thinking` parameter that switches a Claude model on or off.
 
     `None` means leave the parameter out. There are two request shapes, split
-    at 4.6. From there `adaptive` is the only way on, and `disabled` has to be
-    sent to mean off, because Opus 5 and Sonnet 5 think when the parameter is
-    absent. Before 4.6 a token budget is the only way on (and `budget_tokens`
-    is a 400 on Opus 5), while absence already means off.
+    at 4.6. From there `adaptive` is the only way on, and an explicit "off" has
+    to be sent, because Opus 5 and Sonnet 5 think when the parameter is
+    absent -- `disabled` for most, and `_CLAUDE_THINKING_OFF`'s spelling for a
+    model that rejects that one. Before 4.6 a token budget is the only way on
+    (and `budget_tokens` is a 400 on Opus 5), while absence already means off.
     """
     version = _claude_version(model)
     if version is None or model.startswith(_ALWAYS_THINKING_CLAUDE):
         return None
     if version >= (4, 6):
-        return {"type": "adaptive"} if on else {"type": "disabled"}
+        if on:
+            return {"type": "adaptive"}
+        off = next(
+            (spelling for prefix, spelling in _CLAUDE_THINKING_OFF.items()
+             if model.startswith(prefix)),
+            {"type": "disabled"},
+        )
+        return dict(off)
     if on:
         return {"type": "enabled", "budget_tokens": THINKING_BUDGET_TOKENS}
     return None
@@ -847,7 +881,9 @@ def get_llm(
             kwargs["thinking"] = thinking_param
         # A model that is thinking takes no temperature: the families that
         # still accept one reject anything but the default once thinking is on.
-        thinks = thinking_param is not None and thinking_param["type"] != "disabled"
+        thinks = thinking_param is not None and thinking_param["type"] not in (
+            "disabled", "between_tools"
+        )
         if _accepts_temperature("anthropic", model_name) and not thinks:
             kwargs["temperature"] = temperature
         if base_url:
@@ -873,29 +909,34 @@ def get_llm(
 
 
 def _detect_provider(model: str | None) -> Provider:
-    """Detect provider from model name or environment.
+    """Detect a provider from the model's name, then from the environment.
 
-    Cloud-first priority: Anthropic, then Ollama, then OpenAI.
+    The name is read first because it is the more specific fact. `gpt-4o` is an
+    OpenAI model whatever keys the environment happens to hold, and consulting
+    the keys first sent `BUILDER_MODEL=gpt-4o` to Anthropic on any machine with
+    an ANTHROPIC_API_KEY -- a seat that then failed every call with a model
+    Anthropic does not have. The environment decides only for a name no
+    provider's naming claims, or no name at all: Anthropic's key or model
+    first, then OpenAI's, then Anthropic for no name and OpenAI otherwise.
+
+    An Ollama tag is recognised by its colon (`qwen3.8:latest`). A bare name
+    without one cannot be told from anything else by its spelling, so name the
+    provider for such a seat: `{ROLE}_PROVIDER=ollama`.
     """
-    # A tag carrying a colon is an Ollama tag; nothing else names models
-    # that way, so it settles the provider before any env var is consulted.
-    if model and ":" in model:
-        return "ollama"
+    if model:
+        lowered = model.lower()
+        if ":" in model:
+            return "ollama"
+        if "claude" in lowered:
+            return "anthropic"
+        if lowered.startswith(("gpt-", "chatgpt", "o1", "o3", "o4")):
+            return "openai"
 
-    # Anthropic is the primary cloud default.
     if os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_MODEL"):
         return "anthropic"
-
-    # OpenAI remains available as an optional cloud provider.
     if os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_MODEL"):
         return "openai"
-
-    # Fallback to model name detection
-    if not model:
-        return "anthropic"
-    if "claude" in model.lower():
-        return "anthropic"
-    return "openai"
+    return "anthropic" if not model else "openai"
 
 
 def _resolve_seat(agent: str) -> dict[str, str | None]:
@@ -974,7 +1015,7 @@ def get_agent_llm(agent: AgentName, temperature: float = 0.1) -> Any:
             force_gpu=force_gpu,
         )
 
-    return _SeatLLM(agent, build(True), build)
+    return _SeatLLM(agent, build(True), build, provider=seat["provider"] or "")
 
 
 def get_agent_model_info(agent: AgentName) -> dict[str, str]:
@@ -1017,7 +1058,9 @@ def get_agent_status(agent: AgentName) -> dict[str, Any]:
         tags = list_ollama_models()
         if not tags:
             live, reason, badge = False, "Ollama daemon unreachable", "OFFLINE"
-        elif model not in tags:
+        # Compared as tags, not strings: the daemon lists `qwen3.8:latest`, and
+        # a seat configured as `qwen3.8` is that model, not a missing one.
+        elif not any(_same_ollama_tag(model, tag) for tag in tags):
             live, reason, badge = False, f"{model} not pulled", "NOT PULLED"
 
     # Where the prompt goes, read off the seat rather than guessed: an Ollama
@@ -1075,9 +1118,10 @@ class StubLLM:
 
         # Role comes from the system message; everything else is data.
         # The Researcher injects retrieved documents into the Builder's prompt,
-        # and this repository indexes its own prompt files -- so a corpus hit
-        # can put "You are the Architect" inside a Builder call. Reading the
-        # role off user content makes the stub answer as the wrong agent.
+        # and a retrieved document can say anything -- an uploaded copy of a
+        # prompt file puts "You are the Architect" inside a Builder call.
+        # Reading the role off user content makes the stub answer as the wrong
+        # agent.
         system_content = ""
         all_content = ""
         last_content = ""

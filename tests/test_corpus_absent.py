@@ -472,3 +472,23 @@ def test_importing_the_server_never_imports_an_in_process_embedder():
 
     assert "serve" in sys.modules
     assert "transformers" not in sys.modules
+
+
+def test_the_suite_never_sees_this_checkouts_own_corpus(monkeypatch):
+    """conftest hides the developer's `knowledge/` from every test.
+
+    Left visible, each graph test's Researcher searched it for real -- opening
+    Chroma, embedding the plan through the Ollama daemon, and evicting whatever
+    the developer's own console had loaded on the cards. This fails the moment
+    that isolation is lost, which is otherwise invisible: CI has no corpus to
+    find, and a developer's run only gets slower and less repeatable.
+    """
+    from pathlib import Path
+
+    from langgraph_agent import config
+
+    monkeypatch.chdir(Path(__file__).resolve().parent.parent)
+
+    assert graphrag_server.open_knowledge_base() is None
+    assert graphrag_server.corpus_state()[0] == "absent"
+    assert config.free_the_cards_for("hf.co/some/seat:Q4") == []

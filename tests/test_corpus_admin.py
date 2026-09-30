@@ -1334,3 +1334,32 @@ def test_rpc_graph_overview_is_registered_and_answers_without_a_corpus(kb, monke
     monkeypatch.setattr(serve, "open_knowledge_base", lambda *a, **k: None)
     absent = serve.rpc_graph_overview({})
     assert absent["corpus"] == "absent" and absent["nodes"] == []
+
+
+def test_a_save_that_dies_midway_leaves_the_graph_it_replaced(kb, tmp_path, monkeypatch):
+    """`json.dump` straight into the file truncated it before it filled it.
+
+    The process can end in between -- the console's exit and install.sh's
+    start-up check both end it under a rebuild running on a daemon thread --
+    and a graph file cut off mid-write does not load, so the corpus could not
+    be opened by anything, the rebuild that would have repaired it included.
+    """
+    import langgraph_agent.graphrag_server as module
+
+    before = (tmp_path / "knowledge_graph.json").read_text(encoding="utf-8")
+    kb.graph.add_node("Planner", type="entity")
+
+    def dies_midway(data, handle, *args, **kwargs):
+        handle.write('{"nodes": [')
+        raise RuntimeError("the process was ended mid-write")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module.json, "dump", dies_midway)
+        with pytest.raises(RuntimeError, match="mid-write"):
+            kb._save_graph()
+
+    assert (tmp_path / "knowledge_graph.json").read_text(encoding="utf-8") == before
+    reopened = object.__new__(GraphRAGKnowledgeBase)
+    reopened.persist_dir = tmp_path
+    reopened._load_graph()
+    assert "serve.py" in reopened.graph

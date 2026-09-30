@@ -144,6 +144,28 @@ def test_an_oversized_file_is_reported_apart_from_staleness(tmp_path):
     assert oversized_documents(root, use_cache=False) == (str(tmp_path / "huge.md"),)
 
 
+def test_a_file_the_indexer_cannot_read_is_not_stale(tmp_path):
+    """A Latin-1 file is skipped by every rebuild, so it is absent by design.
+
+    Filed under `missing` it held the header at "stale: 1 not indexed" through
+    every rebuild -- a warning no rebuild could clear.
+    """
+    root = _project(tmp_path, **{"a.md": "alpha"})
+    (tmp_path / "notes.md").write_bytes("caf\xe9 au lait".encode("latin-1"))
+
+    report = corpus_staleness([str(tmp_path / "a.md")], root, use_cache=False)
+
+    assert not report["stale"]
+    assert report["missing_count"] == 0
+    assert report["unreadable"] == [str(tmp_path / "notes.md")]
+
+    # A readable file that is absent is still exactly what stale means.
+    (tmp_path / "new.md").write_text("new", encoding="utf-8")
+    forget_expected_documents()
+    fresh = corpus_staleness([str(tmp_path / "a.md")], root, use_cache=False)
+    assert fresh["stale"] and fresh["missing"] == [str(tmp_path / "new.md")]
+
+
 # ---------------------------------------------------------------------------
 # The one time the corpus is meant to be moving
 # ---------------------------------------------------------------------------

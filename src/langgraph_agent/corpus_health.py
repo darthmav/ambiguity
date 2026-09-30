@@ -37,12 +37,17 @@ Three states, and they are not the same request:
   raised. Reported separately *because* it is not stale: folding it into
   `missing` would leave the header permanently asking for a rebuild that
   cannot change anything, and a permanent warning is one nobody reads.
+* `unreadable` -- in the walk, but not UTF-8 text (or not readable at all),
+  which the indexer skips. The same kind of permanent absence as `oversized`,
+  for the same reason reported apart from `missing`: one Latin-1 notes file
+  used to hold the header at "stale: 1 not indexed" through every rebuild.
 """
 
 from __future__ import annotations
 
 import time
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 from langgraph_agent.graphrag_server import MAX_INDEXABLE_BYTES, iter_project_files
@@ -127,18 +132,38 @@ def forget_expected_documents() -> None:
     _walk_cache.clear()
 
 
+def _indexer_can_read(path: str) -> bool:
+    """Whether the indexer's own `read_text(encoding="utf-8")` succeeds on `path`.
+
+    A file gone since the walk counts as readable: it is the walk's to drop,
+    and the next one will.
+    """
+    try:
+        Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return True
+    except (OSError, UnicodeDecodeError):
+        return False
+    return True
+
+
 def corpus_staleness(
     indexed: Iterable[str], root: str = ".", *, use_cache: bool = True
 ) -> dict[str, Any]:
     """Compare what the corpus holds against what a reindex would put there.
 
     See the module docstring for the failure this exists to catch, and for why
-    `oversized` is reported beside `stale` rather than inside it.
+    `oversized` and `unreadable` are reported beside `stale` rather than
+    inside it. Only files already missing from the corpus are read to tell the
+    two apart -- usually none, so the header's poll stays a walk and a stat.
     """
     have = {str(document) for document in indexed}
     want, oversized = _walk(root, use_cache)
 
-    missing = sorted(want - have)
+    absent = sorted(want - have)
+    unreadable = [path for path in absent if not _indexer_can_read(path)]
+    skipped = set(unreadable)
+    missing = [path for path in absent if path not in skipped]
     extra = sorted(have - want)
     return {
         "stale": bool(missing or extra),
@@ -151,4 +176,6 @@ def corpus_staleness(
         # Not staleness: correctly absent, and a rebuild will not change it.
         "oversized_count": len(oversized),
         "oversized": list(oversized[:STALENESS_SAMPLE]),
+        "unreadable_count": len(unreadable),
+        "unreadable": unreadable[:STALENESS_SAMPLE],
     }

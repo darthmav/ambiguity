@@ -2,8 +2,8 @@
 
 Dense retrieval alone misses the queries this corpus is most often asked. A
 plan naming `BUILDER_DEADLINE_SECONDS` or `_report_path_key` is asking about
-one identifier defined in one file, and an embedding of 384 dimensions is a
-poor instrument for "contains this exact rare token": the model was trained to
+one identifier defined in one file, and a dense embedding is a poor
+instrument for "contains this exact rare token": the model was trained to
 put *similar* passages near each other, and every seat-timeout constant in this
 project is similar to every other one. Measured against ground truth that
 cannot be argued with -- 541 identifiers each defined in exactly one project

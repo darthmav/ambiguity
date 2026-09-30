@@ -1,5 +1,9 @@
 # Ruff configuration
-target-version = "py310"
+#
+# The target is the floor pyproject.toml requires (and mypy.ini checks
+# against). It said py310 after that floor moved to 3.12, which kept ruff from
+# suggesting the 3.11 and 3.12 spellings of anything.
+target-version = "py312"
 line-length = 100
 
 [lint]
@@ -14,6 +18,16 @@ select = [
 ]
 ignore = [
     "E501",  # line too long (handled by formatter)
+    # Rewrites 3.12 enables that change how code is written, not what it does,
+    # and that ruff cannot apply safely: PEP 695 type parameters (UP040, UP046,
+    # UP047) and `(str, Enum)` -> `StrEnum`, which also changes what `str()` of
+    # a member prints (UP042). This file lints what the Builder writes as well
+    # as this project, and a lint finding blocks approval: correct 3.12 code
+    # written the older way would cost a whole cycle to restyle.
+    "UP040",
+    "UP042",
+    "UP046",
+    "UP047",
 ]
 
 [lint.isort]

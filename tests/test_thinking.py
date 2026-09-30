@@ -449,3 +449,159 @@ def test_a_builder_nobody_could_describe_is_not_accused(monkeypatch):
 
     assert status["tools"] is None
     assert status["tools_note"] == ""
+
+
+# ---------------------------------------------------------------------------
+# a seat that cannot call tools is given none
+# ---------------------------------------------------------------------------
+
+
+class _Bindable:
+    """A chat model that binds anything, the way ChatOllama does for every tag."""
+
+    def __init__(self, model: str) -> None:
+        self.model = model
+        self.bound: list[Any] = []
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> _Bindable:
+        self.bound.append(tools)
+        return self
+
+
+def test_binding_tools_to_a_tag_without_them_raises_like_a_stub(monkeypatch):
+    """Binding never failed for an Ollama tag: the daemon refused the call.
+
+    `ChatOllama.bind_tools` exists for every tag, so the AttributeError the
+    Builder's no-tools path waits for never came -- the belt was bound, the
+    first call went out, and the daemon answered 400 "does not support tools",
+    failing the run that the card said would only change nothing.
+    """
+    _daemon(monkeypatch, {"plain:latest": PLAIN, "thinks:cloud": THINKS})
+
+    plain = config._SeatLLM("builder", _Bindable("plain:latest"), provider="ollama")
+    with pytest.raises(AttributeError):
+        plain.bind_tools(["filesystem_write"])
+
+    able = config._SeatLLM("builder", _Bindable("thinks:cloud"), provider="ollama")
+    assert able.bind_tools(["filesystem_write"])._provider == "ollama"
+
+
+def test_a_tag_nobody_could_describe_is_still_offered_its_tools(monkeypatch):
+    """"Could not ask" is not "cannot", so the belt is bound as it always was."""
+    _daemon(monkeypatch, {})
+    inner = _Bindable("plain:latest")
+
+    config._SeatLLM("builder", inner, provider="ollama").bind_tools(["filesystem_write"])
+
+    assert inner.bound == [["filesystem_write"]]
+
+
+def test_the_builder_reports_instead_of_failing_on_a_seat_without_tools(monkeypatch):
+    """End to end through `builder_node`, with the daemon's refusal stood in.
+
+    A `:cloud` tag keeps `_SeatLLM.invoke` off the path that evicts models from
+    the cards, which would reach a real daemon.
+    """
+    _daemon(monkeypatch, {"notools:cloud": PLAIN})
+
+    class _RefusesTools:
+        def invoke(self, messages: Any) -> Any:
+            raise RuntimeError("notools:cloud does not support tools (status code: 400)")
+
+    class _NoTools(_Bindable):
+        def bind_tools(self, tools: Any, **kwargs: Any) -> Any:
+            return _RefusesTools()
+
+        def invoke(self, messages: Any) -> AIMessage:
+            return AIMessage(
+                content="## Changes Made\n- Proposed the edit\n\n"
+                "## Files Modified\n\n## Blockers\nnone"
+            )
+
+    seat = config._SeatLLM("builder", _NoTools("notools:cloud"), provider="ollama")
+    monkeypatch.setattr(nodes, "get_agent_llm", lambda agent, temperature=0.1: seat)
+    state: Any = {
+        "goal": "g", "messages": [], "plan": "1. Edit it.", "research": "",
+        "files_changed": [], "failed_verification": [], "lint_failed": [],
+        "expect_failures": False, "discuss_only": False, "output_dir": "",
+        "step_count": 0,
+    }
+
+    result = nodes.builder_node(state)
+
+    assert "Proposed the edit" in result["builder_report"]
+    assert result["files_changed"] == []
+    assert "builder" not in config._seat_failures
+
+
+# ---------------------------------------------------------------------------
+# Claude 5.5
+# ---------------------------------------------------------------------------
+
+
+def test_opus_5_5_is_locked_on_because_it_rejects_every_off(monkeypatch):
+    """Opus 5.5 answers `{"type": "disabled"}` with a 400 at every effort level.
+
+    Left switchable, the unticked default sent exactly that, so a seat moved
+    onto the current Opus failed every call it made.
+    """
+    assert config.thinking_support("anthropic", "claude-opus-5-5")[0] == "always"
+    assert "thinking" not in _claude_payload(monkeypatch, "claude-opus-5-5", False)
+    assert "thinking" not in _claude_payload(monkeypatch, "claude-opus-5-5", True)
+
+
+def test_sonnet_5_5_is_switched_off_with_between_tools(monkeypatch):
+    """Sonnet 5.5 rejects `disabled` too, but can still be switched off --
+    `between_tools` is the word for off on it."""
+    assert config.thinking_support("anthropic", "claude-sonnet-5-5")[0] == "switch"
+
+    on = _claude_payload(monkeypatch, "claude-sonnet-5-5", True)
+    off = _claude_payload(monkeypatch, "claude-sonnet-5-5", False)
+
+    assert on["thinking"] == {"type": "adaptive"}
+    assert off["thinking"] == {"type": "between_tools"}
+    assert "temperature" not in on and "temperature" not in off
+
+
+# ---------------------------------------------------------------------------
+# resolving a seat
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _no_provider_env(monkeypatch):
+    """`.env` is loaded at import, so its keys are cleared before each case."""
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "OPENAI_API_KEY", "OPENAI_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_a_named_model_settles_its_provider_before_the_environment(
+    monkeypatch, _no_provider_env
+):
+    """`BUILDER_MODEL=gpt-4o` is an OpenAI seat on a machine with an Anthropic key.
+
+    The keys were read first, so that seat went to Anthropic and failed every
+    call with a model Anthropic does not have.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    assert config._detect_provider("gpt-4o") == "openai"
+    assert config._detect_provider("qwen3.8:latest") == "ollama"
+    assert config._detect_provider(None) == "anthropic"
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    assert config._detect_provider("claude-sonnet-5") == "anthropic"
+    # A name no provider's naming claims is still decided by the environment.
+    assert config._detect_provider("somemodel") == "openai"
+    assert config._detect_provider(None) == "openai"
+
+
+def test_a_tag_written_without_its_version_is_the_pulled_model(monkeypatch):
+    """The daemon lists `plain:latest`; a seat configured as `plain` is that model."""
+    _daemon(monkeypatch, {"plain": PLAIN, "plain:latest": PLAIN})
+    config.set_agent_llm("architect", "ollama", "plain")
+
+    status = config.get_agent_status("architect")
+
+    assert status["badge"] != "NOT PULLED"
+    assert status["live"]

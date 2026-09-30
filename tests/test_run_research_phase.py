@@ -276,3 +276,31 @@ def test_a_discussion_run_reaches_the_seats_as_state(monkeypatch, graph):
     result = serve.rpc_run_goal({"goal": "g", "discuss_only": True})
 
     assert result["discuss_only"] is True
+
+
+def test_a_pre_run_phase_that_raises_does_not_leave_the_run_claimed(monkeypatch, graph):
+    """The phases ran between claiming the run and the `try` that releases it.
+
+    One that raised left `running` True and the stop control armed for the life
+    of the process: every later run was refused as already in flight, every
+    upload and clear with it, and an exit waited on a `finally` that never came.
+    """
+    def unreadable(report):
+        raise RuntimeError("the floor record is unreadable")
+
+    monkeypatch.setattr(serve, "_calibrate_the_floor_before_the_run", unreadable)
+
+    with pytest.raises(RuntimeError, match="unreadable"):
+        serve.rpc_run_goal({"goal": "g"})
+
+    assert serve._run_progress["running"] is False
+    assert serve.RUN_CONTROL.run_id() == ""
+    assert "unreadable" in (serve._load_snapshot() or {}).get("error", "")
+
+    monkeypatch.setattr(
+        serve, "_calibrate_the_floor_before_the_run",
+        lambda report: {"source": "known", "model": "m"},
+    )
+    serve.rpc_run_goal({"goal": "g"})
+
+    assert graph.streamed, "the next run was refused as already in flight"

@@ -11,7 +11,7 @@ Provides logging with clear severity levels for auditability:
 
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 
 class SelfHealingLogger:
@@ -86,7 +86,7 @@ class SelfHealingLogger:
     def _build_extra(self, **kwargs: object) -> dict[str, object]:
         """Build extra context for log messages."""
         extra: dict[str, object] = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         }
         if self._healing_session_id:
             extra["session_id"] = self._healing_session_id
@@ -180,14 +180,19 @@ class SelfHealingLogger:
             )
 
 
-# Global logger instance
-_healing_logger: SelfHealingLogger | None = None
+# One logger per name. It was a single global, so whichever name asked first
+# was the only one there ever was: every decorator takes a `logger_name`, and
+# every one after the first was handed "self_healing" whatever it passed.
+_healing_loggers: dict[str, SelfHealingLogger] = {}
 
 
 def get_healing_logger(name: str = "self_healing",
                        level: int = logging.DEBUG) -> SelfHealingLogger:
     """
-    Get or create the global self-healing logger instance.
+    Get or create the self-healing logger for `name`.
+
+    The same name always returns the same instance; `level` applies only to
+    the call that creates it.
 
     Args:
         name: Logger name
@@ -196,7 +201,7 @@ def get_healing_logger(name: str = "self_healing",
     Returns:
         SelfHealingLogger instance
     """
-    global _healing_logger
-    if _healing_logger is None:
-        _healing_logger = SelfHealingLogger(name, level)
-    return _healing_logger
+    logger = _healing_loggers.get(name)
+    if logger is None:
+        logger = _healing_loggers[name] = SelfHealingLogger(name, level)
+    return logger

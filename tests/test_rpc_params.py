@@ -238,3 +238,71 @@ def test_a_non_numeric_content_length_is_refused():
 def test_a_well_formed_call_still_works():
     reply = _post(json.dumps({"method": "list_seats", "params": {}}).encode())
     assert "seats" in reply["result"]
+
+
+# ---------------------------------------------------------------------------
+# Who may drive the console
+# ---------------------------------------------------------------------------
+
+
+def _raw_post(headers: dict[str, str], body: bytes = b'{"method": "status"}') -> bytes:
+    """The whole reply, status line included: a refusal is not JSON."""
+    handler = serve.Handler.__new__(serve.Handler)
+    handler.path = "/rpc"
+    handler.headers = {"Content-Length": str(len(body)), **headers}
+    handler.rfile = io.BytesIO(body)
+    handler.wfile = _Socket()
+    handler.request_version = "HTTP/1.1"
+    handler.requestline = "POST /rpc HTTP/1.1"
+    handler.command = "POST"
+    handler.do_POST()
+    return bytes(handler.wfile.data)
+
+
+def _status(reply: bytes) -> int:
+    """The status code off the reply's first line, whatever HTTP version it names."""
+    return int(reply.split(b" ", 2)[1])
+
+
+def test_a_page_on_another_site_cannot_drive_the_console():
+    """The console runs goals, and a goal reaches a Builder that runs programs.
+
+    A page the operator merely visited could POST a `text/plain` body -- sent
+    without the browser asking first -- and reach `run_goal`, and the wildcard
+    CORS header let it read the reply too.
+    """
+    reply = _raw_post({"Host": "localhost:8080", "Origin": "https://attacker.example"})
+
+    assert _status(reply) == 403
+    assert b'"result"' not in reply
+
+
+def test_a_rebound_domain_is_refused_by_its_host():
+    """DNS rebinding makes the browser call a page same-origin; its Host still names it."""
+    reply = _raw_post({"Host": "attacker.example:8080", "Origin": "http://attacker.example:8080"})
+
+    assert _status(reply) == 403
+
+
+def test_the_consoles_own_page_and_a_script_are_both_served():
+    """Same-origin browser calls carry a matching Origin; curl carries none."""
+    for headers in (
+        {"Host": "localhost:8080", "Origin": "http://localhost:8080"},
+        {"Host": "127.0.0.1:8080", "Origin": "http://127.0.0.1:8080"},
+        {"Host": "localhost:8080"},
+    ):
+        reply = _raw_post(headers)
+        assert _status(reply) == 200, headers
+        assert b"Access-Control-Allow-Origin" not in reply
+
+
+def test_the_console_listens_on_loopback_unless_told_otherwise(monkeypatch):
+    assert serve._listening_on_loopback()
+
+    monkeypatch.setattr(serve, "CONSOLE_HOST", "0.0.0.0")
+    # Off loopback the operator chose other names for this machine, so the Host
+    # check steps aside -- and a foreign page is still refused by its Origin.
+    assert serve._foreign_request({"Host": "192.168.1.20:8080"}, writes=True) is None
+    assert serve._foreign_request(
+        {"Host": "192.168.1.20:8080", "Origin": "https://attacker.example"}, writes=True
+    )

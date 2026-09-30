@@ -118,27 +118,36 @@ def retry_with_backoff(
                 error=error_msg
             )
 
-        def _on_success(retry_state: RetryCallState) -> None:
-            """Log successful retry."""
-            if retry_state.attempt_number > 1:
-                logger.log_retry_success(func_name=func_name, attempt=retry_state.attempt_number)
-
         retrying = Retrying(
             stop=stop_after_attempt(max_attempts),
             wait=wait_exponential(multiplier=1, min=min_wait, max=max_wait),
             retry=retry_if_exception_type(exceptions),
             before_sleep=_before_sleep,
-            after=_on_success,
             reraise=True,
         )
 
+        # Success is logged here, once the call has returned, and not from
+        # tenacity's `after` hook. That hook runs only after an attempt that
+        # *failed* and is about to be retried, so hanging "Retry succeeded" on
+        # it logged a success for the second attempt exactly when the second
+        # attempt had failed -- and never logged the attempt that did succeed.
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            attempts = 0
+
+            def attempt() -> Any:
+                nonlocal attempts
+                attempts += 1
+                return func(*args, **kwargs)
+
             try:
-                return retrying(func, *args, **kwargs)
+                result = retrying(attempt)
             except exceptions:
                 logger.log_retry_exhausted(func_name=func_name, max_attempts=max_attempts)
                 raise
+            if attempts > 1:
+                logger.log_retry_success(func_name=func_name, attempt=attempts)
+            return result
 
         return wrapper
 
