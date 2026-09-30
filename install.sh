@@ -116,8 +116,11 @@ SEARXNG_PACKAGES=(podman crun)
 
 # PostgreSQL runs in Docker, as Omarchy's own development databases do.
 # postgresql-libs is the client on the host -- psql -- which is how the step
-# below proves the URL it writes into .env really logs in.
-POSTGRES_PACKAGES=(docker postgresql-libs)
+# below proves the URL it writes into .env really logs in. docker-compose and
+# docker-buildx are for the console's own image: `docker compose up --build`
+# needs the first, and the dockerfile's cache mounts and heredocs need BuildKit,
+# which the second provides (Omarchy ships both; plain Arch does not).
+POSTGRES_PACKAGES=(docker docker-compose docker-buildx postgresql-libs)
 
 # Useful: nothing breaks without them, but working on this repo is worse.
 USEFUL=(

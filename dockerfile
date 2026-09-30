@@ -104,7 +104,10 @@ RUN find /opt/venv -name "*.so" -exec strip --strip-unneeded {} + 2>/dev/null ||
 # first run does not pay for a download at the moment it is indexing.
 # Non-fatal: the runtime path already falls back to the network, so a build
 # behind a proxy that cannot reach huggingface.co still produces a working
-# image, one that fetches on first use.
+# image, one that fetches on first use. The directory is made first because the
+# runtime stage copies it: a download that failed would otherwise leave nothing
+# at HF_HOME, and that COPY -- not this step -- would fail the build.
+RUN mkdir -p "$HF_HOME"
 RUN python - <<'PY' || true
 from transformers import AutoTokenizer
 

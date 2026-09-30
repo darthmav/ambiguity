@@ -255,7 +255,7 @@ If Docker is still behind sudo (the `docker` group applies after a reboot), the
 same files work rootless with Podman:
 
 ```bash
-podman build -t ambiguity-console .
+podman build --format docker -f dockerfile -t ambiguity-console .
 podman run --rm --network host --userns=keep-id -v "$PWD":/app ambiguity-console
 ```
 
@@ -292,8 +292,9 @@ Copy `.env.example` to `.env`:
 cp .env.example .env
 ```
 
-No API key is required: the default seats are all Ollama Cloud tags, and the
-daemon holds those credentials. Sign it in once with `ollama signin`.
+No API key is required: every default seat runs a model the local Ollama daemon
+serves from its own weights. Sign the daemon in (`ollama signin`) only if you
+move a seat onto a `:cloud` tag.
 
 A key is only needed if you move a seat onto Anthropic or OpenAI:
 
