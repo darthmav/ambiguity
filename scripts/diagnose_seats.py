@@ -33,7 +33,7 @@ Usage:
 
     python scripts/diagnose_seats.py --list
     python scripts/diagnose_seats.py --phase probe
-    python scripts/diagnose_seats.py --phase teams --configs baseline,legacy
+    python scripts/diagnose_seats.py --phase teams --configs baseline,heavy-gate
     python scripts/diagnose_seats.py --anthropic --exercise all
 
 Nothing here is a benchmark. One short exercise per configuration is a
@@ -105,17 +105,10 @@ CANDIDATES: tuple[Candidate, ...] = (
               "hf.co/RavichandranJ/Dolphin3-Cyber-8B-GGUF:Q5_K_M",
               "Local, completion-only; a second choice for the three "
               "tool-free seats"),
-    Candidate("qwen3.8", "ollama", "qwen3.8:latest",
+    Candidate("qwen", "ollama", "qwen3.8:latest",
               "Local, the only tag here with tools; holds Builder by default"),
-    Candidate("kimi-k3", "ollama", "kimi-k3:cloud",
-              "General; held Planner and Researcher before the local-first "
-              "switch"),
-    Candidate("kimi-code", "ollama", "kimi-k2.7-code:cloud",
-              "Code-specialised sibling of kimi-k3"),
     Candidate("nemotron", "ollama", "nemotron-3-ultra:cloud",
-              "Large reasoner; held Researcher until it probed empty"),
-    Candidate("gemma", "ollama", "gemma4:cloud",
-              "Researcher before nemotron; also probes empty"),
+              "Ollama Cloud; the cloud model the console's pull list carries"),
     Candidate("opus", "anthropic", "claude-opus-5", "Paid control", paid=True),
     Candidate("sonnet", "anthropic", "claude-sonnet-5", "Paid control", paid=True),
     Candidate("haiku", "anthropic", "claude-haiku-4-5", "Paid control", paid=True),
@@ -139,63 +132,55 @@ class TeamConfig:
         return any(BY_KEY[k].paid for k in self.seats.values())
 
 
-# Eight seatings, each varying one thing you could act on. They are not eight
-# arbitrary permutations: a permutation sweep of five models over four seats is
-# 625 runs and tells you less, because nothing distinguishes a result from
-# noise. Each of these has a stated reason to exist, and `legacy` is the
-# control -- it is the configuration whose Researcher went silent, kept so the
-# diagnostic can show the difference rather than assert it.
+# Seatings, each varying one thing you could act on. They are not arbitrary
+# permutations: a permutation sweep of a few models over four seats is hundreds
+# of runs and tells you less, because nothing distinguishes a result from
+# noise. Each of these has a stated reason to exist.
 TEAM_CONFIGS: tuple[TeamConfig, ...] = (
     TeamConfig(
         "baseline",
-        {"architect": "qwen", "planner": "kimi-k3",
-         "researcher": "kimi-k3", "builder": "qwen"},
-        "Shipped defaults: qwen on the gate and the Builder, kimi-k3 planning "
-        "and researching. Everything else is "
-        "measured against this. Keep it equal to DEFAULT_SEATS -- a control "
-        "that has drifted from what the project ships is measuring nothing "
-        "anyone runs.",
+        {"architect": "dolphin-2.9.1", "planner": "dolphin-2.9.1",
+         "researcher": "dolphin-2.9.1", "builder": "qwen"},
+        "The shipped defaults: dolphin-2.9.1 on the Architect, Planner and "
+        "Researcher, qwen on the Builder. Everything else is measured against "
+        "this. Keep it equal to DEFAULT_SEATS -- a control that has drifted "
+        "from what the project ships is measuring nothing anyone runs.",
     ),
     TeamConfig(
-        "legacy",
-        {"architect": "kimi-k3", "planner": "qwen",
-         "researcher": "nemotron", "builder": "kimi-k3"},
-        "Control: the seating that shipped before the probes were run, whose "
-        "Researcher answers with nothing -- as did gemma4:cloud before it. "
-        "Kept so the difference can be shown rather than asserted. It differs "
-        "from baseline in all four seats now, so read it against `mixed` to "
-        "isolate the Researcher.",
+        "cloud-planning",
+        {"architect": "dolphin-2.9.1", "planner": "nemotron",
+         "researcher": "nemotron", "builder": "qwen"},
+        "Baseline with the cloud model planning and researching. Asks whether "
+        "the two seats that read and reason are where a larger model pays.",
     ),
     TeamConfig(
-        "kimi-solo",
-        {"architect": "kimi-k3", "planner": "kimi-k3",
-         "researcher": "kimi-k3", "builder": "kimi-k3"},
-        "A uniform seating. Baseline already seats kimi-k3 in the two "
-        "tool-free seats, so this asks whether it also holds the gate and "
-        "the Builder -- and read against baseline, whether mixing earns its keep.",
-    ),
-    TeamConfig(
-        "mixed",
-        {"architect": "kimi-k3", "planner": "qwen",
-         "researcher": "qwen", "builder": "kimi-k3"},
-        "The heterogeneous seating that shipped before all four went to qwen: "
-        "kimi-k3 on the gate and the Builder. Baseline is the same two models "
-        "the other way round, so this asks which of them belongs on the seats "
-        "that rule and act, rather than whether to mix at all.",
-    ),
-    TeamConfig(
-        "code-builder",
-        {"architect": "qwen", "planner": "kimi-k3",
-         "researcher": "kimi-k3", "builder": "kimi-code"},
-        "Baseline with a code-specialised Builder. The Builder is the only "
-        "seat that calls tools, so it is where specialisation should pay.",
+        "cloud-builder",
+        {"architect": "dolphin-2.9.1", "planner": "dolphin-2.9.1",
+         "researcher": "dolphin-2.9.1", "builder": "nemotron"},
+        "Baseline with the cloud model on the Builder. The Builder is the only "
+        "seat that calls tools, so it is where a stronger model should pay.",
     ),
     TeamConfig(
         "heavy-gate",
-        {"architect": "nemotron", "planner": "kimi-k3",
-         "researcher": "kimi-k3", "builder": "qwen"},
-        "Big reasoner on the gate. The Architect ends the run, so a weak gate "
-        "shows up as loops rather than as bad text.",
+        {"architect": "nemotron", "planner": "dolphin-2.9.1",
+         "researcher": "dolphin-2.9.1", "builder": "qwen"},
+        "Baseline with a big reasoner on the gate. The Architect ends the run, "
+        "so a weak gate shows up as loops rather than as bad text.",
+    ),
+    TeamConfig(
+        "mixed",
+        {"architect": "nemotron", "planner": "dolphin-2.9.1",
+         "researcher": "dolphin-2.9.1", "builder": "nemotron"},
+        "Baseline with nemotron on the seats that rule and act, dolphin on the "
+        "two that plan and read: does the cloud model belong on the gate and "
+        "the Builder together?",
+    ),
+    TeamConfig(
+        "nemotron-solo",
+        {"architect": "nemotron", "planner": "nemotron",
+         "researcher": "nemotron", "builder": "nemotron"},
+        "A uniform seating on the cloud model. Read against baseline, it asks "
+        "whether mixing local and cloud earns its keep.",
     ),
     TeamConfig(
         "anthropic-control",
@@ -206,8 +191,8 @@ TEAM_CONFIGS: tuple[TeamConfig, ...] = (
     ),
     TeamConfig(
         "spend-on-the-gate",
-        {"architect": "opus", "planner": "qwen",
-         "researcher": "qwen", "builder": "qwen"},
+        {"architect": "opus", "planner": "dolphin-2.9.1",
+         "researcher": "dolphin-2.9.1", "builder": "qwen"},
         "Buys only the seat that decides when to stop. The cheapest way to "
         "find out whether the gate is what is failing.",
     ),
@@ -1274,7 +1259,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             examples:
               %(prog)s --list
               %(prog)s --phase probe
-              %(prog)s --phase teams --configs baseline,legacy --verbose
+              %(prog)s --phase teams --configs baseline,heavy-gate --verbose
               %(prog)s --anthropic --exercise all
         """),
     )
@@ -1319,7 +1304,7 @@ def show_catalogue() -> None:
     width = max(len(c.model) for c in CANDIDATES) + 2
     for c in CANDIDATES:
         tag = red(" paid") if c.paid else ""
-        print(f"  {c.key:<12}{c.provider:<11}{c.model:<{width}}{dim(c.note)}{tag}")
+        print(f"  {c.key:<16}{c.provider:<11}{c.model:<{width}}{dim(c.note)}{tag}")
     print()
     rule("team configurations")
     for cfg in TEAM_CONFIGS:

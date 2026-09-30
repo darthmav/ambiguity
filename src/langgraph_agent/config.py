@@ -73,12 +73,13 @@ DEFAULT_SEATS: dict[str, dict[str, str]] = {
 }
 
 
-# The models the console offers a seat, and the only ones it will set. `group`
-# drives the <optgroup> headings in the seat dropdowns. Tags the daemon
-# carries beyond these are not offered. qwen3-embedding is not a seat choice --
-# the daemon reports it with no `completion` capability, so a seat on it would
-# fail every call -- and the embedder card offers it instead. Anthropic and
-# OpenAI still work for a seat configured in .env; the console does not offer them.
+# The tags `install.sh` pulls so a seat can be moved onto any of them without a
+# mid-run pull. It is NOT the offer: the console's dropdowns and `set_seat` read
+# `ollama ls` (`_seat_model_options` in serve.py), so anything the daemon carries
+# is selectable and nothing here is offered unless it has been pulled. `group` is
+# kept for the labels. qwen3-embedding is not a seat choice -- the daemon reports
+# it with no `completion` capability -- and the embedder card offers it instead.
+# Anthropic and OpenAI still work for a seat configured in .env.
 AGENT_LLM_OPTIONS: list[dict[str, str]] = [
     {"label": "Qwen3.8", "provider": "ollama", "model": "qwen3.8:latest",
      "group": "Ollama (local)"},
@@ -101,7 +102,7 @@ AGENT_LLM_OPTIONS: list[dict[str, str]] = [
     # 5.7 GB. Also `completion`-only (checked live against this daemon, same
     # as the 2.9.1 tag above) -- not a Builder option, but a second local
     # choice for the three tool-free seats.
-    {"label": "Kimi K3", "provider": "ollama", "model": "kimi-k3:cloud",
+    {"label": "Nemotron 3 Ultra", "provider": "ollama", "model": "nemotron-3-ultra:cloud",
      "group": "Ollama Cloud"},
 ]
 

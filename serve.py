@@ -44,7 +44,6 @@ from langgraph.errors import GraphRecursionError  # noqa: E402
 
 from langgraph_agent import AgentState, create_agent_graph  # noqa: E402
 from langgraph_agent.config import (  # noqa: E402
-    AGENT_LLM_OPTIONS,
     AGENTS,
     get_agent_model_info,
     get_agent_status,
@@ -638,24 +637,14 @@ def rpc_set_seat(params: dict[str, Any]) -> dict[str, Any]:
     if not provider or not model:
         raise ValueError("Provider and model are both required")
 
-    # The dropdowns are the whole list, so a tab still showing an older one
-    # cannot seat a model the console no longer offers. A seat's *own* current
-    # model is the one exception, and it is not a courtesy: the console renders
-    # it under "Current" precisely when it is not in the list -- a seat
-    # configured from `.env` on a provider the offer no longer carries -- so
-    # refusing it makes that option unselectable and the only way back to where
-    # the process started is editing `.env` and restarting.
-    allowed = {(o["provider"], o["model"]) for o in AGENT_LLM_OPTIONS}
-
-    # Also allow any locally downloaded Ollama model that reports `completion`
-    # capability. The dropdown (llm_options) is built from this same list, so
-    # anything the user can select there should be accepted here.
-    if provider == "ollama":
-        local_tags = list_ollama_models()
-        for tag in local_tags:
-            caps = ollama_model_capabilities(tag)
-            if caps is not None and "completion" in caps:
-                allowed.add(("ollama", tag))
+    # The dropdowns are `ollama ls` and nothing else, so a tab still showing an
+    # older list cannot seat a model the daemon no longer carries. A seat's
+    # *own* current model is the one exception, and it is not a courtesy: the
+    # console renders it under "Current" precisely when it is not in the list
+    # -- a seat configured from `.env` on a provider the offer does not carry --
+    # so refusing it makes that option unselectable and the only way back to
+    # where the process started is editing `.env` and restarting.
+    allowed = {(o["provider"], o["model"]) for o in _seat_model_options()}
 
     # `get_agent_model_info`, not `get_agent_status`: this asks a pure config
     # question -- which model is seated -- and the status call answers a live
@@ -666,15 +655,7 @@ def rpc_set_seat(params: dict[str, Any]) -> dict[str, Any]:
     allowed.add((seated["provider"], seated["model"]))
 
     if (provider, model) not in allowed:
-        offered = ", ".join(o["model"] for o in AGENT_LLM_OPTIONS)
-        # Include locally available models in the error message for clarity
-        local_completion = []
-        for tag in list_ollama_models():
-            caps = ollama_model_capabilities(tag)
-            if caps is not None and "completion" in caps:
-                local_completion.append(tag)
-        if local_completion:
-            offered += "; locally available: " + ", ".join(local_completion)
+        offered = ", ".join(o["model"] for o in _seat_model_options()) or "none: the daemon reported no models"
         raise ValueError(f"{model!r} is not a seat model the console offers: {offered}")
 
     set_agent_llm(agent, provider, model)
@@ -699,42 +680,36 @@ def rpc_set_thinking(params: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "role": agent, **get_agent_status(agent)}
 
 
-def rpc_llm_options(_: dict[str, Any]) -> dict[str, Any]:
-    """Model choices for the seat dropdowns: cloud models that work via the
-    daemon proxy, plus locally downloaded models that report `completion`
-    capability.
+def _seat_model_options() -> list[dict[str, str]]:
+    """Every tag `ollama ls` reports that a seat can run, and nothing else.
 
-    Cloud models (tags ending in `:cloud` or `-cloud`) are proxied to
-    ollama.com by the local daemon and do not need to be pulled locally.
-    Local models are queried from the daemon on each call so the list always
-    reflects what is currently installed.
+    The daemon is the only source: nothing is offered from a list kept here, so
+    a tag someone pulls shows up on the next poll and one they remove goes.
+    A tag whose capabilities say no `completion` (the embedder) is left out;
+    one the daemon would not describe stays in -- "could not ask" is not "cannot
+    run". Cloud tags (`:cloud`, `-cloud`) are listed by the daemon once pulled
+    or used, and are grouped apart from weights that run on this machine.
     """
     options = []
-
-    # Cloud models from AGENT_LLM_OPTIONS -- these work via the daemon proxy
-    # and don't need to be downloaded locally.
-    for opt in AGENT_LLM_OPTIONS:
-        if opt["provider"] == "ollama" and opt["model"].endswith((":cloud", "-cloud")):
-            options.append({
-                "label": opt["label"],
-                "provider": "ollama",
-                "model": opt["model"],
-                "group": opt["group"],
-            })
-
-    # Local models that report `completion` capability
-    local_tags = list_ollama_models()
-    for tag in local_tags:
-        # Skip embedding models -- they report no completion capability
+    for tag in list_ollama_models():
         caps = ollama_model_capabilities(tag)
         if caps is not None and "completion" not in caps:
             continue
-        # Don't duplicate cloud models that might also be pulled locally
-        if any(o["model"] == tag for o in options):
-            continue
-        options.append({"label": tag, "provider": "ollama", "model": tag, "group": "Ollama (local)"})
+        cloud = tag.endswith((":cloud", "-cloud"))
+        options.append({
+            "label": tag,
+            "provider": "ollama",
+            "model": tag,
+            "group": "Ollama Cloud" if cloud else "Ollama (local)",
+        })
+    # Local weights first, then cloud, each alphabetical (the daemon's list is).
+    options.sort(key=lambda o: o["group"] != "Ollama (local)")
+    return options
 
-    return {"options": options}
+
+def rpc_llm_options(_: dict[str, Any]) -> dict[str, Any]:
+    """Model choices for the seat dropdowns: `ollama ls`, minus embedders."""
+    return {"options": _seat_model_options()}
 
 
 def _embedding_choice() -> dict[str, Any]:

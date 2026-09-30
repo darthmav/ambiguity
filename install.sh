@@ -558,6 +558,10 @@ Environment=SEARXNG_BASE_URL=$SEARXNG_LOCAL/
 [Service]
 Restart=on-failure
 TimeoutStartSec=300
+# Rootless podman's pasta copies the host's routes when the container starts.
+# Started at login before Wi-Fi is up, it gets none, and every engine then fails
+# on DNS until a restart. Wait (bounded, never fatal) for a default route.
+ExecStartPre=/usr/bin/sh -c 'for _ in \$(seq 1 90); do ip route show default | grep -q . && exit 0; sleep 1; done; exit 0'
 
 [Install]
 WantedBy=default.target
@@ -588,6 +592,28 @@ EOF
         fi
         for _ in $(seq 1 60); do searxng_up "$SEARXNG_LOCAL" && break; sleep 1; done
 
+        # Answering is not reaching the internet. A container whose pasta came up
+        # without a route answers /healthz and finds nothing, so the container is
+        # asked to open a connection out, and restarted (which re-reads the host's
+        # routes) until it can. Three tries, spaced, and never fatal: a machine
+        # that is genuinely offline is reported by the search test below.
+        searxng_egress() {
+            podman exec ambiguity-searxng python3 -c \
+                'import socket; socket.create_connection(("1.1.1.1", 443), timeout=5)' >/dev/null 2>&1
+        }
+        if searxng_up "$SEARXNG_LOCAL"; then
+            for attempt in 1 2 3; do
+                searxng_egress && break
+                echo "  SearxNG's container has no route out (attempt $attempt); restarting it"
+                for _ in $(seq 1 30); do ip route show default 2>/dev/null | grep -q . && break; sleep 1; done
+                systemctl --user restart ambiguity-searxng.service || true
+                for _ in $(seq 1 60); do searxng_up "$SEARXNG_LOCAL" && break; sleep 1; done
+                sleep 2
+            done
+            searxng_egress && ok "SearxNG's container can reach the internet" \
+                || NOTES+=("SearxNG's container has no route out; is this machine online? then: systemctl --user restart ambiguity-searxng")
+        fi
+
         if searxng_up "$SEARXNG_LOCAL"; then
             ok "SearxNG answering at $SEARXNG_LOCAL (starts with your session)"
             # The app uses SearxNG only when SEARXNG_URL says so, and only once
@@ -614,6 +640,7 @@ EOF
         searx_status=0
         "$PY" - <<'PY' || searx_status=$?
 import sys
+import time
 
 import httpx
 
@@ -621,7 +648,14 @@ from langgraph_agent import web_research
 
 try:
     with httpx.Client() as client:
-        hits = web_research._search_searxng("python packaging", 5, client)
+        # A fresh instance's engines warm up and rate-limit in bursts, so an
+        # empty answer is asked again, spaced, before it is called empty.
+        hits = []
+        for attempt in range(6):
+            hits = web_research._search_searxng("python packaging", 5, client)
+            if hits:
+                break
+            time.sleep(5)
 except httpx.HTTPStatusError as exc:
     code = exc.response.status_code
     hint = " (403: json is not in the instance's search.formats)" if code == 403 else ""
@@ -879,7 +913,11 @@ for _ in $(seq 1 60); do
     kill -0 "$console_pid" 2>/dev/null || break
     sleep 0.5
 done
-if [ "$console_up" -eq 1 ] && curl -sf -m 5 "http://127.0.0.1:$console_port/" | grep -qi '<html'; then
+# The page is read whole, not piped into grep -q: grep exits at the first match,
+# curl then fails writing the rest, and pipefail reads that as a failed fetch.
+console_page=""
+[ "$console_up" -eq 1 ] && console_page="$(curl -sf -m 5 "http://127.0.0.1:$console_port/" || true)"
+if [ "$console_up" -eq 1 ] && grep -qi '<html' <<<"$console_page"; then
     ok "serve.py starts, answers /api/status and serves the console page"
 elif [ "$console_up" -eq 1 ]; then
     problem "serve.py answers /api/status but did not serve the console page; see $console_log"
@@ -984,6 +1022,7 @@ if os.environ.get("PROBE") == "1":
             list(pool.map(probe, live))
 
 dead = 0
+width = max(len(get_agent_status(agent)["model"]) for agent in AGENTS) + 2
 for agent in AGENTS:
     seat = get_agent_status(agent)
     if not seat["live"]:
@@ -992,7 +1031,7 @@ for agent in AGENTS:
         mark, note = "✗", "  -- SILENT: answered a one-word prompt with nothing"
     else:
         mark, note = "✓", ""
-    print(f"  {mark} {agent:11}{seat['model']:24}{seat['provider']}{note}")
+    print(f"  {mark} {agent:11}{seat['model']:<{width}}{seat['provider']}{note}")
     dead += mark == "✗"
 sys.exit(1 if dead else 0)
 PY

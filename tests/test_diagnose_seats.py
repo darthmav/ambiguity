@@ -70,7 +70,7 @@ def test_a_silent_researcher_seat_probes_as_empty(diag, monkeypatch):
     )
 
     mods = {"nodes": nodes, "config": _FakeConfig(), "Verdict": Verdict}
-    result = diag.run_probe(diag.BY_KEY["kimi-k3"], "researcher", mods)
+    result = diag.run_probe(diag.BY_KEY["nemotron"], "researcher", mods)
 
     assert result.status == "empty"
     assert "loop the run" in result.detail
@@ -92,7 +92,7 @@ def test_real_findings_still_probe_as_ok(diag, monkeypatch):
     )
 
     mods = {"nodes": nodes, "config": _FakeConfig(), "Verdict": Verdict}
-    result = diag.run_probe(diag.BY_KEY["kimi-k3"], "researcher", mods)
+    result = diag.run_probe(diag.BY_KEY["nemotron"], "researcher", mods)
 
     assert result.status == "ok"
 
@@ -156,7 +156,7 @@ def test_the_gate_is_graded_on_judgment_not_parseability(
                         _gate_stub(on_finished, on_blocked))
 
     mods = {"nodes": nodes, "config": _FakeConfig(), "Verdict": Verdict}
-    result = diag.run_probe(diag.BY_KEY["kimi-k3"], "architect", mods)
+    result = diag.run_probe(diag.BY_KEY["nemotron"], "architect", mods)
 
     assert result.status == expected
     assert result.parsed["verdict"] == on_finished

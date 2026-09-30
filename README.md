@@ -157,9 +157,9 @@ Later cycles route as the Planner asks.
 | **Researcher** | Gathers deep, relationship-aware knowledge | Dolphin 2.9.1 9B (ollama, local) | GraphRAG MCP only |
 | **Builder** | Implements the plan (writes code, edits files) | `qwen3.8:latest` (ollama, local) | Filesystem, Git, Terminal |
 
-Every seat is reassignable live from its dropdown in the console, which offers
-`qwen3.8:latest`, two local dolphin tags, and `kimi-k3:cloud` and nothing
-else; selections last for the life of the process. `qwen3-embedding:latest`
+Every seat is reassignable live from its dropdown in the console, which lists
+exactly what `ollama ls` reports (embedders excluded), so a tag you pull appears
+on the next poll; selections last for the life of the process. `qwen3-embedding:latest`
 is the embedder's, not a seat's: it cannot chat. Only `qwen3.8:latest`
 reports `tools`, which is why it -- not either dolphin -- holds the Builder.
 
@@ -325,13 +325,13 @@ ollama pull hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M   # Architect
 ollama pull qwen3.8:latest                                           # Builder
 ```
 
-Point a seat at an Ollama Cloud tag instead (`ARCHITECT_MODEL=kimi-k3:cloud`,
+Point a seat at an Ollama Cloud tag instead (`ARCHITECT_MODEL=nemotron-3-ultra:cloud`,
 say) and it needs the daemon signed in, since `:cloud` tags proxy to
 ollama.com on credentials the daemon holds:
 
 ```bash
 ollama signin
-ollama pull kimi-k3:cloud
+ollama pull nemotron-3-ultra:cloud
 ```
 
 The embedding model (`qwen3-embedding:latest`) is served by the Ollama daemon like the seats' models and pulled the same way — `install.sh` does it, or `ollama pull qwen3-embedding:latest`. Only its tokenizer is fetched from Hugging Face, so the chunker can cut passages in-process; nothing here runs or needs torch.
@@ -417,7 +417,7 @@ python scripts/diagnose_seats.py --dry-run
 python scripts/diagnose_seats.py --phase probe
 
 # Phase 2 only: whole runs, one sandbox each
-python scripts/diagnose_seats.py --phase teams --configs baseline,legacy --verbose
+python scripts/diagnose_seats.py --phase teams --configs baseline,heavy-gate --verbose
 
 # Include the paid Anthropic controls
 python scripts/diagnose_seats.py --anthropic --exercise all

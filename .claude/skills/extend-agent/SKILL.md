@@ -18,9 +18,9 @@ and expose it through `mcp_client.py`.
 
 ### Change a seat's model
 Update `DEFAULT_SEATS` and `_DEFAULT_AGENT_MODELS` in
-`src/langgraph_agent/config.py`, the seat table in CLAUDE.md, and `.env.example`; add
-the tag to `AGENT_LLM_OPTIONS`, which is the whole offer -- `set_seat` refuses
-anything not in it and `test_rpc_params.py` pins the list. Check the tag
+`src/langgraph_agent/config.py`, the seat table in CLAUDE.md, and `.env.example`; list
+the tag in `AGENT_LLM_OPTIONS` so `install.sh` pulls it. That list is not the
+offer: the dropdowns and `set_seat` read `ollama ls` (`_seat_model_options`). Check the tag
 reports `tools` before seating it as the Builder: that seat's work *is* tool
 calls, and `get_agent_status` puts a **NO TOOLS** chip on its card alone.
 

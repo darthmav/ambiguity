@@ -131,52 +131,55 @@ def test_a_seat_takes_only_a_model_the_console_offers(provider, model):
     assert get_agent_model_info("planner") == before
 
 
-def test_the_seat_dropdowns_query_the_daemon_for_local_models(monkeypatch):
-    """The dropdowns are populated from AGENT_LLM_OPTIONS (cloud models) plus
-    locally downloaded models from the daemon.
+def test_the_seat_dropdowns_are_exactly_ollama_ls(monkeypatch):
+    """The dropdowns hold every tag the daemon lists that can complete, and
+    nothing kept in code: no tag is offered because a list here names it.
 
-    Cloud models (tags ending in :cloud) work via the daemon proxy and don't
-    need to be pulled locally. Local models are queried from the daemon and
-    filtered for completion capability. Embedding models (no completion
-    capability) are filtered out.
+    Cloud tags appear when the daemon lists them (pulled or used), grouped apart
+    from local weights. An embedder (no `completion`) is left out; a tag the
+    daemon will not describe stays in.
     """
-    # Mock the daemon to return specific local models
-    def mock_list_ollama_models():
-        return ["qwen3.8:latest", "dolphin-2.9.1-yi-1.5-9b:Q4_K_M", "qwen3-embedding:latest"]
+    tags = [
+        "kimi-k3:cloud",
+        "nemotron-3-nano:30b-cloud",
+        "qwen3-embedding:latest",
+        "qwen3.8:latest",
+        "mystery:latest",
+    ]
 
-    def mock_ollama_model_capabilities(model):
+    def caps(model):
         if model == "qwen3-embedding:latest":
-            return ["embedding"]  # no completion
+            return ["embedding"]
+        if model == "mystery:latest":
+            return None
         return ["completion", "tools", "thinking"]
 
-    # The functions are imported at module level in serve.py, so patch there
-    monkeypatch.setattr(serve, "list_ollama_models", mock_list_ollama_models)
-    monkeypatch.setattr(serve, "ollama_model_capabilities", mock_ollama_model_capabilities)
+    monkeypatch.setattr(serve, "list_ollama_models", lambda: tags)
+    monkeypatch.setattr(serve, "ollama_model_capabilities", caps)
 
-    result = serve.rpc_llm_options({})
-    options = result["options"]
-
-    # Should have cloud models from AGENT_LLM_OPTIONS (kimi-k3:cloud)
-    # plus 2 local models (embedding model filtered out)
+    options = serve.rpc_llm_options({})["options"]
     models = [o["model"] for o in options]
-    # Cloud models from AGENT_LLM_OPTIONS
-    assert "kimi-k3:cloud" in models
-    # Local models from daemon
-    assert "qwen3.8:latest" in models
-    assert "dolphin-2.9.1-yi-1.5-9b:Q4_K_M" in models
-    # Embedding model filtered out
-    assert "qwen3-embedding:latest" not in models
+    assert sorted(models) == sorted(
+        ["kimi-k3:cloud", "nemotron-3-nano:30b-cloud", "qwen3.8:latest", "mystery:latest"]
+    )
+    assert all(o["provider"] == "ollama" for o in options)
+    groups = {o["model"]: o["group"] for o in options}
+    assert groups["kimi-k3:cloud"] == groups["nemotron-3-nano:30b-cloud"] == "Ollama Cloud"
+    assert groups["qwen3.8:latest"] == groups["mystery:latest"] == "Ollama (local)"
+    # Local weights are listed before cloud.
+    assert [o["group"] for o in options] == sorted(
+        (o["group"] for o in options), key=lambda g: g != "Ollama (local)"
+    )
 
-    # Cloud models should have "Ollama Cloud" group, local models "Ollama (local)"
-    # Check for both :cloud and -cloud suffixes like the implementation does
-    cloud_models = [o for o in options if o["model"].endswith((":cloud", "-cloud"))]
-    local_models = [o for o in options if not o["model"].endswith((":cloud", "-cloud"))]
-    for o in cloud_models:
-        assert o["provider"] == "ollama"
-        assert o["group"] == "Ollama Cloud"
-    for o in local_models:
-        assert o["provider"] == "ollama"
-        assert o["group"] == "Ollama (local)"
+
+def test_a_tag_the_daemon_does_not_list_is_not_offered_and_not_seatable(monkeypatch):
+    """A cloud tag that was hardcoded once is gone the moment `ollama ls` is."""
+    monkeypatch.setattr(serve, "list_ollama_models", lambda: ["qwen3.8:latest"])
+    monkeypatch.setattr(serve, "ollama_model_capabilities", lambda m: ["completion"])
+
+    assert [o["model"] for o in serve.rpc_llm_options({})["options"]] == ["qwen3.8:latest"]
+    with pytest.raises(ValueError, match="not a seat model the console offers"):
+        serve.rpc_set_seat({"agent": "planner", "provider": "ollama", "model": "kimi-k3:cloud"})
 
 
 # ---------------------------------------------------------------------------
