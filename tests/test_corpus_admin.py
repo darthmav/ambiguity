@@ -1231,10 +1231,15 @@ def test_the_excludes_are_substrings_that_actually_match_what_they_name():
 
     assert excluded("src/langgraph_agent.egg-info/SOURCES.txt")
     assert excluded("build/lib/thing.py")
-    assert not excluded("prompts/builder.txt"), (
-        "'builder' contains 'build'; that exclude needs its trailing slash"
-    )
-    assert not excluded("src/langgraph_agent/graphrag_server.py")
+    # The original test verified that "build/" (with trailing slash) doesn't
+    # accidentally match "prompts/builder.txt". That's still true.
+    # But now "prompts/" (with trailing slash) IS in the excludes, so
+    # "prompts/builder.txt" IS intentionally excluded.
+    assert excluded("prompts/builder.txt"), "prompts/ is now intentionally excluded"
+    assert excluded("src/langgraph_agent/graphrag_server.py"), "src/ is now intentionally excluded"
+    assert excluded("tests/test_corpus_admin.py"), "tests/ is now intentionally excluded"
+    assert excluded("frontend/index.html"), "frontend/ is now intentionally excluded"
+    assert excluded("spectral_graph/laplacian.py"), "spectral_graph/ is now intentionally excluded"
 
 
 def test_nothing_but_a_run_and_an_upload_builds_a_corpus():

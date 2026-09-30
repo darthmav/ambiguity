@@ -308,6 +308,12 @@ Parameters are typed, bounded and refused by name (`_int_param`, `_float_param`,
   since deleting files moves it too -- and the pinned top-twenty in
   `test_claims.py` is what tells you it has.
 - `PROJECT_INDEX_EXCLUDES` entries are matched as plain substrings, not globs.
+- **The corpus never indexes this program's own source.** `src/`, `tests/`,
+  `prompts/`, `frontend/` and `spectral_graph/` are in `PROJECT_INDEX_EXCLUDES`,
+  so GraphRAG holds project knowledge -- docs, config, whatever a run is
+  actually about -- rather than the four agents' own code and prompts. An
+  operator who wants the source searchable opts it in the same way as any
+  other document: upload it, or embed a generated project explicitly.
 - **There is exactly one embedding model** (`EMBEDDING_MODEL_NAME`), a corpus
   belongs to it, and `set_embedding_model` refuses: vectors from two models
   share no space. The chunker cuts with that model's own tokenizer.

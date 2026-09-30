@@ -465,6 +465,8 @@ ENTITY_STOPWORDS = frozenset(
     Generate Extract Point Seconds Deliberately Named Built Asking Pinned
     Insert Tests Write Reported Computed Cached Complete Convert Dimension
     Naming Perform Useful Prose Measure Observed Nodes Spectrum
+
+    Hello Inference Three Verification
     """.split()
 )
 
@@ -1792,6 +1794,12 @@ PROJECT_INDEX_EXCLUDES = (
     # per file, because the class recurs: four artifacts of this shape were
     # deleted on 2026-09-09 and the list grew no way to keep the fifth out.
     "experimental/",
+    # Application's own source files -- these are the program itself, not
+    # project knowledge to be retrieved. The operator must explicitly request
+    # embedding (via upload or project opt-in) for any of these to enter the
+    # corpus. This prevents the corpus from being polluted with the program's
+    # own code, tests, prompts, and documentation.
+    "src/", "tests/", "prompts/", "frontend/", "spectral_graph/",
 )
 
 # Above this size a file is not a document at all -- a data dump, a minified

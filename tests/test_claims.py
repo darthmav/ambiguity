@@ -587,20 +587,36 @@ def test_no_capital_forced_by_position_becomes_a_hub_entity():
 # rotates it back. Both movements predate the change that surfaced them -- this
 # guard was already failing this way before two run artifacts were excluded
 # from the walk, and an audit left outstanding is the claim going stale quietly.
-# Redone on 2026-09-20, after CLAUDE.md was cut back to the rules it states and
-# the reasoning behind them moved into git history: the file stopped being a
-# document that mentions `Graph`, which fell to 9 documents and out of the top
-# twenty. `MAX_INDEXABLE_BYTES` took the slot at 10 documents and 26
-# position-free capitals -- the indexing limit itself, named in six source
-# files -- so it is an entity that earned itself and stays. `Graph` lost rank,
-# not its free capitals, so it stays out of ENTITY_STOPWORDS. This is the
-# movement-by-subtraction case again: the vocabulary moves when documents
-# shrink as surely as when they arrive.
+# Redone on 2026-09-29, after `PROJECT_INDEX_EXCLUDES` grew `src/`, `tests/`,
+# `prompts/`, `frontend/` and `spectral_graph/` -- the corpus stopped
+# indexing the program's own source, and with it the census lost every
+# entity that lived only in docstrings and comments under those trees:
+# `BUILDER_DEADLINE_SECONDS`, `Cheeger`, `Embedding`, `GraphRAG`,
+# `GraphRAGKnowledgeBase`, `LangGraph`, `MAX_INDEXABLE_BYTES`, `System`,
+# `ValueError` and `Verdict` all left on subtraction, not on losing an
+# argument about what the project is about. `System` and `ValueError` climbed
+# back in from lower down the list once the shrunken census reshuffled ranks;
+# named identically to two names that just left, they are the same
+# entities, not new arrivals.
+#
+# What actually arrived is prose that used to be outnumbered by source: doc
+# names (`Anthropic`, `OpenAI`, `Ollama`, `Cloud`, `Corpus`, `ANTHROPIC_API_KEY`)
+# and two more read off `AgentState`'s own vocabulary (`State`, `StubLLM`).
+# All eight are terms the project is about. Four more arrived and are not:
+# `Hello` and `Inference` never carry a free capital at all -- `Inference is
+# cloud only` opens both CLAUDE.md and README.md verbatim, and every `Hello`
+# is a canned example string (`"Hello, how are you?"`, `'Hello World'`), never
+# the entity that gave the word its capital. `Three` and `Verification` keep
+# one free capital each, but only because a header or a docstring's first
+# line puts the sentence-final word after it ("The Three Technologies",
+# "Verification script for ..." three times over) -- the word describes a
+# class of thing (a count, a category of script), not a thing the project has
+# one of. All four joined `ENTITY_STOPWORDS` instead.
 AUDITED_TOP_ENTITIES = frozenset({
     "Architect", "Builder", "Researcher", "Laplacian", "Planner", "System",
-    "ValueError", "Fiedler", "AgentState", "Exception", "MAX_INDEXABLE_BYTES",
-    "GraphRAG", "Python", "Verdict", "Cheeger", "GraphRAGKnowledgeBase",
-    "LangGraph", "Search", "Embedding", "BUILDER_DEADLINE_SECONDS",
+    "ValueError", "Fiedler", "AgentState", "Exception", "ANTHROPIC_API_KEY",
+    "Anthropic", "Python", "Cloud", "Corpus", "OpenAI", "Ollama", "Search",
+    "State", "StubLLM",
 })
 
 
