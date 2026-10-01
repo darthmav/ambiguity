@@ -27,7 +27,7 @@
 #
 # Usage:
 #   ./install.sh                everything below
-#   ./install.sh --minimal      skip the optional developer tools
+#   ./install.sh --minimal      skip the optional developer and container tools
 #   ./install.sh --no-system    skip pacman entirely (no sudo); Python side only
 #   ./install.sh --no-cuda12    keep Arch's Ollama build on NVIDIA cards its
 #                               CUDA 13 cannot drive (they embed on the CPU)
@@ -116,11 +116,18 @@ SEARXNG_PACKAGES=(podman crun)
 
 # PostgreSQL runs in Docker, as Omarchy's own development databases do.
 # postgresql-libs is the client on the host -- psql -- which is how the step
-# below proves the URL it writes into .env really logs in. docker-compose and
-# docker-buildx are for the console's own image: `docker compose up --build`
-# needs the first, and the dockerfile's cache mounts and heredocs need BuildKit,
-# which the second provides (Omarchy ships both; plain Arch does not).
-POSTGRES_PACKAGES=(docker docker-compose docker-buildx postgresql-libs)
+# below proves the URL it writes into .env really logs in.
+POSTGRES_PACKAGES=(docker postgresql-libs)
+
+# The console's own image (README.md > Running in a container), optional like
+# USEFUL and apart from the database, so --no-postgres does not take it away:
+# `docker compose up --build` needs the engine and docker-compose, and the
+# dockerfile's cache mounts and heredocs need BuildKit, which docker-buildx
+# provides (Omarchy ships both plugins; plain Arch does not, and neither pulls
+# in the engine). Podman, with crun for the reason above, builds and runs the
+# same image rootless while the docker group has not applied yet.
+# docker.service and the docker group are still set up by the PostgreSQL step.
+CONTAINER_PACKAGES=(docker docker-compose docker-buildx podman crun)
 
 # Useful: nothing breaks without them, but working on this repo is worse.
 USEFUL=(
@@ -144,7 +151,7 @@ if [ "$SYSTEM" -eq 1 ]; then
     wanted=("${REQUIRED[@]}")
     [ "$SEARXNG" -eq 1 ] && wanted+=("${SEARXNG_PACKAGES[@]}")
     [ "$POSTGRES" -eq 1 ] && wanted+=("${POSTGRES_PACKAGES[@]}")
-    [ "$MINIMAL" -eq 0 ] && wanted+=("${USEFUL[@]}")
+    [ "$MINIMAL" -eq 0 ] && wanted+=("${USEFUL[@]}" "${CONTAINER_PACKAGES[@]}")
 
     # The console needs a browser, and Omarchy ships Chromium. Only a machine
     # with none at all gets one, so an existing choice is never second-guessed.
@@ -153,6 +160,10 @@ if [ "$SYSTEM" -eq 1 ]; then
         command -v "$b" >/dev/null && { browser_found=1; break; }
     done
     [ "$browser_found" -eq 0 ] && wanted+=(chromium)
+
+    # docker, podman and crun each sit in two groups; each is named once, so
+    # the counts below are packages rather than mentions.
+    mapfile -t wanted < <(printf '%s\n' "${wanted[@]}" | awk '!seen[$0]++')
 
     # `pacman -T` prints what is not satisfied, provides included, so a rerun
     # on a finished machine reaches no sudo prompt at all.

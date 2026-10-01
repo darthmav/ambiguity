@@ -188,8 +188,9 @@ corpus is built before the Architect opens. Check `rag_stats` reports non-zero
 nodes afterwards.
 
 **A seat shows NO KEY** — it is pointed at Anthropic or OpenAI and that
-provider's key is unset. The default seats are all Ollama; if those are the
-ones failing, the daemon is down or not signed in (`ollama signin`).
+provider's key is unset. The default seats are all local Ollama models; if
+those are the ones failing, the daemon is down (`OFFLINE`) or the model is not
+pulled yet (`NOT PULLED`: `ollama pull` its tag).
 
 **Server won't start** — port in use; `PORT=3001 python serve.py`.
 

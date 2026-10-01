@@ -320,8 +320,9 @@ def cmd_smoke(_args: list[str]) -> int:
     seats = rpc("list_seats")["result"]["seats"]
     check("four seats configured", len(seats) == 4, f"n={len(seats)}")
     live = sum(s["live"] for s in seats)
-    # Not a failure: the shipped seats are Ollama Cloud tags that are not
-    # pulled on a fresh box, and every read-only tab works without them.
+    # Not a failure: the shipped seats are local models a fresh box may not
+    # have pulled yet (install.sh pulls them), and every read-only tab works
+    # without them.
     print(f"  note  {live}/{len(seats)} seats live"
           f"{'' if live else ' -- run_goal will fail until a tag is pulled'}")
 

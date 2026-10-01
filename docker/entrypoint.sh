@@ -91,4 +91,21 @@ if [ -n "${DATABASE_URL:-}" ]; then
     fi
 fi
 
+# 5. the tokenizer ---------------------------------------------------------
+# The chunker cuts passages with the embedding model's own tokenizer, baked in
+# when the image was built. A build that could not reach huggingface.co still
+# succeeds -- the console fetches the tokenizer on first use -- but BuildKit
+# caches that step and folds its warning away, and every rebuild reuses it, so
+# this is where it gets said. Offline, such an image cannot chunk at all.
+# Snapshots only: .no_exist/ holds empty markers for files the hub lacks.
+if [ -n "$(find "${HF_HOME:-/opt/hf-cache}" -path '*/snapshots/*' -name 'tokenizer*.json' -print -quit 2>/dev/null)" ]; then
+    echo "  tokenizer: baked into the image"
+else
+    echo "  tokenizer: not in this image -- the console fetches it from"
+    echo "             huggingface.co the first time it chunks a document,"
+    echo "             and with no network that fails. The build could not"
+    echo "             reach the hub; once it can, rebuild without the cache:"
+    echo "             docker compose build --no-cache"
+fi
+
 exec "$@"

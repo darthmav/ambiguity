@@ -102,19 +102,43 @@ RUN find /opt/venv -name "*.so" -exec strip --strip-unneeded {} + 2>/dev/null ||
 # cache-first and fetched from Hugging Face when the cache misses. Baking it in
 # means a container on a machine with no network still chunks -- and that the
 # first run does not pay for a download at the moment it is indexing.
-# Non-fatal: the runtime path already falls back to the network, so a build
-# behind a proxy that cannot reach huggingface.co still produces a working
-# image, one that fetches on first use. The directory is made first because the
-# runtime stage copies it: a download that failed would otherwise leave nothing
-# at HF_HOME, and that COPY -- not this step -- would fail the build.
-RUN mkdir -p "$HF_HOME"
-RUN python - <<'PY' || true
+# Only an unreachable hub is forgiven: the runtime path already falls back to
+# the network, so a build behind a proxy that cannot reach huggingface.co still
+# produces a working image, one that fetches on first use. Anything else -- an
+# import that moved, a renamed repository, a transformers API change -- fails
+# the build, where a blanket `|| true` would ship a green image with no
+# tokenizer in it. A forgiven step is cached like any other and its warning
+# folds away in BuildKit's output, so the entrypoint says at every start
+# whether the image has one. HF_HOME is made first because the runtime stage
+# copies it, and a download that never connected leaves nothing there.
+RUN mkdir -p "$HF_HOME" && python - <<'PY'
+import httpx
+from huggingface_hub.errors import LocalEntryNotFoundError
 from transformers import AutoTokenizer
 
 from langgraph_agent.graphrag_server import EMBEDDING_TOKENIZER_NAME
 
-AutoTokenizer.from_pretrained(EMBEDDING_TOKENIZER_NAME)
-print(f"cached the tokenizer for {EMBEDDING_TOKENIZER_NAME}")
+
+def unreachable(exc):
+    # huggingface_hub reports a hub it could not reach -- refused, unresolvable,
+    # timed out, or down -- as LocalEntryNotFoundError, and re-raises a proxy's
+    # refusal as the httpx error itself; transformers wraps either in OSError.
+    while exc is not None:
+        if isinstance(exc, (LocalEntryNotFoundError, httpx.TransportError)):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+try:
+    AutoTokenizer.from_pretrained(EMBEDDING_TOKENIZER_NAME)
+except Exception as exc:
+    if not unreachable(exc):
+        raise
+    print(f"WARNING: no tokenizer baked in, the hub is unreachable ({exc}); "
+          f"the image fetches {EMBEDDING_TOKENIZER_NAME}'s on first use")
+else:
+    print(f"cached the tokenizer for {EMBEDDING_TOKENIZER_NAME}")
 PY
 
 # ---------------------------------------------------------------------------
@@ -123,10 +147,10 @@ PY
 FROM base AS runtime
 
 COPY --from=build /opt/venv /opt/venv
-COPY --from=build /opt/hf-cache /opt/hf-cache
+COPY --from=build $HF_HOME $HF_HOME
 # Readable and lockable by whatever uid the container is given: transformers
 # takes a file lock beside a cached repo even when it reads it.
-RUN chmod -R a+rwX /opt/hf-cache
+RUN chmod -R a+rwX "$HF_HOME"
 
 # uid 1000 because that is the first human account on an Arch/Omarchy install,
 # so the bind-mounted checkout is owned by the uid writing into it and the

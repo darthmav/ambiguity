@@ -343,6 +343,38 @@ def test_the_seat_table_matches_the_shipped_defaults():
         )
 
 
+def test_a_container_stop_outlasts_the_node_in_flight():
+    """`docker compose stop` and `podman stop` have to wait out the node in flight.
+
+    SIGTERM stops the run and defers the exit to the `finally` that writes its
+    snapshot, but a stop never cuts a seat call short: the node in flight
+    returns when its call does, or at its deadline. A grace period shorter than
+    the longest deadline kills the process first, and with it the snapshot the
+    README promises -- which Podman's ten-second default and compose's old 30
+    seconds both did.
+    """
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    grace = re.search(r"^\s*stop_grace_period:\s*(\d+)s\s*$", compose, re.MULTILINE)
+    assert grace, "docker-compose.yml no longer sets stop_grace_period in seconds"
+    podman = re.search(r"podman run\b[^\n]*--stop-timeout[ =](\d+)",
+                       (ROOT / "README.md").read_text(encoding="utf-8"))
+    assert podman, "README.md's podman run no longer sets --stop-timeout"
+    assert podman.group(1) == grace.group(1), (
+        f"podman stop waits {podman.group(1)}s for the console, "
+        f"docker compose stop {grace.group(1)}s"
+    )
+
+    # Commented lines count: they document the code's own default.
+    shipped = re.findall(r"^#?\s*(NODE_DEADLINE_SECONDS|BUILDER_DEADLINE_SECONDS)=(\d+)",
+                         (ROOT / ".env.example").read_text(encoding="utf-8"), re.MULTILINE)
+    assert {name for name, _ in shipped} == {"NODE_DEADLINE_SECONDS", "BUILDER_DEADLINE_SECONDS"}
+    name, longest = max(shipped, key=lambda pair: float(pair[1]))
+    assert int(grace.group(1)) > float(longest), (
+        f"a container stop waits {grace.group(1)}s, but .env.example gives {name} "
+        f"{longest}s: a run stopped mid-call is killed before its snapshot is written"
+    )
+
+
 def test_ci_runs_the_checks_the_quick_reference_documents():
     """"Run all checks" in CLAUDE.md and "CI is green" have to mean one thing.
 

@@ -466,16 +466,20 @@ def test_reselecting_the_same_seat_keeps_its_failure():
     config._seat_failures.pop("architect", None)
 
 
-def test_default_seats_need_no_api_key():
-    """A fresh checkout must run without the user holding a provider key.
+def test_default_seats_need_no_credentials():
+    """A fresh checkout must run with no provider key and no ollama.com sign-in.
 
     The Architect used to default to Anthropic, which made the entry node --
     and so the whole run -- depend on billable credit nobody had configured.
+    A `:cloud` tag passes the provider check while doing the same through the
+    daemon's ollama.com account, and README.md tells a newcomer no sign-in is
+    needed.
     """
-    from langgraph_agent.config import AGENTS, DEFAULT_SEATS
+    from langgraph_agent.config import AGENTS, DEFAULT_SEATS, is_local_ollama_model
 
     assert set(DEFAULT_SEATS) == set(AGENTS)
     assert all(seat["provider"] == "ollama" for seat in DEFAULT_SEATS.values())
+    assert all(is_local_ollama_model(seat["model"]) for seat in DEFAULT_SEATS.values())
 
 
 class _WritesFileLLM(_ToolCallingLLM):

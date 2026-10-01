@@ -67,4 +67,13 @@ services:
     # rebuild claim), and its snapshot under runs/ is what a restarted console
     # reattaches to.
     restart: "no"
-    stop_grace_period: 30s
+
+    # How long `docker compose stop` waits before it kills. SIGTERM stops the
+    # run and defers the exit until its snapshot is written, but a stop never
+    # cuts a seat call short: the node in flight returns when its call does, or
+    # at its deadline. So this outlasts the longest deadline a node runs under,
+    # BUILDER_DEADLINE_SECONDS as .env.example sets it, with room for the
+    # teardown -- anything shorter kills the process, and the snapshot with it.
+    # README.md's `podman run --stop-timeout` is the same figure, and
+    # tests/test_claims.py holds both to it.
+    stop_grace_period: 900s

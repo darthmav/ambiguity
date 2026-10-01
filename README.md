@@ -249,15 +249,21 @@ Without them commits carry a fallback identity and `gh` has no account.
 
 `docker compose stop` is the console's exit button rather than a kill -- a run
 in flight is stopped and the exit deferred until it has written its snapshot,
-so it stays as recoverable as a stop from the browser.
+so it stays as recoverable as a stop from the browser. A stop never cuts a seat
+call short, so that can take as long as the call in flight:
+`stop_grace_period` outlasts the longest node deadline
+(`BUILDER_DEADLINE_SECONDS`), and `docker compose kill` is the kill.
 
 If Docker is still behind sudo (the `docker` group applies after a reboot), the
 same files work rootless with Podman:
 
 ```bash
 podman build --format docker -f dockerfile -t ambiguity-console .
-podman run --rm --network host --userns=keep-id -v "$PWD":/app ambiguity-console
+podman run --rm --network host --userns=keep-id --stop-timeout 900 -v "$PWD":/app ambiguity-console
 ```
+
+`--stop-timeout` is the same allowance: without it `podman stop` kills the
+console after ten seconds, before a run in flight has written its snapshot.
 
 **Bridged instead**, if the host network is not acceptable: attach both
 containers to a network of their own, name the database by container, and tell
