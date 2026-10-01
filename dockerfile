@@ -153,8 +153,8 @@ COPY --from=build $HF_HOME $HF_HOME
 RUN chmod -R a+rwX "$HF_HOME"
 
 # uid 1000 because that is the first human account on an Arch/Omarchy install,
-# so the bind-mounted checkout is owned by the uid writing into it and the
-# files a run produces are not left root-owned on the host. The home directory
+# so the image's own files and the volumes' contents are owned by one user and
+# the mounted `.env` is readable to it. The home directory
 # is world-writable so `--user` with some other uid still has somewhere to put
 # a git config; nothing secret lives there.
 RUN useradd --create-home --uid 1000 --shell /bin/bash agent \
@@ -162,6 +162,14 @@ RUN useradd --create-home --uid 1000 --shell /bin/bash agent \
 
 COPY docker/entrypoint.sh /usr/local/bin/ambiguity-entrypoint
 COPY --chown=1000:1000 . /app
+
+# Every directory the app writes, created here and owned by the container's
+# user. docker-compose.yml mounts a named volume on each, and a new volume
+# takes its owner from the directory already in the image: without these a
+# volume is root's, and the console cannot write its own corpus. None is
+# created in the checkout, so none exists on the host until it is indexed.
+RUN install -d -o 1000 -g 1000 /app/knowledge /app/runs /app/uploads \
+        /app/research/web /app/projects /app/reports/diagnostics /app/experimental
 
 WORKDIR /app
 ENV HOME=/home/agent \

@@ -359,7 +359,9 @@ a Builder that runs programs. No CORS header is sent; the page is same-origin.
   `__pycache__` is never committed.
 - **The container joins this machine's network** (`network_mode: host`): the
   daemon, PostgreSQL and SearxNG are all loopback-only on the host. The daemon
-  stays on the host, the checkout arrives as a bind mount, and `docker stop`
+  stays on the host, only code and `.env` arrive from the checkout, read-only (every directory the
+  app writes is a named volume, and the port is 8081, so a console on the host
+  shares nothing with it), and `docker stop`
   asks for the same exit the console's X does.
 
 ## Documentation claims are tests

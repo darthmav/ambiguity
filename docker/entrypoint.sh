@@ -21,8 +21,8 @@ if [ ! -f ".env" ] && [ -f ".env.example" ]; then
 fi
 
 # 2. git -------------------------------------------------------------------
-# The checkout is bind-mounted from the host, so its .git is owned by whoever
-# owns it there. When that is not the uid inside the container, git refuses the
+# The repository baked into the image is owned by uid 1000, and a container run
+# with `--user` as another uid does not own it. When the uid differs, git refuses the
 # repository outright ("dubious ownership") and every git_ tool -- the whole of
 # git_dwell -- fails on a repository that is perfectly fine.
 #

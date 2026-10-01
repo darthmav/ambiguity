@@ -34,28 +34,59 @@ services:
     # Arch/Omarchy install; override for any other (AMBIGUITY_UID=$(id -u)).
     user: "${AMBIGUITY_UID:-1000}:${AMBIGUITY_GID:-1000}"
 
-    # The checkout itself, because a corpus is a function of what is on disk: the
-    # project the agents index and write to, knowledge/ (Chroma and the graph),
-    # runs/, uploads/, research/web/ and projects/ all live in it, and a container
-    # that kept them inside its own layer would throw away the corpus -- and the
-    # relevance floor measured for it -- on every rebuild. It is also what gives
-    # the Builder's git_ tools a real repository with a real origin.
+    # The container never writes into your checkout, and nothing a host console
+    # writes reaches the container: the two cannot share a corpus, a run
+    # snapshot, an upload or a generated project.
     #
-    # To let git_dwell finish its default pipeline as you rather than as the
-    # container's fallback identity, add your own credentials, read-only -- the
-    # entrypoint supplies safe.directory through the environment precisely so
-    # these need no writes. Both must exist on the host before uncommenting, or
-    # Docker creates a directory in their place.
+    #  * Code comes from the checkout, read-only, path by path -- not the whole
+    #    tree. A volume mounted under a read-only checkout makes Docker create
+    #    its mount point *in the checkout* (an empty knowledge/, which must not
+    #    exist there until someone indexes), and the whole tree is also where
+    #    knowledge/, runs/ and .env live.
+    #  * Everything the app writes is a named volume of this project, so a
+    #    rebuild keeps the corpus and the relevance floor measured for it, and
+    #    `docker compose down -v` is the one command that forgets them. The
+    #    dockerfile creates each directory owned by uid 1000, which is what makes
+    #    a fresh volume writable by the user the container runs as.
+    #  * .env is config, read-only; it must exist on the host (install.sh makes
+    #    it), and compose refuses to start rather than create a directory there.
+    #
+    # The Builder's git_ tools see the repository baked into the image, a copy
+    # that is as old as the last `--build`, so what a run commits there is not
+    # the host's branch. To let git_dwell finish its default pipeline as you
+    # rather than as the container's fallback identity, add your own credentials,
+    # read-only -- the entrypoint supplies safe.directory through the
+    # environment precisely so these need no writes. Both must exist on the host
+    # before uncommenting, or Docker creates a directory in their place.
     #   - ${HOME}/.gitconfig:/home/agent/.gitconfig:ro
     #   - ${HOME}/.config/gh:/home/agent/.config/gh:ro
     volumes:
-      - .:/app
+      - ./src:/app/src:ro
+      - ./serve.py:/app/serve.py:ro
+      - ./frontend:/app/frontend:ro
+      - ./prompts:/app/prompts:ro
+      - ./spectral_graph:/app/spectral_graph:ro
+      - type: bind
+        source: ./.env
+        target: /app/.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - knowledge:/app/knowledge
+      - runs:/app/runs
+      - uploads:/app/uploads
+      - research-web:/app/research/web
+      - projects:/app/projects
+      - diagnostics:/app/reports/diagnostics
+      - experimental:/app/experimental
 
     environment:
       # These fall back to the values in .env (compose reads it for
       # interpolation) and then to the machine defaults, so setting one in .env
-      # sets it in both halves rather than only one.
-      PORT: "${PORT:-8080}"
+      # sets it in both halves rather than only one. PORT is the exception.
+      # Its own port, not .env's PORT: a console started on the host from the
+      # same .env takes 8080, and on the host network two cannot share it.
+      PORT: "${AMBIGUITY_PORT:-8081}"
       OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
       # The URL install.sh writes into .env after proving it logs in. Nothing in
       # the app reads it; the console exports it to everything it runs, so a
@@ -77,3 +108,12 @@ services:
     # README.md's `podman run --stop-timeout` is the same figure, and
     # tests/test_claims.py holds both to it.
     stop_grace_period: 900s
+
+volumes:
+  knowledge:
+  runs:
+  uploads:
+  research-web:
+  projects:
+  diagnostics:
+  experimental:

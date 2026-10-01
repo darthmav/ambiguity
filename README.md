@@ -218,7 +218,7 @@ pip install -e ".[dev]"
 An Arch image of the console, wired to the machine it runs on:
 
 ```bash
-docker compose up --build        # http://localhost:8080
+docker compose up --build        # http://localhost:8081
 ```
 
 **Host networking is the configuration**, and it is what makes the database
@@ -236,12 +236,18 @@ proxied with, so the image only ever speaks HTTP to it. The entrypoint says
 whether it answers, because with no daemon behind them every default seat fails
 its first call and the corpus cannot be embedded.
 
-What is mounted: the **checkout itself**, at `/app`. A corpus is a function of
-what is on disk -- `knowledge/`, the relevance floor measured for it, `runs/`,
-`uploads/`, `research/web/` and `projects/` all live in the tree -- so a
-container holding them in its own layer would throw the corpus away on every
-rebuild. It runs as uid 1000 so what a run writes is yours on the host; set
-`AMBIGUITY_UID`/`AMBIGUITY_GID` for any other account.
+What is shared with the host Python install: **code and `.env`, read-only,
+and nothing else.** `src/`, `serve.py`, `frontend/`, `prompts/` and
+`spectral_graph/` are mounted from the checkout so an edit shows on restart, but
+the container cannot write to them. Everything the app writes -- `knowledge/`
+(the corpus and the relevance floor measured for it), `runs/`, `uploads/`,
+`research/web/`, `projects/` and the rest -- is a named Docker volume, so the
+container and a console started on the host (`./launch_console.sh`, port 8080)
+never share a corpus, a run snapshot or a generated project, and can run at
+once. The container is on **8081** (`AMBIGUITY_PORT` moves it). Volumes survive
+a rebuild; `docker compose down -v` forgets them. To hand the container a
+document, upload it through its console. It runs as uid 1000
+(`AMBIGUITY_UID`/`AMBIGUITY_GID` for any other account).
 
 `git_dwell`'s `push`, `pr` and `merge` stages need your own credentials:
 uncomment the `~/.gitconfig` and `~/.config/gh` mounts in `docker-compose.yml`.
