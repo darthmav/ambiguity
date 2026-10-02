@@ -248,20 +248,29 @@ pip install -e ".[dev]"
 
 ### Running in a container
 
-An Arch image of the console, wired to the machine it runs on:
+An Arch image of the console and the database its corpus lives in, as one
+stack:
 
 ```bash
 docker compose up --build        # http://localhost:8081
 ```
 
-**Host networking is the configuration**, and it is what makes the database
-work without a line of its own. The console talks to three things on this
-machine, and all three are loopback-only on purpose: the Ollama daemon on
-127.0.0.1:11434, the `postgres18` container on 127.0.0.1:5432 -- published
-there and nowhere else, which is why it can afford trust authentication -- and
-the SearxNG on 127.0.0.1:8888. A bridged container reaches none of them, so
-`DATABASE_URL` and `OLLAMA_BASE_URL` mean the same thing inside the container
-as outside it, and nothing has to be republished to the world.
+**The stack brings its own database.** The `postgres` service runs
+`pgvector/pgvector:pg18-trixie` -- the image `install.sh` runs on the host --
+on a volume of its own (`pgdata`), and the console starts only once it is
+healthy. It is published on **127.0.0.1:5433** and nowhere else
+(`AMBIGUITY_DB_PORT` moves it), which is why it can use trust authentication,
+and why it is not the host's `postgres18` on 5432: a console in the container
+and one on the host keep separate corpora in separate servers. Compose sets the
+console's `DATABASE_URL` to it, over whatever `.env` says.
+
+**The console itself is on the host network.** It talks to two things on this
+machine, both loopback-only on purpose: the Ollama daemon on 127.0.0.1:11434
+and the SearxNG on 127.0.0.1:8888. A bridged container reaches neither, so
+`OLLAMA_BASE_URL` means the same thing inside the container as outside it. The
+database is the opposite case -- on Docker's bridge, published on loopback --
+because a password-free server on the host network would listen on every
+interface.
 
 What stays on the host: the **Ollama daemon**. It owns the embedding model's
 placement on the GPU and holds the ollama.com credentials the `:cloud` tags are
@@ -274,11 +283,10 @@ and nothing else.** `src/`, `serve.py`, `frontend/`, `prompts/` and
 `spectral_graph/` are mounted from the checkout so an edit shows on restart, but
 the container cannot write to them. Everything the app writes to disk --
 `runs/`, `uploads/`, `research/web/`, `projects/` and the rest -- is a named
-Docker volume, and the corpus is in the database under a schema named after
-the corpus directory's path (`/app/knowledge` inside, the checkout's outside),
-so the container and a console started on the host (`./launch_console.sh`,
-port 8080) never share a corpus, a run snapshot or a generated project, and can
-run at once. The container is on **8081** (`AMBIGUITY_PORT` moves it). Volumes survive
+Docker volume, and the corpus is in the stack's own database, so the container
+and a console started on the host (`./launch_console.sh`, port 8080, the host's
+`postgres18`) never share a corpus, a run snapshot or a generated project, and
+can run at once. The container is on **8081** (`AMBIGUITY_PORT` moves it). Volumes survive
 a rebuild; `docker compose down -v` forgets them. To hand the container a
 document, upload it through its console. It runs as uid 1000
 (`AMBIGUITY_UID`/`AMBIGUITY_GID` for any other account).

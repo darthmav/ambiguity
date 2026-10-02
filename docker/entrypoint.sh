@@ -70,32 +70,38 @@ fi
 # so it is also the URL a script the Builder writes will use. Proved the way
 # install.sh proves it on the host: with a query through psql, and then by
 # asking for the extension the corpus cannot do without.
-if [ -n "${DATABASE_URL:-}" ]; then
-    if PGCONNECT_TIMEOUT=5 psql "$DATABASE_URL" -tAc 'select 1' >/dev/null 2>&1; then
-        if [ "$(PGCONNECT_TIMEOUT=5 psql "$DATABASE_URL" -tAc \
-                "select count(*) from pg_available_extensions where name = 'vector'" 2>/dev/null)" = 1 ]; then
-            echo "  postgres: ${DATABASE_URL%%\?*} answers, with pgvector"
-        else
-            echo "  postgres: ${DATABASE_URL%%\?*} answers but has no pgvector, so the corpus"
-            echo "            cannot be stored. Re-run ./install.sh on the host: it moves"
-            echo "            postgres18 to pgvector/pgvector:pg18-trixie on the same data."
-        fi
+# The URL the app will use, resolved the way it resolves it: the environment
+# first (compose passes one), then .env, which config.py loads, then the
+# default -- so a plain `docker run` is told about the same server.
+db_url="${DATABASE_URL:-}"
+if [ -z "$db_url" ] && [ -f .env ]; then
+    db_url="$(sed -n 's/^[[:space:]]*DATABASE_URL=//p' .env | tail -n 1)"
+    db_url="${db_url%\"}"; db_url="${db_url#\"}"
+fi
+db_url="${db_url:-postgresql://postgres@127.0.0.1:5432/postgres}"
+if PGCONNECT_TIMEOUT=5 psql "$db_url" -tAc 'select 1' >/dev/null 2>&1; then
+    if [ "$(PGCONNECT_TIMEOUT=5 psql "$db_url" -tAc \
+            "select count(*) from pg_available_extensions where name = 'vector'" 2>/dev/null)" = 1 ]; then
+        echo "  postgres: ${db_url%%\?*} answers, with pgvector"
     else
-        echo "  postgres: ${DATABASE_URL%%\?*} does not answer"
-        case "$DATABASE_URL" in
-            *127.0.0.1*|*localhost*)
-                # The postgres18 container Omarchy's installer runs publishes
-                # 5432 on 127.0.0.1 only, so loopback is the host's loopback
-                # and nothing else: reachable on host networking, and never
-                # from a bridge, where the gateway address the container would
-                # use is not an address that port is published on.
-                echo "            A loopback URL only resolves under network_mode: host."
-                echo "            Check the container is up (docker ps | grep postgres18),"
-                echo "            or see README.md > Running in a container for the"
-                echo "            shared-network alternative."
-                ;;
-        esac
+        echo "  postgres: ${db_url%%\?*} answers but has no pgvector, so the corpus"
+        echo "            cannot be stored. Re-run ./install.sh on the host: it moves"
+        echo "            postgres18 to pgvector/pgvector:pg18-trixie on the same data."
     fi
+else
+    echo "  postgres: ${db_url%%\?*} does not answer"
+    case "$db_url" in
+        *127.0.0.1*|*localhost*)
+            # Both databases publish on 127.0.0.1 only -- compose's
+            # `postgres` service on 5433, the host's postgres18 on 5432 -- so
+            # loopback is the host's loopback and nothing else: reachable on
+            # host networking, never from a bridge, where the gateway address
+            # the container would use is not an address either is published on.
+            echo "            A loopback URL only resolves under network_mode: host."
+            echo "            Under compose: docker compose ps postgres (and its logs)."
+            echo "            Run by hand: docker ps | grep postgres18 on the host."
+            ;;
+    esac
 fi
 
 # 5. the tokenizer ---------------------------------------------------------

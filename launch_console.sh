@@ -98,11 +98,26 @@ case "${REBUILD_CORPUS:-1}" in
         echo "   startup or before a run.)"
         ;;
     *)
-        echo "  (The server brings the corpus up to date with this directory once it"
-        echo "   is up -- the header shows the rebuild -- and every run checks it"
-        echo "   again before the Architect opens.)"
+        echo "  (The server brings the corpus up to date with the archive --"
+        echo "   research/web/, uploads/ and opted-in projects/ -- once it is up;"
+        echo "   the header shows the rebuild, and every run checks it again"
+        echo "   before the Architect opens.)"
         ;;
 esac
+
+# The corpus lives in PostgreSQL. Not fatal -- the console starts without it
+# and reports the corpus unavailable -- but said here, where someone is
+# looking, rather than only in the header.
+DB_URL="${DATABASE_URL:-postgresql://postgres@127.0.0.1:5432/postgres}"
+if command -v psql >/dev/null 2>&1; then
+    if PGCONNECT_TIMEOUT=3 psql "$DB_URL" -w -X -q -t -A -c 'select 1' >/dev/null 2>&1; then
+        echo "✓ Corpus database answers"
+    else
+        echo "⚠️  The corpus database does not answer at ${DB_URL%%\?*}:"
+        echo "   docker start postgres18 (or ./install.sh); the console starts anyway"
+        echo "   and reports the corpus as unavailable until it does."
+    fi
+fi
 
 python serve.py > /tmp/ambiguity-console.log 2>&1 &
 SERVER_PID=$!

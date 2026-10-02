@@ -42,7 +42,7 @@ ENV VIRTUAL_ENV=/opt/venv \
     HF_HOME=/opt/hf-cache \
     PYTHONUNBUFFERED=1
 
-# The installed tree ships no __pycache__: 285 MB of a 990 MB venv, and
+# The installed tree ships no __pycache__: 173 MB of a 515 MB venv, and
 # unwritable anyway once the image runs as a user who does not own /opt/venv --
 # so every process would recompile the same modules and throw the result away.
 # Pointed at a writable directory instead, the first process in a container
@@ -81,7 +81,7 @@ COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install -e ".[tools]"
 
-# Debug symbols from 415 compiled extensions: 80 MB, and nothing reads them
+# Debug symbols from 145 compiled extensions, and nothing reads them
 # here -- a segfault in scipy is not a thing this project debugs from inside
 # its own container. Suite green after it, the same way.
 RUN find /opt/venv -name "*.so" -exec strip --strip-unneeded {} + 2>/dev/null || true
@@ -154,8 +154,9 @@ COPY --chown=1000:1000 . /app
 # Every directory the app writes, created here and owned by the container's
 # user. docker-compose.yml mounts a named volume on each, and a new volume
 # takes its owner from the directory already in the image: without these a
-# volume is root's, and the console cannot write its own corpus. None is
-# created in the checkout, so none exists on the host until it is indexed.
+# volume is root's, and the console cannot write the archive its corpus is
+# built from. None is created in the checkout. The corpus itself is in the
+# database, which no volume here holds.
 RUN install -d -o 1000 -g 1000 /app/runs /app/uploads \
         /app/research/web /app/projects /app/reports/diagnostics /app/experimental
 

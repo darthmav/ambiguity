@@ -2,26 +2,54 @@
 #
 #   docker compose up --build                    # Arch    (dockerfile)
 #
-# Host networking is the whole configuration decision here, and it is what
-# makes the database work unchanged. The corpus lives in the postgres18
-# container install.sh brings up (pgvector's build of Omarchy's postgres:18),
-# which publishes
-# its port on 127.0.0.1:5432 and nowhere else, which is why it can afford trust
-# authentication. A container on a bridge network reaches the host through the
-# gateway address, which is not an address that port is published on, so a
-# bridged console cannot see the database at all without republishing it to the
-# world or attaching both containers to a network of their own (README.md >
-# Running in a container has that recipe). On the host network the URL in .env
-# means the same thing inside the container as outside it.
+# Two services. `postgres` is the stack's own database, where the container's
+# corpus lives: pgvector's build of postgres:18, on a volume of its own, so
+# `docker compose up` needs no database on the host. `console` waits for it to
+# be healthy before it starts.
 #
-# The same reasoning covers the other two things on this machine the console
-# talks to: the Ollama daemon on 127.0.0.1:11434, which serves every seat and
-# holds the embedding model, and the SearxNG install.sh runs on 127.0.0.1:8888.
-# Bridging would have to solve all three, one env var at a time.
+# The console is on the host network. It talks to two things on this machine,
+# both loopback-only on purpose -- the Ollama daemon on 127.0.0.1:11434, which
+# serves every seat and holds the embedding model, and the SearxNG install.sh
+# runs on 127.0.0.1:8888 -- and a bridged container reaches neither: the
+# gateway address it would use is not an address either is published on.
+#
+# The database is the other way round, on Docker's bridge with its port
+# published on 127.0.0.1 only. It trusts every connection (no password), so it
+# must not share the host network: there the server listens on every
+# interface, and the machine's LAN could log in. Published on loopback, it is
+# reachable from the host-network console at 127.0.0.1 and from nothing else.
+# Port 5433, so it never meets the host's own postgres18 on 5432 (install.sh's,
+# which a console started on the host uses): the two corpora never mix.
 
 name: ambiguity
 
 services:
+  postgres:
+    # The image install.sh runs on the host: postgres:18 with pgvector, on the
+    # same Debian release so its collations match a postgres:18 data directory.
+    image: pgvector/pgvector:pg18-trixie
+    environment:
+      # Trust, as the host's postgres18 does: development data, reachable only
+      # over the loopback publish below.
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "127.0.0.1:${AMBIGUITY_DB_PORT:-5433}:5432"
+    volumes:
+      # postgres:18 keeps PGDATA under /var/lib/postgresql/18/, so the volume
+      # goes on the parent, as the image documents.
+      - pgdata:/var/lib/postgresql
+    # Ready means accepting TCP: during first-start initialisation the image
+    # runs a temporary server on the Unix socket alone, which a socket check
+    # would mistake for the real one.
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-h", "127.0.0.1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    # Stopped with the stack, like the console; `docker compose up` brings both.
+    restart: "no"
+
   console:
     build:
       context: .
@@ -29,6 +57,12 @@ services:
     image: ambiguity-console:latest
 
     network_mode: host
+
+    # The corpus cannot be stored without the database, so the console starts
+    # only once it accepts connections.
+    depends_on:
+      postgres:
+        condition: service_healthy
 
     # The uid that owns the checkout on the host, so a run's products are not
     # left root-owned in your working tree. 1000 is the first human account on an
@@ -93,10 +127,12 @@ services:
       # same .env takes 8080, and on the host network two cannot share it.
       PORT: "${AMBIGUITY_PORT:-8081}"
       OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
-      # The URL install.sh writes into .env after proving it logs in: where the
-      # corpus lives. The console also exports it to everything it runs, so a
-      # script the Builder writes finds the database here.
-      DATABASE_URL: "${DATABASE_URL:-postgresql://postgres@127.0.0.1:5432/postgres}"
+      # The stack's own database, never .env's: that URL names the host's
+      # postgres18, and this container's corpus belongs with this stack. Set
+      # here, the environment wins over the .env config.py loads. The console
+      # also exports it to everything it runs, so a script the Builder writes
+      # finds the database here.
+      DATABASE_URL: "postgresql://postgres@127.0.0.1:${AMBIGUITY_DB_PORT:-5433}/postgres"
 
     # A console is something you start and watch, not a service that should come
     # back by itself: a run holds process-global state (the stop flag, the corpus
@@ -115,6 +151,9 @@ services:
     stop_grace_period: 900s
 
 volumes:
+  # The database's data: the container's corpus. `docker compose down -v`
+  # forgets it with the rest.
+  pgdata:
   runs:
   uploads:
   research-web:

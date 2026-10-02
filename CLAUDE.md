@@ -370,9 +370,13 @@ a Builder that runs programs. No CORS header is sent; the page is same-origin.
 - Nothing is written under `knowledge/` any more; what an older console left
   there is gitignored, and `__pycache__` is never committed.
 - **The container joins this machine's network** (`network_mode: host`): the
-  daemon, PostgreSQL and SearxNG are all loopback-only on the host. The daemon
+  daemon and SearxNG are loopback-only on the host. **Its database is compose's
+  own `postgres` service** (pgvector image, `pgdata` volume, health-checked,
+  `depends_on` it), on Docker's bridge and published on 127.0.0.1:5433 only --
+  never on the host network, where a trust-auth server listens on every
+  interface -- and compose sets `DATABASE_URL` to it over `.env`'s. The daemon
   stays on the host, only code and `.env` arrive from the checkout, read-only (every directory the
-  app writes is a named volume, its corpus is the schema of `/app/knowledge`,
+  app writes is a named volume, the corpus is in its own server,
   and the port is 8081, so a console on the host shares nothing with it), and `docker stop`
   asks for the same exit the console's X does.
 
