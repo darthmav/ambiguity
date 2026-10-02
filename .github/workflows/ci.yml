@@ -38,6 +38,21 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # The corpus lives in PostgreSQL with pgvector, and its tests run against
+    # it: the image install.sh runs, with the same trust authentication. The
+    # suite makes its own database there (tests/conftest.py).
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18-trixie
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
     strategy:
       # One version failing is worth knowing about even when the other is
       # still running.
@@ -62,4 +77,9 @@ jobs:
         run: mypy src/langgraph_agent/ serve.py ollama_client.py spectral_graph/
 
       - name: Tests
+        # A corpus test that skipped for want of a database would pass for
+        # nothing, so here an unreachable one fails the run.
+        env:
+          DATABASE_URL: postgresql://postgres@127.0.0.1:5432/postgres
+          REQUIRE_POSTGRES: "1"
         run: python -m pytest tests/ -v

@@ -81,7 +81,7 @@ def quiet_logs() -> None:
     progress bar over the report instead of logging one.
     """
     logging.getLogger().setLevel(logging.WARNING)
-    for noisy in ("httpx", "httpcore", "chromadb", "urllib3"):
+    for noisy in ("httpx", "httpcore", "psycopg", "urllib3"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     os.environ.setdefault("TQDM_DISABLE", "1")
 
@@ -221,12 +221,12 @@ def _retrieval_floor() -> str:
     one place an operator goes to find out which seat to trust.
 
     It is no longer a constant: the run that finishes a corpus measures one
-    against that corpus and stores it beside the store, so a machine with no
+    against that corpus and stores it with the corpus, so a machine with no
     measured corpus answers "unmeasured" -- which is the truth a stale number
     never told.
 
     Imported inside the function, not at module scope, because `--list` and
-    `--help` must not pay for chromadb. If the package will not import, the
+    `--help` must not pay for the corpus imports. If the package will not import, the
     function's *name* is the honest answer; a stale number is not.
     """
     try:

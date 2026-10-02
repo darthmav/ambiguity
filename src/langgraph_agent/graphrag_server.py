@@ -1,6 +1,8 @@
 """GraphRAG: the knowledge base -- a chunked vector store beside an entity graph.
 
-Search is hybrid (dense retrieval re-ranked with BM25, see `lexical`), and the
+Both halves live in PostgreSQL (`corpus_store`): chunks with pgvector
+embeddings, and the graph's nodes and edges, one schema per corpus, written in
+transactions that keep the two agreeing. Search is hybrid (dense retrieval re-ranked with BM25, see `lexical`), and the
 graph links each document to the entities it mentions. The corpus is built
 only by indexing (`get_knowledge_base`); every read goes through
 `open_knowledge_base`, which never creates one.
@@ -15,7 +17,6 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, ParamSpec, TypeVar
 
-import chromadb
 import networkx as nx
 
 from langgraph_agent.control import EMBEDDER_ACTIVITY
@@ -27,6 +28,12 @@ from langgraph_agent.corpus_spectral import (
     EIGENGAP_DECISIVENESS,
     MAX_AUTO_CLUSTERS,
     CorpusSpectralMixin,
+)
+from langgraph_agent.corpus_store import (
+    PgCorpusStore,
+    create_corpus_store,
+    database_unreachable,
+    open_corpus_store,
 )
 from langgraph_agent.lexical import (
     BM25Index,
@@ -41,6 +48,10 @@ from langgraph_agent.self_healing import Circuit, CircuitOpenError, call_with_re
 # corpus is only ever built and searched by the model it was built with.
 # Placement is the daemon's; nothing here touches a card.
 EMBEDDING_MODEL_NAME = "qwen3-embedding:latest"
+
+# The length of its vectors, which the store's `vector(...)` column is typed
+# with: a corpus is built for one model and one dimension, and refuses others.
+EMBEDDING_DIMENSIONS = 4096
 
 # The embedding model's own tokenizer, loaded in-process (a few MB, no weights)
 # because the chunker needs one here and the daemon's is not reachable.
@@ -283,23 +294,28 @@ def resolve_persist_dir(persist_dir: str | Path | None = None) -> Path:
 # The questions the relevance floor is measured with, in JSON because the walk
 # never indexes JSON: indexed, the unanswerable ones would answer themselves.
 FLOOR_CALIBRATION_QUESTIONS = Path(__file__).with_name("embedding_calibration.json")
-FLOOR_CALIBRATION_FILE = "floor_calibration.json"
 
 
-def _floor_calibration_path(persist_dir: str | Path | None = None) -> Path:
-    """Where a corpus's floor record lives: beside the store, always.
-
-    One function, so the reader and the writer cannot disagree about it.
-    """
-    return resolve_persist_dir(persist_dir) / FLOOR_CALIBRATION_FILE
+def open_store(persist_dir: str | Path | None = None) -> PgCorpusStore | None:
+    """The store of the corpus a caller means, or None if none was built. Never creates."""
+    return open_corpus_store(
+        resolve_persist_dir(persist_dir),
+        embedding_model=EMBEDDING_MODEL_NAME,
+        dimensions=EMBEDDING_DIMENSIONS,
+    )
 
 
 def floor_calibration(persist_dir: str | Path | None = None) -> dict[str, Any] | None:
-    """The stored measurement behind the corpus's floor, or None if none was taken."""
-    path = _floor_calibration_path(persist_dir)
+    """The stored measurement behind the corpus's floor, or None if none was taken.
+
+    Kept in the corpus's own row, so it is cleared in the transaction that
+    clears the texts it was measured on. A database that cannot be reached
+    has no floor to offer, which every reader already handles.
+    """
     try:
-        record = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        store = open_store(persist_dir)
+        record = store.floor_record() if store is not None else None
+    except Exception:
         return None
     return record if isinstance(record, dict) and record.get("model") == EMBEDDING_MODEL_NAME else None
 
@@ -345,11 +361,7 @@ def calibrate_relevance_floor(kb: "GraphRAGKnowledgeBase") -> dict[str, Any]:
         "floor": round((low + high) / 2, 3) if high > low else None,
         "measured_at": datetime.now(UTC).isoformat(),
     }
-    path = _floor_calibration_path(kb.persist_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(record, indent=1), encoding="utf-8")
-    temporary.replace(path)
+    kb.collection.set_floor_record(record)
     return record
 
 
@@ -532,10 +544,53 @@ def _needs_the_cards(method: Callable[_P, _R]) -> Callable[_P, _R]:
     return run
 
 
-class GraphRAGKnowledgeBase(CorpusSpectralMixin):
-    """The corpus: a NetworkX document/entity graph beside a Chroma vector store.
+def _document_node(
+    doc_id: str, content: str, metadata: dict[str, Any] | None = None
+) -> tuple[dict[str, Any], set[str]]:
+    """A document's node attributes and the entities it mentions.
 
-    Constructing one **creates the store on disk**, which is why most callers go
+    Pure, so the store and the in-memory graph are written from one answer.
+    """
+    # `type` on a node is structural -- document vs entity; the metadata's
+    # own `type` would collide with it, so it goes in as `doc_type`.
+    attrs: dict[str, Any] = {k: v for k, v in (metadata or {}).items() if k != "type"}
+    if metadata and "type" in metadata:
+        attrs["doc_type"] = metadata["type"]
+    attrs["type"] = "document"
+    attrs["content"] = content[:200]  # a snippet
+
+    # Capitalised words over four characters, stripped of prose and code
+    # punctuation and filtered through `ENTITY_STOPWORDS`.
+    #
+    # Fetched pages and markup, script and config files mint no entities
+    # (`_mints_entities`): web prose opens sentences with a vocabulary the
+    # hand-audited list was never checked against -- 15 pages once minted
+    # 551 entities, a fifth of the graph -- and the graph's edges are read
+    # as evidence. Those documents are still chunked, embedded and
+    # retrievable.
+    entities: set[str] = set()
+    for word in (content.split() if _mints_entities(doc_id) else []):
+        token = word.strip("\"'`()[]{}<>.,!?;:*=+-/\\|")
+        if (
+            len(token) > 4
+            and token[0].isupper()
+            and token.replace("_", "").isalnum()
+            and token.lower() not in ENTITY_STOPWORDS
+        ):
+            entities.add(token)
+    entities.discard(doc_id)
+    return attrs, entities
+
+
+class GraphRAGKnowledgeBase(CorpusSpectralMixin):
+    """The corpus: a NetworkX document/entity graph beside a pgvector chunk store.
+
+    `collection` is the corpus's `PgCorpusStore`: the chunks, read through the
+    collection API search is written against, and the graph and floor beside
+    them. `graph` is the working copy of the stored graph, loaded when the corpus
+    opens and written back in the same transactions as the chunks.
+
+    Constructing one **creates the store in the database**, which is why most callers go
     through `open_knowledge_base()`, which never builds one; `get_knowledge_base()`
     is reserved for indexing.
     """
@@ -565,12 +620,10 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
 
     def __init__(self, persist_dir: str | None = None):
         self.persist_dir = resolve_persist_dir(persist_dir)
-        self.persist_dir.mkdir(parents=True, exist_ok=True)
-
-        self.chroma_client = chromadb.PersistentClient(str(self.persist_dir / "chroma"))
-        self.collection = self.chroma_client.get_or_create_collection(
-            name="knowledge",
-            metadata={"hnsw:space": "cosine"}
+        self.collection: Any = create_corpus_store(
+            self.persist_dir,
+            embedding_model=EMBEDDING_MODEL_NAME,
+            dimensions=EMBEDDING_DIMENSIONS,
         )
 
         self.graph = nx.DiGraph()
@@ -612,25 +665,16 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         return vectors
 
     def _load_graph(self) -> None:
-        """Load the graph from disk, if there is one."""
-        graph_path = self.persist_dir / "knowledge_graph.json"
-        if graph_path.exists():
-            with open(graph_path, encoding="utf-8") as handle:
-                self.graph = nx.readwrite.json_graph.node_link_graph(json.load(handle))
+        """Load the stored graph into memory."""
+        self.graph = self.collection.load_graph()
 
     def _save_graph(self) -> None:
-        """Save the graph to disk, whole or not at all.
+        """Replace the stored graph with the one in memory, whole or not at all.
 
-        Written to a temporary file and renamed over the real one: a process ending
-        mid-write (a rebuild runs on a daemon thread) would otherwise leave a file
-        that does not load, and a corpus whose graph does not load cannot be opened.
+        One transaction: a process ending mid-write (a rebuild runs on a daemon
+        thread) leaves the graph that was stored before it.
         """
-        graph_path = self.persist_dir / "knowledge_graph.json"
-        node_link_data = nx.readwrite.json_graph.node_link_data(self.graph)
-        temporary = graph_path.with_suffix(".json.tmp")
-        with open(temporary, "w", encoding="utf-8") as handle:
-            json.dump(node_link_data, handle)
-        os.replace(temporary, graph_path)
+        self.collection.save_graph(self.graph)
 
     def chunk_text(self, content: str) -> list[str]:
         """Split a document into passages the embedder can read whole.
@@ -710,32 +754,24 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         """
         chunks = self.chunk_text(content)
 
-        # Embedded before anything is deleted, so a failed or stopped embed
-        # leaves the document as the store held it. One batched call for all
-        # the chunks.
+        # Embedded before the transaction opens: a failed or stopped embed
+        # leaves the document as the store held it, and no transaction is held
+        # open across the slow part. One batched call for all the chunks.
         embeddings = self._encode(chunks).tolist() if chunks else []
 
-        # A document's previous chunks go before the new ones land: a file that
-        # shrank would otherwise leave its old tail matching queries. Keyed on
-        # `doc_id`, which also sweeps the single unsuffixed row of a pre-
-        # chunking store.
-        try:
-            self.collection.delete(where={"doc_id": doc_id})
-        except Exception:
-            # A collection that cannot filter by metadata still gets a correct
-            # insert; only the sweep is lost.
-            pass
-        self.collection.delete(ids=[doc_id])
+        base = dict(metadata or {})
+        # The fingerprint rides on every chunk, so a rebuild can tell an
+        # unchanged document from the metadata it already fetches.
+        base["sha"] = _content_sha(content)
+        attrs, entities = _document_node(doc_id, content, metadata)
 
-        if chunks:
-            base = dict(metadata or {})
-            # The fingerprint rides on every chunk, so a rebuild can tell an
-            # unchanged document from the metadata it already fetches.
-            base["sha"] = _content_sha(content)
-            self.collection.upsert(
-                ids=[
-                    f"{doc_id}{CHUNK_ID_SEPARATOR}{i:04d}" for i in range(len(chunks))
-                ],
+        # One transaction: the document's previous chunks go (a file that shrank
+        # would otherwise leave its old tail matching queries), its new ones land,
+        # and its node and edges are replaced -- all of it, or none.
+        with self.collection.transaction():
+            self.collection.replace_document(
+                doc_id,
+                ids=[f"{doc_id}{CHUNK_ID_SEPARATOR}{i:04d}" for i in range(len(chunks))],
                 embeddings=embeddings,
                 documents=chunks,
                 metadatas=[
@@ -743,14 +779,14 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
                     for i in range(len(chunks))
                 ],
             )
+            self.collection.save_document_graph(doc_id, attrs, entities)
 
-        self._add_to_graph(doc_id, content, metadata)
+        # Memory follows the store only once the store has committed.
+        self._place_in_graph(doc_id, attrs, entities)
 
         # The lexical index now describes a corpus that no longer exists; the
         # next search rebuilds it.
         self._lexical_index = None
-
-        self._save_graph()
         return len(chunks)
 
     def _add_to_graph(
@@ -758,45 +794,27 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
     ) -> None:
         """The half of `add_document` that costs nothing: the node and its entities.
 
-        Separate because a rebuild that keeps a document's vectors still has to put
-        it back in the graph it cleared.
+        In memory only. Separate because a rebuild that keeps a document's
+        vectors still has to put it back in the graph it cleared, and writes the
+        rebuilt graph once at the end.
         """
-        # `type` on a node is structural -- document vs entity; the metadata's
-        # own `type` would collide with it, so it goes in as `doc_type`.
-        node_attrs = {k: v for k, v in (metadata or {}).items() if k != "type"}
-        if metadata and "type" in metadata:
-            node_attrs["doc_type"] = metadata["type"]
+        self._place_in_graph(doc_id, *_document_node(doc_id, content, metadata))
 
-        self.graph.add_node(
-            doc_id,
-            type="document",
-            content=content[:200],  # Store snippet
-            **node_attrs
-        )
+    def _place_in_graph(
+        self, doc_id: str, attrs: dict[str, Any], entities: set[str]
+    ) -> None:
+        """Put one document's node and `mentions` edges in the in-memory graph.
 
-        # Capitalised words over four characters, stripped of prose and code
-        # punctuation and filtered through `ENTITY_STOPWORDS`.
-        #
-        # Fetched pages and markup, script and config files mint no entities
-        # (`_mints_entities`): web prose opens sentences with a vocabulary the
-        # hand-audited list was never checked against -- 15 pages once minted
-        # 551 entities, a fifth of the graph -- and the graph's edges are read
-        # as evidence. Those documents are still chunked, embedded and
-        # retrievable.
-        entities = []
-        for word in (content.split() if _mints_entities(doc_id) else []):
-            token = word.strip("\"'`()[]{}<>.,!?;:*=+-/\\|")
-            if (
-                len(token) > 4
-                and token[0].isupper()
-                and token.replace("_", "").isalnum()
-                and token.lower() not in ENTITY_STOPWORDS
-            ):
-                entities.append(token)
-
-        for entity in set(entities):
-            self.graph.add_node(entity, type="entity")
+        The edges replace any the document had, as the store's do.
+        """
+        if doc_id in self.graph:
+            self.graph.remove_edges_from(list(self.graph.out_edges(doc_id)))
+        self.graph.add_node(doc_id, **attrs)
+        for entity in entities:
+            if entity not in self.graph:
+                self.graph.add_node(entity, type="entity")
             self.graph.add_edge(doc_id, entity, relation="mentions")
+
 
     def search(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
         """Search the knowledge base: matches chunks, answers in documents.
@@ -869,7 +887,7 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
     def _rerank_lexically(
         self, query: str, raw: "Mapping[str, Any]"
     ) -> list[str] | None:
-        """Fuse the dense window's order with BM25's; None to keep Chroma's order.
+        """Fuse the dense window's order with BM25's; None to keep the dense order.
 
         None when there is no index, fewer than two candidates, or no disagreement.
         """
@@ -1236,7 +1254,7 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         try:
             chunks = self.collection.count()
         except Exception:
-            # A Chroma failure must not take the in-memory counts with it.
+            # A database failure must not take the in-memory counts with it.
             chunks = 0
 
         nodes = self.graph.number_of_nodes()
@@ -1260,12 +1278,13 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         }
 
     def clear(self) -> dict[str, Any]:
-        """Empty the knowledge base, keeping the files that hold it.
+        """Empty the knowledge base, keeping the schema that holds it.
 
-        Emptied in place, since Chroma has the directory open. Chroma goes first and
-        the graph only once it has, so a failure leaves both intact; the floor record
-        goes last, since a floor measured on texts that are gone would otherwise be
-        read as `known` by the run that rebuilds the corpus.
+        Chunks, graph and floor record go in one transaction, so a failure leaves
+        all three intact; the floor has to go with the texts, since a floor
+        measured on texts that are gone would otherwise be read as `known` by the
+        run that rebuilds the corpus. The in-memory graph is emptied only once
+        the store has committed.
 
         Returns:
             What was removed, plus the (now zeroed) stats.
@@ -1273,21 +1292,14 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         removed_nodes = self.graph.number_of_nodes()
         removed_edges = self.graph.number_of_edges()
 
-        existing = self.collection.get(include=[]).get("ids", [])
-        if existing:
-            self.collection.delete(ids=existing)
+        removed = self.collection.clear()
 
         self.graph.clear()
         self._lexical_index = None
-        # Without this the next start reloads the old graph from disk.
-        self._save_graph()
-
-        floor_record = _floor_calibration_path(self.persist_dir)
-        removed_floor = floor_record.exists()
-        floor_record.unlink(missing_ok=True)
+        removed_floor = bool(removed["removed_floor"])
 
         return {
-            "removed_chunks": len(existing),
+            "removed_chunks": int(removed["removed_chunks"]),
             "removed_nodes": removed_nodes,
             "removed_edges": removed_edges,
             "removed_floor": removed_floor,
@@ -1298,7 +1310,7 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         """The whole corpus as one JSON-serialisable document.
 
         Embeddings are left out -- most of the bytes, and regenerated locally -- and
-        the file says so. The graph half is `node_link_data`, the format on disk.
+        the file says so. The graph half is `node_link_data`.
         """
         errors: list[str] = []
         chunks: list[dict[str, Any]] = []
@@ -1321,7 +1333,7 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
                 for i, chunk_id in enumerate(ids)
             ]
         except Exception as exc:
-            # A Chroma failure must not cost the graph half too.
+            # A database failure must not cost the graph half too.
             errors.append(f"reading chunks: {exc}")
 
         return {
@@ -1591,28 +1603,26 @@ def index_corpus_files(
     files = iter_corpus_files(root)
     wanted = {str(path) for path in files}
 
-    # Stored rows are chunks, so staleness is asked of the document each row
-    # belongs to, read alongside each surviving row's fingerprint.
+    # One transaction: every document that left the walk is deleted by set
+    # difference, and the fingerprints of the ones that stayed are read from
+    # what survived it.
     stored_sha: dict[str, str] = {}
     try:
-        existing = kb.collection.get(include=["metadatas"])
-        existing_ids = existing.get("ids") or []
-        existing_metadatas = existing.get("metadatas") or []
-        stale: list[str] = []
-        stale_documents: set[str] = set()
-        for i, chunk_id in enumerate(existing_ids):
-            row = existing_metadatas[i] if i < len(existing_metadatas) else None
-            document = _document_id_of(chunk_id, row)
-            if document not in wanted:
-                stale.append(chunk_id)
-                stale_documents.add(document)
-            elif row and row.get("sha"):
-                stored_sha[document] = str(row["sha"])
-        # Counted in documents, not rows: how many files stopped answering.
-        dropped = len(stale_documents)
-        if stale:
-            kb.collection.delete(ids=stale)
-    except Exception as exc:  # pragma: no cover - Chroma unavailable
+        with kb.collection.transaction():
+            # Counted in documents, not rows: how many files stopped answering.
+            dropped = len(kb.collection.prune_documents(wanted))
+            stored_sha = kb.collection.fingerprints()
+    except CircuitOpenError as exc:
+        # The database is gone: nothing below could be stored either.
+        kb.graph.clear()
+        refused: dict[str, Any] = {
+            "stopped": False, "unavailable": str(exc), "unavailable_circuit": exc.circuit,
+            "indexed": 0, "embedded": 0, "reused": 0, "dropped": 0, "skipped": 0,
+            "errors": [],
+        }
+        refused.update(kb.stats())
+        return refused
+    except Exception as exc:
         errors_pre = [f"pruning stale documents: {exc}"]
         dropped = 0
     else:
@@ -1649,8 +1659,8 @@ def index_corpus_files(
             stopped = True
             break
         except CircuitOpenError as exc:
-            # The daemon is gone, or the model will not load: every document
-            # left would fail the same way.
+            # The daemon or the database is gone, or the model will not load:
+            # every document left would fail the same way.
             unavailable, unavailable_circuit = str(exc), exc.circuit
             break
         except EmbedderLoadFailed as exc:
@@ -1665,12 +1675,15 @@ def index_corpus_files(
 
     # Persisted unconditionally: a rebuild that embedded nothing must still
     # save the cleared graph and drop the lexical index built before the prune.
-    kb._save_graph()
     kb._lexical_index = None
+    kb._should_stop = None
+    try:
+        kb._save_graph()
+    except Exception as exc:
+        errors.append(f"saving the graph: {exc}")
 
     # `indexed` is how many documents the corpus holds; `embedded` and `reused`
     # split it by cost.
-    kb._should_stop = None
     report: dict[str, Any] = {
         "stopped": stopped,
         "unavailable": unavailable,
@@ -1721,11 +1734,16 @@ def embedding_device_status() -> dict[str, Any]:
 
 
 def corpus_exists(persist_dir: str | None = None) -> bool:
-    """Whether a corpus has been built, without building or opening one.
+    """Whether a corpus has been built, without building one.
 
-    An emptied store still exists; `corpus_state()` tells empty from absent.
+    An emptied store still exists; `corpus_state()` tells empty from absent. A
+    database that cannot be reached raises: that is not "no corpus".
     """
-    return (resolve_persist_dir(persist_dir) / "chroma").is_dir()
+    return open_store(persist_dir) is not None
+
+
+# Why the last `open_knowledge_base` could not ask the database, or None.
+_unreachable: str | None = None
 
 
 def open_knowledge_base(persist_dir: str | None = None) -> GraphRAGKnowledgeBase | None:
@@ -1733,36 +1751,59 @@ def open_knowledge_base(persist_dir: str | None = None) -> GraphRAGKnowledgeBase
 
     Constructing a knowledge base creates the store, so a read wired to
     `get_knowledge_base` would leave a corpus behind on the first status poll.
+    A database that cannot be reached is also `None` -- a run without a corpus
+    is a worse run, not a refused one -- and `absent_corpus()` says which.
     """
+    global _unreachable
     if _kb_instance is not None:
         return _kb_instance
-    if not corpus_exists(persist_dir):
+    try:
+        exists = corpus_exists(persist_dir)
+    except Exception as exc:
+        if not (isinstance(exc, CircuitOpenError) or database_unreachable(exc)):
+            raise
+        _unreachable = str(exc)
+        return None
+    _unreachable = None
+    if not exists:
         return None
     return get_knowledge_base(persist_dir)
 
 
-def corpus_state(persist_dir: str | None = None) -> tuple[str, str]:
-    """Report the corpus as `absent`, `empty` or `indexed`, plus the model name.
+def absent_corpus() -> tuple[str, str]:
+    """What a read that found no corpus reports: `(state, note)`.
 
-    Non-creating and cheap enough to poll: opens Chroma read-only and never
-    touches the embedder. `absent` and `empty` are told apart because only one of
-    them means nothing was ever indexed here.
+    `unavailable` when the last open could not reach the database, which says
+    nothing about whether anyone indexed; `absent` with `NO_CORPUS_NOTE`
+    otherwise.
+    """
+    if _unreachable is not None:
+        return "unavailable", (
+            f"The corpus database could not be reached ({_unreachable}), so there "
+            "is nothing to retrieve until it answers. The console reports it as "
+            "the postgres circuit; a run goes ahead without retrieval."
+        )
+    return "absent", NO_CORPUS_NOTE
+
+
+def corpus_state(persist_dir: str | None = None) -> tuple[str, str]:
+    """Report the corpus as `absent`, `empty`, `indexed` or `unavailable`, plus the model.
+
+    Non-creating and cheap enough to poll: two queries, never the embedder.
+    `absent` and `empty` are told apart because only one of them means nothing
+    was ever indexed here; `unavailable` is a database that cannot be asked,
+    which is neither.
 
     Returns:
         (state, embedding_model_name)
     """
-    chroma_dir = resolve_persist_dir(persist_dir) / "chroma"
-    if not chroma_dir.is_dir():
-        return "absent", EMBEDDING_MODEL_NAME
-
     try:
-        client = chromadb.PersistentClient(str(chroma_dir))
-        # `get_collection`: asking must not create what it asks about.
-        collection = client.get_collection(name="knowledge")
-        return ("indexed" if collection.count() > 0 else "empty"), EMBEDDING_MODEL_NAME
+        store = open_store(persist_dir)
+        if store is None:
+            return "absent", EMBEDDING_MODEL_NAME
+        return ("indexed" if store.count() > 0 else "empty"), EMBEDDING_MODEL_NAME
     except Exception:
-        # A store with no readable collection has nothing in it.
-        return "empty", EMBEDDING_MODEL_NAME
+        return "unavailable", EMBEDDING_MODEL_NAME
 
 
 # Re-exported from `corpus_spectral`, where the whole-graph diagnostics live.

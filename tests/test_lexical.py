@@ -14,7 +14,7 @@ The second is the relevance floor. It was 0.3 once, hard-coded beside the
 comparison in `nodes.py`, and 0.3 turned out to sit inside the off-corpus score
 population rather than below it -- so a question this corpus cannot answer was
 formatted into the findings as though it had. The floor is now measured per
-corpus by `calibrate_relevance_floor` and stored beside the store, never
+corpus by `calibrate_relevance_floor` and stored with the corpus, never
 hard-coded: a cosine has no meaning across models, so no number is borrowed
 from one model to judge another.
 
@@ -30,6 +30,7 @@ from typing import Any
 
 import networkx as nx
 import pytest
+from store_doubles import StoreDoubleMixin
 
 from langgraph_agent.graphrag_server import GraphRAGKnowledgeBase
 from langgraph_agent.lexical import (
@@ -187,18 +188,13 @@ def test_the_order_is_by_score_when_there_is_an_opinion():
 # the relevance floor
 # --------------------------------------------------------------------------
 
-def test_a_measured_record_becomes_the_floor(tmp_path, monkeypatch):
-    """The floor is the calibrator's record, stored beside the corpus."""
-    import json
-
+def test_a_measured_record_becomes_the_floor(tmp_path, monkeypatch, postgres):
+    """The floor is the calibrator's record, stored with the corpus."""
     from langgraph_agent import graphrag_server
 
     monkeypatch.chdir(tmp_path)
-    (tmp_path / "knowledge").mkdir()
-    (tmp_path / "knowledge" / graphrag_server.FLOOR_CALIBRATION_FILE).write_text(
-        json.dumps({"model": graphrag_server.EMBEDDING_MODEL_NAME, "floor": 0.5}),
-        encoding="utf-8",
-    )
+    store = graphrag_server.GraphRAGKnowledgeBase().collection
+    store.set_floor_record({"model": graphrag_server.EMBEDDING_MODEL_NAME, "floor": 0.5})
 
     assert graphrag_server.relevance_floor() == 0.5
 
@@ -219,18 +215,13 @@ def test_an_unmeasured_corpus_has_no_floor(tmp_path, monkeypatch):
     assert graphrag_server.relevance_floor() is None
 
 
-def test_a_record_for_another_model_is_no_floor(tmp_path, monkeypatch):
+def test_a_record_for_another_model_is_no_floor(tmp_path, monkeypatch, postgres):
     """A corpus can outlive its model; the old number must not survive that."""
-    import json
-
     from langgraph_agent import graphrag_server
 
     monkeypatch.chdir(tmp_path)
-    (tmp_path / "knowledge").mkdir()
-    (tmp_path / "knowledge" / graphrag_server.FLOOR_CALIBRATION_FILE).write_text(
-        json.dumps({"model": "some-other-model", "floor": 0.5}),
-        encoding="utf-8",
-    )
+    store = graphrag_server.GraphRAGKnowledgeBase().collection
+    store.set_floor_record({"model": "some-other-model", "floor": 0.5})
 
     assert graphrag_server.relevance_floor() is None
 
@@ -281,7 +272,7 @@ class _FakeEmbedder:
         return np.zeros((len(text), 3)) if isinstance(text, list) else np.zeros(3)
 
 
-class _FakeCollection:
+class _FakeCollection(StoreDoubleMixin):
     """Hits in insertion order with a distance that rises down the list.
 
     The dense ranking is fixed and known, which is what makes a re-rank

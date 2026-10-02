@@ -5,7 +5,7 @@
 # Arch rather than a python:* base because this project is an Arch/Omarchy
 # project: `install.sh` names pacman packages, the interpreter it resolves
 # against is Arch's current one (3.14), and the versions this repo is actually
-# run on -- numpy 2.5, scipy 1.18, chromadb 1.5, transformers 5 -- are the ones
+# run on -- numpy 2.5, scipy 1.18, psycopg 3.3, transformers 5 -- are the ones
 # that stack resolves to there. A Debian-based image would be a second,
 # untested resolution of the same requirements.
 #
@@ -80,16 +80,6 @@ COPY pyproject.toml ./pyproject.toml
 COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install -e ".[tools]"
-
-# Two dependencies of chromadb that this project cannot reach, removed after
-# the fact because there is no way to ask for the tree without them: 148 MB of
-# 990. `onnxruntime` backs Chroma's own default embedding function, and nothing
-# here uses it -- there is exactly one embedding model and it is served by the
-# Ollama daemon over HTTP. `kubernetes` is its client for a Chroma running as a
-# server, and this one runs embedded, as files under knowledge/.
-# The whole suite passes in the image without them; delete this line if a
-# chromadb upgrade starts reaching for either.
-RUN uv pip uninstall onnxruntime kubernetes
 
 # Debug symbols from 415 compiled extensions: 80 MB, and nothing reads them
 # here -- a segfault in scipy is not a thing this project debugs from inside
@@ -166,7 +156,7 @@ COPY --chown=1000:1000 . /app
 # takes its owner from the directory already in the image: without these a
 # volume is root's, and the console cannot write its own corpus. None is
 # created in the checkout, so none exists on the host until it is indexed.
-RUN install -d -o 1000 -g 1000 /app/knowledge /app/runs /app/uploads \
+RUN install -d -o 1000 -g 1000 /app/runs /app/uploads \
         /app/research/web /app/projects /app/reports/diagnostics /app/experimental
 
 WORKDIR /app

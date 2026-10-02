@@ -11,12 +11,12 @@ from __future__ import annotations
 import io
 import json
 import urllib.error
-from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import networkx as nx
 import pytest
+from store_doubles import StoreDoubleMixin
 
 import serve
 from langgraph_agent import config, web_research
@@ -236,13 +236,21 @@ def test_an_unreachable_embedder_opens_the_daemon_circuit(monkeypatch, no_waits)
     assert len(calls) == config.DAEMON_CONNECT_ATTEMPTS
 
 
+class _EmptyStore(StoreDoubleMixin):
+    """A store with nothing in it."""
+
+    def get(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"ids": [], "metadatas": []}
+
+    def delete(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+
 class _IndexingKB:
     """What `index_corpus_files` touches; the daemon goes after one document."""
 
     def __init__(self) -> None:
-        self.collection = SimpleNamespace(
-            get=lambda include: {"ids": [], "metadatas": []}, delete=lambda ids: None
-        )
+        self.collection = _EmptyStore()
         self.graph = nx.DiGraph()
         self._should_stop = None
         self._lexical_index = None
@@ -468,9 +476,26 @@ def test_a_rejected_push_is_not_sent_again(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+class _Database:
+    """The corpus database as the monitor asks it: one health answer."""
+
+    def __init__(self) -> None:
+        self.answer = {"status": "healthy", "details": "PostgreSQL 18.6, pgvector 0.8.7"}
+
+    def health(self) -> dict[str, str]:
+        return dict(self.answer)
+
+
 @pytest.fixture
-def monitor(monkeypatch):
-    """`_heal` against a daemon that answers and no search backend to ask."""
+def database(monkeypatch):
+    found = _Database()
+    monkeypatch.setattr(serve, "get_database", lambda: found)
+    return found
+
+
+@pytest.fixture
+def monitor(monkeypatch, database):
+    """`_heal` against a daemon and a database that answer, and no search backend."""
     monkeypatch.setattr(serve, "daemon_request", lambda path, payload=None, timeout=0: {"version": "0.33"})
     monkeypatch.setattr(serve, "search_backend_health", lambda: None)
     monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
@@ -510,6 +535,50 @@ def test_the_monitor_waits_for_the_daemon_before_rebuilding(monitor, monkeypatch
     assert monitor == []
     assert serve._health["ollama-daemon"]["status"] == "unhealthy"
     assert serve._health["corpus"]["status"] == "unhealthy"
+
+
+def test_the_monitor_reports_the_database(monitor, database):
+    serve._heal()
+    assert serve._health["postgres"]["status"] == "healthy"
+
+    database.answer = {"status": "unhealthy", "details": "connection refused"}
+    serve._heal()
+    assert serve._health["postgres"] == {"status": "unhealthy", "details": "connection refused"}
+
+
+def test_the_monitor_waits_for_the_database_then_rebuilds(monitor, database):
+    """A rebuild the database interrupted is finished once it answers again."""
+    serve._last_rebuild.update(source="unavailable", unavailable_circuit="postgres")
+    database.answer = {"status": "unhealthy", "details": "connection refused"}
+
+    serve._heal()
+
+    assert monitor == []
+    assert "database could not be reached" in serve._health["corpus"]["details"]
+
+    database.answer = {"status": "healthy", "details": "back"}
+    serve._heal()
+
+    assert monitor == ["after the database came back"]
+
+
+def test_a_rebuild_stops_at_once_when_the_database_cannot_be_reached(tmp_path):
+    """Nothing could be stored, so not one document is embedded for nothing."""
+    uploads = tmp_path / gs.UPLOADS_DIR
+    uploads.mkdir()
+    (uploads / "a.md").write_text("a text", encoding="utf-8")
+    kb = _IndexingKB()
+
+    def refused(keep: Any) -> list[str]:
+        raise CircuitOpenError("postgres", 15)
+
+    kb.collection.prune_documents = refused  # type: ignore[method-assign]
+
+    report = gs.index_corpus_files(kb, str(tmp_path))  # type: ignore[arg-type]
+
+    assert kb.added == []
+    assert report["unavailable_circuit"] == "postgres"
+    assert report["indexed"] == 0
 
 
 def test_the_monitor_waits_out_the_embedder_cooldown(monitor, monkeypatch):

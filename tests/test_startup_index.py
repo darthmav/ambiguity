@@ -12,15 +12,17 @@ them stands in for `index_corpus_files`.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import inspect
+import os
 import threading
 import time
 
+import psycopg
 import pytest
 
 import serve
 from langgraph_agent import graphrag_server
+from langgraph_agent.corpus_store import corpus_schema
 
 # The walk's mechanics, laid out at the top of a scratch tree.
 pytestmark = pytest.mark.usefixtures("whole_root_walk")
@@ -122,7 +124,7 @@ def test_switching_indexing_off_switches_this_off_too(nowhere, monkeypatch):
     assert serve._background_rebuild_status()["source"] == ""
 
 
-def test_nothing_to_index_leaves_no_corpus_behind(nowhere, monkeypatch):
+def test_nothing_to_index_leaves_no_corpus_behind(nowhere, monkeypatch, postgres):
     """The walk is counted before the creating door is opened.
 
     `get_knowledge_base` builds the store, so a machine with nothing to index
@@ -338,24 +340,32 @@ def test_the_header_is_told_what_the_rebuild_is_doing(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def _hold_the_claim(root) -> psycopg.Connection:
+    """Take the corpus's rebuild lock the way a second console would.
+
+    On a connection of its own, which is what makes this a fair stand-in: a
+    session advisory lock conflicts between two sessions of one process exactly
+    as it does between two processes, so the phase under test meets the same
+    refusal from here as it would from a console on `PORT=8081`. Closing the
+    connection releases it, as a console exiting would.
+    """
+    conn = psycopg.connect(os.environ["DATABASE_URL"], autocommit=True)
+    key = f"rebuild:{corpus_schema(root / graphrag_server.DEFAULT_PERSIST_DIR)}"
+    assert conn.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (key,)).fetchone()[0]
+    return conn
+
+
 @contextlib.contextmanager
 def _another_process_is_rebuilding(root):
-    """Hold the corpus's claim the way a second console would.
-
-    On a separate descriptor, which is what makes this a fair stand-in: `flock`
-    conflicts between two descriptors of one process exactly as it does between
-    two processes, so the phase under test meets the same refusal from here as
-    it would from a console on `PORT=8081`.
-    """
-    handle = (root / "knowledge.lock").open("a+")
-    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    """Hold the corpus's claim for the length of the block."""
+    conn = _hold_the_claim(root)
     try:
         yield
     finally:
-        handle.close()
+        conn.close()
 
 
-def test_a_corpus_another_process_is_rebuilding_is_left_alone(nowhere, monkeypatch):
+def test_a_corpus_another_process_is_rebuilding_is_left_alone(nowhere, monkeypatch, postgres):
     """Two consoles in one checkout used to be two rebuilds with nothing
     between them: `index_corpus_files` prunes and clears before it re-adds, so
     the second clear lands on the first's half-built graph and both report
@@ -373,14 +383,14 @@ def test_a_corpus_another_process_is_rebuilding_is_left_alone(nowhere, monkeypat
     assert serve._background_rebuild_status()["source"] == "busy_elsewhere"
 
 
-def test_the_claim_is_released_when_the_rebuild_ends(nowhere, monkeypatch):
+def test_the_claim_is_released_when_the_rebuild_ends(nowhere, monkeypatch, postgres):
     """A claim the first phase kept would stop every rebuild after it -- in this
     process and in every other one, for as long as the console stayed up.
 
-    Checked from both sides, because the descriptor is closed *and* would be
-    collected: a second rebuild here, and a claim taken from outside afterwards.
-    The second is what would catch a handle parked somewhere that outlives the
-    phase, which is the shape this could plausibly regress into.
+    Checked from both sides: a second rebuild here, and a claim taken from
+    outside afterwards. The second is what would catch a connection parked
+    somewhere that outlives the phase, which is the shape this could plausibly
+    regress into.
     """
     (nowhere / "notes.md").write_text("x", encoding="utf-8")
     indexed: list[object] = []
@@ -411,24 +421,31 @@ def test_a_rebuild_already_under_way_is_left_to_finish(nowhere, monkeypatch):
     assert serve._background_rebuild["running"] is True  # still the first one's
 
 
-def test_the_lock_file_is_not_created_when_there_is_nothing_to_index(nowhere, monkeypatch):
+def test_nothing_is_created_when_there_is_nothing_to_index(nowhere, monkeypatch):
     """The claim is taken after the walk, for the reason the creating door is
-    opened after it: no work, no trace left on a machine that had none to do."""
+    opened after it: no work, no trace left on a machine that had none to do --
+    on disk or in the database."""
     monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
 
     serve._rebuild_the_corpus_in_background()
 
     assert sorted(p.name for p in nowhere.iterdir()) == []
+    assert graphrag_server.corpus_state()[0] in ("absent", "unavailable")
 
 
-def test_a_machine_without_flock_still_rebuilds(nowhere, monkeypatch):
+def test_a_claim_that_cannot_be_taken_still_rebuilds(nowhere, monkeypatch):
     """The claim is an extra guarantee about a rare collision. Refusing to index
     because it could not be taken would turn that into a corpus nobody rebuilds
-    -- the failure this whole phase exists to end."""
+    -- the failure this whole phase exists to end. The rebuild meets the same
+    database itself, and reports it."""
     (nowhere / "notes.md").write_text("x", encoding="utf-8")
     indexed: list[object] = []
     monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
-    monkeypatch.setattr(serve, "fcntl", None)
+
+    def unreachable(*args, **kwargs):
+        raise psycopg.OperationalError("connection refused")
+
+    monkeypatch.setattr(serve, "rebuild_claim", unreachable)
     monkeypatch.setattr(serve, "get_knowledge_base", lambda: object())
     monkeypatch.setattr(serve, "index_corpus_files", _fake_index(indexed))
 
@@ -439,7 +456,7 @@ def test_a_machine_without_flock_still_rebuilds(nowhere, monkeypatch):
 
 
 def test_a_run_waits_for_a_foreign_rebuild_rather_than_searching_a_fraction(
-    nowhere, monkeypatch
+    nowhere, monkeypatch, postgres
 ):
     """The run's phase is what makes the corpus whole before any seat searches
     it, and a corpus midway through a rebuild returns whatever fraction of
@@ -461,7 +478,9 @@ def test_a_run_waits_for_a_foreign_rebuild_rather_than_searching_a_fraction(
     assert "left alone" in serve._corpus_feed_line(report)
 
 
-def test_a_waiting_run_gets_the_corpus_when_the_other_process_finishes(nowhere, monkeypatch):
+def test_a_waiting_run_gets_the_corpus_when_the_other_process_finishes(
+    nowhere, monkeypatch, postgres
+):
     """A wait that only ever times out is a delay, not a wait."""
     (nowhere / "notes.md").write_text("x", encoding="utf-8")
     indexed: list[object] = []
@@ -472,8 +491,7 @@ def test_a_waiting_run_gets_the_corpus_when_the_other_process_finishes(nowhere, 
     monkeypatch.setattr(serve, "index_corpus_files", _fake_index(indexed))
 
     released = threading.Event()
-    holder = (nowhere / "knowledge.lock").open("a+")
-    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    holder = _hold_the_claim(nowhere)
 
     def release():
         time.sleep(0.1)
@@ -488,8 +506,8 @@ def test_a_waiting_run_gets_the_corpus_when_the_other_process_finishes(nowhere, 
     assert len(indexed) == 1
 
 
-def test_the_stop_interrupts_a_wait(nowhere, monkeypatch):
-    """A blocking `flock` cannot be interrupted, which is why the wait is
+def test_the_stop_interrupts_a_wait(nowhere, monkeypatch, postgres):
+    """A blocking lock wait cannot be interrupted, which is why the wait is
     polled: the emergency stop has to reach a run parked here, and
     `RUN_BUDGET_SECONDS` cannot end it -- that is checked between supersteps and
     this phase runs before the first one."""

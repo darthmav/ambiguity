@@ -902,7 +902,7 @@ def _gather_research(state: AgentState) -> tuple[str, str]:
         results = list(response.get("results") or [])
         if response.get("source") == "no_corpus":
             why_none = "no corpus has been built on this machine"
-        # Imported late, as mcp_client does: graphrag_server pulls in chromadb.
+        # Imported late, as mcp_client does: graphrag_server pulls in the database driver.
         from langgraph_agent.graphrag_server import relevance_floor
 
         floor = relevance_floor()

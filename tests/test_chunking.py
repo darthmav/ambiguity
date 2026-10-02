@@ -23,6 +23,7 @@ from typing import Any
 
 import networkx as nx
 import pytest
+from store_doubles import StoreDoubleMixin
 
 from langgraph_agent.graphrag_server import (
     CHUNK_ID_SEPARATOR,
@@ -102,7 +103,7 @@ class _FakeEmbedder:
         return np.zeros(3)
 
 
-class _FakeChunkCollection:
+class _FakeChunkCollection(StoreDoubleMixin):
     """The slice of the Chroma API the chunked write and read paths use.
 
     Supports `delete(where=...)` because that is how a document's previous

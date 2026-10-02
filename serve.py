@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlsplit
 
-# Upstream libraries (langsmith, chromadb) emit DeprecationWarnings on Python 3.14+
+# Upstream libraries (langsmith) emit DeprecationWarnings on Python 3.14+
 # about asyncio.iscoroutinefunction. They are harmless and outside our control,
 # so suppress them before importing any third-party code.
 warnings.filterwarnings(
@@ -60,14 +60,15 @@ from langgraph_agent.corpus_health import (  # noqa: E402
     corpus_staleness,
     forget_cached_walk,
 )
+from langgraph_agent.corpus_store import POSTGRES, get_database, rebuild_claim  # noqa: E402
 from langgraph_agent.graph import RECURSION_LIMIT  # noqa: E402
 from langgraph_agent.graphrag_server import (  # noqa: E402
     EMBEDDER_LOAD,
     EMBEDDING_MODEL_NAME,
     INDEXABLE_SUFFIXES,
-    NO_CORPUS_NOTE,
     WEB_RESEARCH_DIR,
     GraphRAGKnowledgeBase,
+    absent_corpus,
     calibrate_relevance_floor,
     corpus_state,
     embedding_device_status,
@@ -237,9 +238,10 @@ def rpc_rag_stats(_: dict[str, Any]) -> dict[str, Any]:
     """
     kb_or_none = _open_kb()
     if kb_or_none is None:
+        state, note = absent_corpus()
         return {
-            "corpus": "absent",
-            "note": NO_CORPUS_NOTE,
+            "corpus": state,
+            "note": note,
             "total_documents": 0,
             "total_chunks": 0,
             "total_nodes": 0,
@@ -287,7 +289,8 @@ def rpc_list_documents(_: dict[str, Any]) -> dict[str, Any]:
     """Every document node; the seed set for a graph sweep."""
     kb_or_none = _open_kb()
     if kb_or_none is None:
-        return {"documents": [], "corpus": "absent", "note": NO_CORPUS_NOTE}
+        state, note = absent_corpus()
+        return {"documents": [], "corpus": state, "note": note}
     return kb_or_none.list_documents()
 
 
@@ -303,9 +306,10 @@ def rpc_query_graph(params: dict[str, Any]) -> dict[str, Any]:
     split = _bool_param(params, "split")
     kb_or_none = _open_kb()
     if kb_or_none is None:
+        state, note = absent_corpus()
         return {
-            "error": NO_CORPUS_NOTE,
-            "corpus": "absent",
+            "error": note,
+            "corpus": state,
             "center_node": node_id,
             "related_nodes": [],
             "edges": [],
@@ -329,9 +333,10 @@ def rpc_graph_overview(params: dict[str, Any]) -> dict[str, Any]:
     include_isolated = _bool_param(params, "include_isolated")
     kb_or_none = _open_kb()
     if kb_or_none is None:
+        state, note = absent_corpus()
         return {
-            "corpus": "absent",
-            "note": NO_CORPUS_NOTE,
+            "corpus": state,
+            "note": note,
             "nodes": [],
             "edges": [],
             "total_nodes": 0,
@@ -354,7 +359,7 @@ def rpc_search_documents(params: dict[str, Any]) -> dict[str, Any]:
     top_k = _int_param(params, "top_k", 5, low=1, high=MAX_TOP_K)
     kb_or_none = _open_kb()
     if kb_or_none is None:
-        return {"results": [], "source": "no_corpus", "note": NO_CORPUS_NOTE}
+        return {"results": [], "source": "no_corpus", "note": absent_corpus()[1]}
 
     results = kb_or_none.search(query, top_k)
     return {"results": results, "source": "local_graphrag"}
@@ -472,7 +477,7 @@ def rpc_bottleneck(params: dict[str, Any]) -> dict[str, Any]:
     limit = _int_param(params, "limit", 12, low=1, high=MAX_LIST_LIMIT)
     kb_or_none = _open_kb()
     if kb_or_none is None:
-        raise ValueError(f"There is no corpus to analyse. {NO_CORPUS_NOTE}")
+        raise ValueError(f"There is no corpus to analyse. {absent_corpus()[1]}")
     return kb_or_none.bottleneck(limit=limit)
 
 
@@ -489,7 +494,7 @@ def rpc_topics(params: dict[str, Any]) -> dict[str, Any]:
     )
     kb_or_none = _open_kb()
     if kb_or_none is None:
-        raise ValueError(f"There is no corpus to cluster. {NO_CORPUS_NOTE}")
+        raise ValueError(f"There is no corpus to cluster. {absent_corpus()[1]}")
     return kb_or_none.topics(k=k)
 
 
@@ -504,7 +509,7 @@ def rpc_duplicate_entities(params: dict[str, Any]) -> dict[str, Any]:
     containment = _float_param(params, "containment", None, low=0.0, high=1.0)
     kb_or_none = _open_kb()
     if kb_or_none is None:
-        raise ValueError(f"There is no corpus to scan. {NO_CORPUS_NOTE}")
+        raise ValueError(f"There is no corpus to scan. {absent_corpus()[1]}")
     return kb_or_none.duplicate_entities(
         limit=limit, name_similarity=name_similarity, containment=containment
     )
@@ -519,7 +524,7 @@ def rpc_export_corpus(_: dict[str, Any]) -> dict[str, Any]:
     """
     kb_or_none = _open_kb()
     if kb_or_none is None:
-        raise ValueError(f"There is no corpus to export. {NO_CORPUS_NOTE}")
+        raise ValueError(f"There is no corpus to export. {absent_corpus()[1]}")
     return kb_or_none.export_corpus()
 
 
@@ -534,7 +539,7 @@ def rpc_clear_corpus(_: dict[str, Any]) -> dict[str, Any]:
     _refuse_while_a_run_is_in_flight("cleared")
     kb_or_none = _open_kb()
     if kb_or_none is None:
-        raise ValueError(f"There is no corpus to clear. {NO_CORPUS_NOTE}")
+        raise ValueError(f"There is no corpus to clear. {absent_corpus()[1]}")
     return kb_or_none.clear()
 
 
@@ -992,11 +997,6 @@ def _calibration_feed_line(report: dict[str, Any]) -> str | None:
 # Lock order: this one first, `_run_lock` briefly inside it, never the reverse.
 _index_lock = threading.Lock()
 
-# The cross-process claim is a file beside the store, named after it, so two
-# consoles on one corpus share it and two checkouts do not. Outside
-# `knowledge/`, because creating that directory is reserved for indexing.
-CORPUS_LOCK_SUFFIX = ".lock"
-
 # How long a run waits out a rebuild another process is running before going
 # ahead against the corpus as it stands: longer than a cold build. The
 # background rebuild waits 0, since the holder is rebuilding the same corpus
@@ -1006,76 +1006,38 @@ CORPUS_LOCK_WAIT_SECONDS = 180.0
 # How often the wait above re-tries, which is also how quickly it notices a stop.
 CORPUS_LOCK_POLL_SECONDS = 0.5
 
-try:  # pragma: no cover - present on every platform this runs on
-    import fcntl
-except ImportError:  # pragma: no cover - Windows has no flock
-    fcntl = None  # type: ignore[assignment]
-
-
 @contextlib.contextmanager
 def _claim_the_rebuild(
     wait_seconds: float, should_stop: Callable[[], bool], waiting: Callable[[], None]
 ) -> "Iterator[bool]":
     """Hold the right to rebuild this corpus, across threads and processes.
 
-    `_index_lock` serializes the phases inside one process; two consoles in one
-    checkout share the store but not that lock, so the claim is also an `flock`
-    on a file beside the store. The kernel releases it when the process dies,
-    so a stale claim cannot exist, and it is taken without blocking, so "someone
-    else is rebuilding" is an answer rather than an unbounded wait.
+    `_index_lock` serializes the phases inside one process; two consoles on one
+    corpus share the database but not that lock, so the claim is also an
+    advisory lock in the database, keyed by the corpus's schema
+    (`rebuild_claim`). The server releases it when the process dies, so a stale
+    claim cannot exist, and it is polled, so "someone else is rebuilding" is an
+    answer rather than an unbounded wait.
 
     Yields True when the claim is held, False when another process holds it
-    past `wait_seconds`. Where no claim can be taken at all -- no `fcntl`, or a
-    directory that cannot be written -- it yields True on `_index_lock` alone:
-    refusing to index would turn a rare collision into a corpus nobody rebuilds.
+    past `wait_seconds`. Where no claim can be taken at all -- the database
+    cannot be reached -- it yields True on `_index_lock` alone, and the rebuild
+    meets the same database and reports it.
     """
     with _index_lock:
-        handle = None
         try:
-            granted = True
-            if fcntl is not None:
-                try:
-                    # Appended, not `with_suffix`, which replaces a suffix:
-                    # `my.knowledge` would claim through `my.lock`.
-                    store = resolve_persist_dir()
-                    path = store.parent / (store.name + CORPUS_LOCK_SUFFIX)
-                    handle = path.open("a+")
-                except OSError:
-                    handle = None
-                if handle is not None:
-                    granted = _flock_until(handle, wait_seconds, should_stop, waiting)
+            claim = rebuild_claim(
+                resolve_persist_dir(), wait_seconds, should_stop, waiting,
+                poll_seconds=CORPUS_LOCK_POLL_SECONDS,
+            )
+            granted = claim.__enter__()
+        except Exception:
+            claim, granted = None, True
+        try:
             yield granted
         finally:
-            # Closing the descriptor releases the flock; the empty file stays
-            # and claims nothing.
-            if handle is not None:
-                handle.close()
-
-
-def _flock_until(
-    handle: Any, wait_seconds: float, should_stop: Callable[[], bool], waiting: Callable[[], None]
-) -> bool:
-    """Take the exclusive flock, retrying until `wait_seconds` is spent.
-
-    Polled rather than blocking (`LOCK_EX` without `LOCK_NB`) for one reason:
-    a blocking wait cannot be interrupted, and the emergency stop has to reach
-    a run parked here. `waiting` is called once, on the first refusal, so the
-    operator is told a wait has started rather than watching a phase go quiet.
-    """
-    deadline = time.monotonic() + wait_seconds
-    announced = False
-    while True:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return True
-        except OSError:
-            pass
-        if not announced:
-            waiting()
-            announced = True
-        if should_stop() or time.monotonic() >= deadline:
-            return False
-        time.sleep(CORPUS_LOCK_POLL_SECONDS)
+            if claim is not None:
+                claim.__exit__(None, None, None)
 
 
 # What the background rebuild is doing, for the console header. Not part of
@@ -1760,6 +1722,9 @@ def _check_health() -> dict[str, dict[str, str]]:
             "details": f"{ollama_base_url()}: {type(exc).__name__}: {exc}",
         }
 
+    # The database the corpus lives in, through its circuit, as the daemon is.
+    results["postgres"] = get_database().health()
+
     search = search_backend_health()
     if search is not None:
         results["searxng"] = search
@@ -1767,11 +1732,14 @@ def _check_health() -> dict[str, dict[str, str]]:
     with _run_lock:
         last = dict(_last_rebuild)
     if last.get("source") == "unavailable":
+        circuit = last.get("unavailable_circuit")
         results["corpus"] = {
             "status": "unhealthy",
             "details": (
                 "the last rebuild stopped because the embedding model would not load"
-                if last.get("unavailable_circuit") == EMBEDDER_LOAD.name
+                if circuit == EMBEDDER_LOAD.name
+                else "the last rebuild stopped because the database could not be reached"
+                if circuit == POSTGRES.name
                 else "the last rebuild stopped because the embedder could not be reached"
             ),
         }
@@ -1791,19 +1759,26 @@ def _heal() -> None:
         if result["status"] != previous.get(component, {}).get("status"):
             HEALING.log_health_check(component, result["status"], result["details"])
 
-    # A rebuild stopped by an unreachable embedder is finished once it is back.
-    # Nothing else rebuilds on its own: any other failure is not one waiting
-    # on a service, and a run rebuilds before it starts anyway. A model that
-    # would not load is waited out for its circuit's cooldown, which a rebuild
-    # tried every pass would only meet as a refusal, logged each time.
+    # A rebuild stopped by an unreachable embedder or database is finished once
+    # what stopped it is back. Nothing else rebuilds on its own: any other
+    # failure is not one waiting on a service, and a run rebuilds before it
+    # starts anyway. A model that would not load is waited out for its
+    # circuit's cooldown, which a rebuild tried every pass would only meet as a
+    # refusal, logged each time. Every rebuild needs both services.
+    with _run_lock:
+        stopped_by_database = _last_rebuild.get("unavailable_circuit") == POSTGRES.name
     if (
         REBUILD_CORPUS
         and results["corpus"]["status"] == "unhealthy"
         and results["ollama-daemon"]["status"] == "healthy"
+        and results["postgres"]["status"] == "healthy"
         and not EMBEDDER_LOAD.retry_in
         and not _run_in_flight()
     ):
-        when = "after the embedder came back"
+        when = (
+            "after the database came back" if stopped_by_database
+            else "after the embedder came back"
+        )
         report = _rebuild_the_corpus_in_background(when)
         if report is not None:  # None: another rebuild was already under way
             recovered = report.get("source") not in ("unavailable", "error", "busy_elsewhere")

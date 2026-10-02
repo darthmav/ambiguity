@@ -140,9 +140,11 @@ The checks CI runs:
 .venv/bin/python -m pytest tests/ -q
 ```
 
-Expect one warning on Python 3.14: chromadb calling the deprecated
-`asyncio.iscoroutinefunction` -- upstream, ignore it. Tests use a stub LLM --
-no seats, no daemon, no keys needed.
+Tests use a stub LLM -- no seats, no daemon, no keys needed. The corpus tests
+want PostgreSQL: the suite uses its own database, `langgraph_agent_test`, on the
+server `DATABASE_URL` names (created on first use, its schemas dropped after),
+and skips those tests when no server answers -- `REQUIRE_POSTGRES=1` turns that
+skip into a failure, as CI does.
 
 ## Gotchas
 

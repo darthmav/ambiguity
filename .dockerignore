@@ -23,8 +23,8 @@ __pycache__/
 build/
 dist/
 
-# Per-machine runtime state (see above). knowledge.lock is an empty file whose
-# only job is to be flock'ed; a copy of it claims nothing.
+# Per-machine runtime state (see above), and what an older console left under
+# knowledge/ before the corpus moved into PostgreSQL.
 knowledge/chroma/
 knowledge/knowledge_graph.json
 knowledge/floor_calibration.json

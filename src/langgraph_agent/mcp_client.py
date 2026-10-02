@@ -307,9 +307,9 @@ class MCPClient:
 
         kb = self._open_kb()
         if kb is None:
-            from langgraph_agent.graphrag_server import NO_CORPUS_NOTE
+            from langgraph_agent.graphrag_server import absent_corpus
 
-            return {"results": [], "source": "no_corpus", "note": NO_CORPUS_NOTE}
+            return {"results": [], "source": "no_corpus", "note": absent_corpus()[1]}
 
         return {"results": kb.search(query, top_k), "source": "local_graphrag"}
 
@@ -320,7 +320,7 @@ class MCPClient:
 
         kb = self._open_kb()
         if kb is None:
-            from langgraph_agent.graphrag_server import NO_CORPUS_NOTE
+            from langgraph_agent.graphrag_server import absent_corpus
 
             return {
                 "entity": entity,
@@ -328,7 +328,7 @@ class MCPClient:
                 "subgraph_nodes": 0,
                 "subgraph_edges": 0,
                 "source": "no_corpus",
-                "note": NO_CORPUS_NOTE,
+                "note": absent_corpus()[1],
             }
 
         result = kb.query_graph(entity, hops)

@@ -19,21 +19,112 @@ The corpus bootstrap is switched off here for the same reason -- see
 
 from __future__ import annotations
 
+import os
+import re
 from pathlib import Path
 
 import pytest
 
-import langgraph_agent.nodes as _nodes
-import langgraph_agent.web_research as _web_research
-from langgraph_agent.config import StubLLM
-from langgraph_agent.control import RUN_CONTROL
-from langgraph_agent.self_healing import reset_circuit
+# The suite's own database, set before anything imports `config` (which loads
+# `.env`, never over a variable already set): a test that indexes writes a
+# schema, and the developer's corpus lives in the database `.env` names.
+# `TEST_DATABASE_URL` names it outright; otherwise it is the configured server
+# with the database swapped for `langgraph_agent_test`.
+TEST_DATABASE_NAME = "langgraph_agent_test"
+
+
+def _test_database_url() -> str:
+    if os.getenv("TEST_DATABASE_URL"):
+        return os.environ["TEST_DATABASE_URL"]
+    base = os.getenv("DATABASE_URL") or "postgresql://postgres@127.0.0.1:5432/postgres"
+    head, _, query = base.partition("?")
+    head = re.sub(r"^(postgres(?:ql)?://[^/]*)(/[^/]*)?$", rf"\1/{TEST_DATABASE_NAME}", head)
+    return head + (f"?{query}" if query else "")
+
+
+def _ensure_test_database(url: str) -> str | None:
+    """Create the suite's database if the server lacks it; None, or why it cannot."""
+    import psycopg
+    from psycopg import sql
+
+    try:
+        with psycopg.connect(url, connect_timeout=3):
+            return None
+    except psycopg.OperationalError as exc:
+        if "does not exist" not in str(exc):
+            return str(exc).strip()
+    maintenance = re.sub(r"/[^/?]*(\?|$)", r"/postgres\1", url.split("://", 1)[1], count=1)
+    try:
+        with psycopg.connect(f"{url.split('://', 1)[0]}://{maintenance}", autocommit=True,
+                             connect_timeout=3) as conn:
+            conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(TEST_DATABASE_NAME)))
+    except psycopg.Error as exc:
+        return str(exc).strip()
+    return None
+
+
+os.environ["DATABASE_URL"] = _test_database_url()
+_POSTGRES_PROBLEM = _ensure_test_database(os.environ["DATABASE_URL"])
+
+import langgraph_agent.nodes as _nodes  # noqa: E402
+import langgraph_agent.web_research as _web_research  # noqa: E402
+from langgraph_agent.config import StubLLM  # noqa: E402
+from langgraph_agent.control import RUN_CONTROL  # noqa: E402
+from langgraph_agent.self_healing import reset_circuit  # noqa: E402
 
 # Patch the LLM lookup used by agent nodes so every test gets deterministic,
 # parser-friendly responses without making network calls. This has to be
 # `get_agent_llm`: it is what the nodes import, and patching `get_llm` here
 # only set an unused attribute on the module.
 _nodes.get_agent_llm = lambda agent, temperature=0.1: StubLLM()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _drop_test_corpora():
+    """Every schema a test indexed into is dropped when the session ends."""
+    yield
+    if _POSTGRES_PROBLEM is not None:
+        return
+    import psycopg
+    from psycopg import sql
+
+    from langgraph_agent.corpus_store import SCHEMA_PREFIX, close_databases
+
+    close_databases()
+    with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+        schemas = [row[0] for row in conn.execute(
+            "SELECT nspname FROM pg_namespace WHERE starts_with(nspname, %s)", (SCHEMA_PREFIX,)
+        )]
+        for schema in schemas:
+            conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+
+
+@pytest.fixture(autouse=True)
+def _no_waiting_for_an_absent_database(monkeypatch):
+    """With no server at all, a store call fails at once rather than backing off.
+
+    The retries ride out a database restarting under a running console; a
+    suite run on a machine with none would spend seconds on every one.
+    """
+    if _POSTGRES_PROBLEM is not None:
+        from langgraph_agent import corpus_store
+
+        monkeypatch.setattr(corpus_store, "POSTGRES_CONNECT_ATTEMPTS", 1)
+
+
+@pytest.fixture
+def postgres():
+    """The suite's database, for a test that stores a corpus for real.
+
+    Skipped where no server answers, unless `REQUIRE_POSTGRES=1` (CI) makes
+    that a failure: a corpus test that silently skipped would pass for nothing.
+    """
+    if _POSTGRES_PROBLEM is not None:
+        message = f"PostgreSQL is not reachable at {os.environ['DATABASE_URL']}: {_POSTGRES_PROBLEM}"
+        if os.getenv("REQUIRE_POSTGRES") == "1":
+            pytest.fail(message)
+        pytest.skip(message)
+    return os.environ["DATABASE_URL"]
 
 
 @pytest.fixture(autouse=True)

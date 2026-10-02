@@ -17,13 +17,13 @@ runs locally through the same daemon, serving `qwen3-embedding:latest` -- the
 daemon owns every model's placement, so nothing in this project touches torch
 or a card itself. The embedding belongs to GraphRAG, not to a seat.
 
-Tech stack: Python 3.12+, LangGraph, Chroma + NetworkX, tools served in-process under MCP-style names.
+Tech stack: Python 3.12+, LangGraph, PostgreSQL + pgvector + NetworkX, tools served in-process under MCP-style names.
 
 ## Quick Reference
 
 ```bash
 # Install everything on Arch / Omarchy (packages, venv, Ollama models, SearxNG,
-# PostgreSQL in Docker), then prove the embedder, the database, git/gh and
+# PostgreSQL + pgvector in Docker), then prove the embedder, the corpus store, git/gh and
 # every seat actually work
 ./install.sh
 
@@ -60,6 +60,7 @@ python example_usage.py
 │   ├── graph.py               # StateGraph wiring + conditional edges
 │   ├── control.py             # RUN_CONTROL (the emergency stop), GPU_ARBITER, activity meters
 │   ├── graphrag_server.py     # GraphRAG knowledge base: entity graph + chunked vector store
+│   ├── corpus_store.py        # Where the corpus lives: PostgreSQL + pgvector, one schema per corpus
 │   ├── embedding_calibration.json # Floor questions for a new embedding model (JSON: never indexed)
 │   ├── mcp_client.py          # The agents' tool belts, served in-process
 │   ├── lexical.py             # BM25 + rank fusion: the lexical half of search
@@ -88,6 +89,8 @@ python example_usage.py
 │   ├── test_console_stop.py   # Emergency stop, deferred exit, snapshot
 │   ├── test_chunking.py       # Document chunking, chunk ids, search collapse
 │   ├── test_corpus_admin.py   # Corpus clear / export / reindex guards
+│   ├── test_corpus_store.py   # The store against PostgreSQL: exact search, transactions, the lock
+│   ├── store_doubles.py       # The store's own methods over a test's fake collection
 │   ├── test_embedding_device.py # The one embedder, and the light that says when it is working
 │   ├── test_mcp_tools.py      # Builder tool belt
 │   ├── test_imports.py        # Pins the package's public surface, and initial_state
@@ -277,26 +280,41 @@ a Builder that runs programs. No CORS header is sent; the page is same-origin.
   returns the retrieved chunks without invoking the Researcher's model whenever
   the top hit clears `relevance_floor()`, marking any passage under it; below
   it, the seat judges the passages that came back (`_retrieval_for_the_seat`).
-  The floor is measured per corpus into
-  `floor_calibration.json`, `None` until it has been, and never borrowed
+  The floor is measured per corpus into the corpus's own row in the
+  database, `None` until it has been, and never borrowed
   between embedding models. Search is hybrid: BM25 re-ranks the dense window
   (`lexical.py`), ranks fused rather than scores, so every result keeps the
   cosine the floor is read off.
 - **Documents are embedded in chunks** (`CHUNK_MAX_TOKENS` 254 against a
   256-token window); `search` collapses chunks back onto documents, and a
-  document's previous chunks are deleted before its new ones land.
+  document's previous chunks are replaced by its new ones, with its graph
+  node and edges, in one transaction (`replace_document`, `save_document_graph`).
+- **The corpus lives in PostgreSQL** (`corpus_store.py`): one schema per
+  corpus directory, named from its resolved path (`corpus_schema`), holding
+  `chunks` (a `vector(EMBEDDING_DIMENSIONS)` column), `graph_nodes`,
+  `graph_edges` and a one-row `corpus` table naming the embedding model and
+  carrying the floor. A schema of another model reads as absent and is rebuilt
+  empty by the creating door. **Search is exact cosine** -- pgvector's ANN
+  indexes cap at 4,000 dimensions and the model answers in 4,096 -- so add no
+  ANN index without quantizing, and re-measuring the floor. `kb.collection` is
+  the store: its read API is the collection one the fakes in tests implement,
+  and `tests/store_doubles.py` supplies the rest over them.
+  `DATABASE_URL` names the server (`DEFAULT_DATABASE_URL` otherwise); the
+  suite uses its own database, `langgraph_agent_test`, and `REQUIRE_POSTGRES=1`
+  makes an unreachable server fail rather than skip the `postgres` tests.
 - **No corpus exists until someone indexes one, and reading is not indexing.**
   `get_knowledge_base()` creates and is reserved for indexing;
   `open_knowledge_base()` returns `None` and is what every read goes through.
   The corpus is rebuilt when the console starts and again before every run
   (`REBUILD_CORPUS=0` switches off both), `_claim_the_rebuild` holds
-  an `flock` beside the store so two consoles cannot interleave rebuilds, and a
+  a session advisory lock keyed by the corpus's schema (`rebuild_claim`) so two
+  consoles cannot interleave rebuilds, and a
   reindex rebuilds rather than accumulates while keeping the vectors of
   unchanged documents.
 - **Changing the corpus is refused while a run or a rebuild is in flight**
   (`clear_corpus`, `upload_document`); `export_corpus` is not, since reading
-  takes nothing away. `clear()` empties Chroma first, then the graph, then the
-  floor record, and must reach disk.
+  takes nothing away. `clear()` empties chunks, graph and floor record in one
+  transaction, and only then the in-memory graph.
 - **An uploaded document is a file first**: `store_uploaded_document` writes
   under `uploads/` and only then embeds, so `uploads/` must stay one of
   `CORPUS_ROOTS` or the next rebuild deletes the upload silently.
@@ -349,13 +367,13 @@ a Builder that runs programs. No CORS header is sent; the page is same-origin.
   (`_seat_failures`), and `stubbed` and `live` failures are worded apart.
 - A seat's thinking box says what its next call does: a switchable model is
   always sent the flag, off included, since omitting it means *on*.
-- Knowledge base files under `knowledge/` are runtime artifacts, and
-  `__pycache__` is never committed.
+- Nothing is written under `knowledge/` any more; what an older console left
+  there is gitignored, and `__pycache__` is never committed.
 - **The container joins this machine's network** (`network_mode: host`): the
   daemon, PostgreSQL and SearxNG are all loopback-only on the host. The daemon
   stays on the host, only code and `.env` arrive from the checkout, read-only (every directory the
-  app writes is a named volume, and the port is 8081, so a console on the host
-  shares nothing with it), and `docker stop`
+  app writes is a named volume, its corpus is the schema of `/app/knowledge`,
+  and the port is 8081, so a console on the host shares nothing with it), and `docker stop`
   asks for the same exit the console's X does.
 
 ## Self-healing
@@ -367,6 +385,13 @@ and every action lands in the healing journal (`get_healing_logger()`), which
 the console reads and a run's snapshot carries (each run is one healing
 session). Where it is used:
 
+- **The database is one circuit, `POSTGRES`** (`corpus_store.py`), opened only
+  by a server that cannot be reached (`database_unreachable`). A store call
+  is one transaction, retried briefly while unreachable -- safe, since a
+  transaction the connection dropped under was rolled back -- and a rebuild
+  that meets the open circuit ends as `unavailable` naming it; the monitor
+  checks the database (`postgres` in the health map) and redoes that rebuild
+  once it answers. The corpus then reads `unavailable`, never `absent`.
 - **The Ollama daemon is one circuit, `OLLAMA_DAEMON`** (`config.py`): seats,
   the embedder and every status read go through it (`daemon_request`), and only
   an unreachable daemon trips it (`daemon_unreachable`) -- an HTTP error is the
@@ -455,8 +480,13 @@ every checkout has, so `uploads/`, `projects/` and fetched pages are out.
 - **`docker` says permission denied, or nothing answers on port 5432** -- The
   `docker` group applies only after a reboot, and Omarchy enables only the
   socket, so `docker.service` must be enabled for the database to come back up.
-- **Tests are slow** -- The first run opens Chroma; later runs reuse the cached
-  singleton.
+- **The header shows `postgres down`, or the corpus reads `unavailable`** -- the
+  database stopped answering: `docker ps | grep postgres18`, then
+  `docker logs postgres18`. A server without pgvector is reported by name in the
+  health map; `./install.sh` moves `postgres18` to
+  `pgvector/pgvector:pg18-trixie` on the same data volume.
+- **The corpus tests are skipped** -- no server answers at `DATABASE_URL`;
+  the suite's database is created on that server on first use.
 
 ## Where the reasoning went
 

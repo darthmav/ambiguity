@@ -9,7 +9,7 @@
 # Everything it installs is free to use. System packages come from the Arch
 # repos, Python packages from PyPI, the embedding model from the local Ollama
 # daemon (its tokenizer from Hugging Face -- the chunker cuts passages with it
-# in-process), the SearxNG and PostgreSQL images from Docker Hub, and inference
+# in-process), the SearxNG and pgvector PostgreSQL images from Docker Hub, and inference
 # from models that daemon runs from its own weights. No default seat needs an
 # account: an Ollama Cloud tag -- which a free ollama.com account can run -- is
 # pulled as an extra seat choice only when the daemon is signed in, and a
@@ -32,7 +32,9 @@
 #   ./install.sh --no-cuda12    keep Arch's Ollama build on NVIDIA cards its
 #                               CUDA 13 cannot drive (they embed on the CPU)
 #   ./install.sh --no-searxng   do not run a SearxNG for online research
-#   ./install.sh --no-postgres  do not run a PostgreSQL in Docker
+#   ./install.sh --no-postgres  do not run a PostgreSQL in Docker; the corpus
+#                               lives in PostgreSQL, so DATABASE_URL in .env
+#                               must then name a server with pgvector
 #   ./install.sh --no-docker-group
 #                               keep Docker behind sudo, Omarchy's default,
 #                               rather than adding you to the docker group
@@ -114,9 +116,10 @@ REQUIRED=(
 # ask which.
 SEARXNG_PACKAGES=(podman crun)
 
-# PostgreSQL runs in Docker, as Omarchy's own development databases do.
-# postgresql-libs is the client on the host -- psql -- which is how the step
-# below proves the URL it writes into .env really logs in.
+# PostgreSQL runs in Docker, as Omarchy's own development databases do, and
+# holds the corpus: chunks with their pgvector embeddings, the entity graph and
+# the relevance floor. postgresql-libs is the client on the host -- psql --
+# which is how the step below proves the URL it writes into .env really logs in.
 POSTGRES_PACKAGES=(docker postgresql-libs)
 
 # The console's own image (README.md > Running in a container), optional like
@@ -134,7 +137,6 @@ USEFUL=(
     ripgrep      # rg: searching a codebase this size
     fd           # finding files by name
     jq           # reading /rpc replies: curl ... | jq
-    sqlite       # inspecting knowledge/chroma/chroma.sqlite3 directly
     shellcheck   # linting this script and launch_console.sh
     btop         # watching the embedder and the test suite use the machine
 )
@@ -749,20 +751,29 @@ fi
 # ---------------------------------------------------------------------------
 
 if [ "$POSTGRES" -eq 1 ]; then
-    step "PostgreSQL (Docker)"
+    step "PostgreSQL + pgvector (Docker)"
     # The development database Omarchy's own installer runs
     # (omarchy-install-docker-dbs PostgreSQL), with its flags exactly, so this
     # and that menu entry make one container rather than two fighting over the
-    # port: postgres:18 as postgres18, published on loopback only, restarting
-    # with the daemon, and trust authentication -- a local connection logs in
-    # without a password, which is the development setting and the reason it is
-    # never published past 127.0.0.1.
+    # port: postgres18, published on loopback only, restarting with the daemon,
+    # and trust authentication -- a local connection logs in without a
+    # password, which is the development setting and the reason it is never
+    # published past 127.0.0.1.
     #
-    # Nothing in the app reads DATABASE_URL; the corpus is Chroma. The console
-    # exports .env to everything it runs, so a script the Builder writes finds
-    # the database there.
+    # One difference: the image. The corpus lives here -- every chunk with its
+    # embedding, the entity graph, the relevance floor, one schema per corpus
+    # (src/langgraph_agent/corpus_store.py) -- and embeddings need pgvector,
+    # which postgres:18 does not ship. pgvector/pgvector:pg18-trixie is
+    # postgres:18 with the extension added, on the same Debian 13: the bookworm
+    # build has an older glibc, whose collations differ from the ones a
+    # postgres:18 data directory was created with. A postgres18 already running
+    # postgres:18 -- Omarchy's menu makes exactly that -- is recreated from it
+    # below, on the same data volume, so nothing in it is lost.
+    #
+    # The console also exports .env to everything it runs, so a script the
+    # Builder writes finds the database there.
     postgres_container=postgres18
-    postgres_image=postgres:18
+    postgres_image=pgvector/pgvector:pg18-trixie
     postgres_local="postgresql://postgres@127.0.0.1:5432/postgres"
     me="$(id -un)"
     # A URL's password, if it carries one, stays out of the terminal.
@@ -771,6 +782,14 @@ if [ "$POSTGRES" -eq 1 ]; then
     # an open port: a server that wants a password accepts connections too.
     pg_answers() { PGCONNECT_TIMEOUT=3 psql "$1" -w -X -q -t -A -c 'select 1' >/dev/null 2>&1; }
     pg_version() { PGCONNECT_TIMEOUT=3 psql "$1" -w -X -q -t -A -c 'show server_version' 2>/dev/null | cut -d' ' -f1; }
+    pg_has_vector() {
+        [ "$(PGCONNECT_TIMEOUT=3 psql "$1" -w -X -q -t -A \
+            -c "select count(*) from pg_available_extensions where name = 'vector'" 2>/dev/null)" = 1 ]
+    }
+    pg_vector_version() { PGCONNECT_TIMEOUT=3 psql "$1" -w -X -q -t -A -c "select extversion from pg_extension where extname = 'vector'" 2>/dev/null; }
+    # Waits out a first start, which initialises its data directory before it
+    # listens.
+    pg_wait() { for _ in $(seq 1 60); do pg_answers "$1" && return 0; sleep 1; done; return 1; }
 
     if ! command -v docker >/dev/null; then
         problem "docker is not installed, so PostgreSQL cannot run (drop --no-system, or: sudo pacman -S docker postgresql-libs)"
@@ -836,21 +855,21 @@ if [ "$POSTGRES" -eq 1 ]; then
             *)            database_own="$database_url" ;;
         esac
         database_own="${database_own/@localhost:/@127.0.0.1:}"
+        # The daemon, when it is needed: directly when the socket is writable,
+        # through sudo when it is not -- a group granted above does not reach
+        # this run.
+        docker_cmd=()
+        if [ -w /var/run/docker.sock ]; then
+            docker_cmd=(docker)
+        elif [ "$SYSTEM" -eq 1 ]; then
+            docker_cmd=(sudo docker)
+        fi
         answered=0
         if pg_answers "$database_url"; then
             answered=1
         elif [ "$database_own" != "$postgres_local" ]; then
             problem "DATABASE_URL names $(redacted "$database_url"), which does not answer: fix it in .env, or remove it and re-run to have this script run PostgreSQL"
         else
-            # Only now is the daemon needed: directly when the socket is
-            # writable, through sudo when it is not -- a group granted above
-            # does not reach this run.
-            docker_cmd=()
-            if [ -w /var/run/docker.sock ]; then
-                docker_cmd=(docker)
-            elif [ "$SYSTEM" -eq 1 ]; then
-                docker_cmd=(sudo docker)
-            fi
             started=0
             [ "${#docker_cmd[@]}" -gt 0 ] && echo "  nothing answers at 127.0.0.1:5432 yet; bringing up $postgres_container (${docker_cmd[*]})"
             if [ "${#docker_cmd[@]}" -eq 0 ]; then
@@ -883,17 +902,71 @@ if [ "$POSTGRES" -eq 1 ]; then
                 fi
             fi
             if [ "$started" -eq 1 ]; then
-                # A first start initialises its data directory before it
-                # listens, which takes some seconds.
-                for _ in $(seq 1 60); do pg_answers "$postgres_local" && { answered=1; break; }; sleep 1; done
-                if [ "$answered" -eq 0 ]; then
+                if pg_wait "$postgres_local"; then
+                    answered=1
+                else
                     problem "PostgreSQL did not answer at $postgres_local; see: docker logs $postgres_container"
+                fi
+            fi
+        fi
+
+        # The corpus needs pgvector. A server that lacks it is either this
+        # script's own container on the old image -- recreated from the
+        # pgvector image on the same data -- or someone else's, which is left
+        # alone and named.
+        if [ "$answered" -eq 1 ] && ! pg_has_vector "$database_url"; then
+            current_image=""
+            if [ "$database_own" = "$postgres_local" ] && [ "${#docker_cmd[@]}" -gt 0 ]; then
+                current_image="$("${docker_cmd[@]}" container inspect -f '{{.Config.Image}}' "$postgres_container" 2>/dev/null || true)"
+            fi
+            if [ "$database_own" != "$postgres_local" ]; then
+                problem "$(redacted "$database_url") has no pgvector, and the corpus stores its embeddings with it: install the extension there, or point DATABASE_URL at a server that has it"
+                answered=0
+            elif [ -z "$current_image" ]; then
+                problem "the PostgreSQL at 127.0.0.1:5432 has no pgvector and is not a $postgres_container container this script can recreate: run it from $postgres_image, or point DATABASE_URL at a server with pgvector"
+                answered=0
+            else
+                # Where its data lives: the volume (or directory) mounted at
+                # /var/lib/postgresql, which the new container mounts in turn.
+                data_mount="$("${docker_cmd[@]}" container inspect -f \
+                    '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql"}}{{if eq .Type "volume"}}{{.Name}}{{else}}{{.Source}}{{end}}{{end}}{{end}}' \
+                    "$postgres_container" 2>/dev/null || true)"
+                if [ -z "$data_mount" ]; then
+                    problem "$postgres_container ($current_image) has no data volume at /var/lib/postgresql, so recreating it would lose its data: move it to $postgres_image by hand"
+                    answered=0
+                else
+                    echo "  $postgres_container runs $current_image, which has no pgvector;"
+                    echo "  recreating it from $postgres_image on the same data ($data_mount)"
+                    "${docker_cmd[@]}" pull --quiet "$postgres_image" >/dev/null || true
+                    answered=0
+                    if "${docker_cmd[@]}" image inspect "$postgres_image" >/dev/null 2>&1 \
+                            && "${docker_cmd[@]}" rm -f "$postgres_container" >/dev/null \
+                            && "${docker_cmd[@]}" run -d --restart unless-stopped -p "127.0.0.1:5432:5432" \
+                                --name="$postgres_container" -e POSTGRES_HOST_AUTH_METHOD=trust \
+                                -v "$data_mount:/var/lib/postgresql" "$postgres_image" >/dev/null; then
+                        if pg_wait "$postgres_local" && pg_has_vector "$postgres_local"; then
+                            answered=1
+                            ok "recreated $postgres_container from $postgres_image; its data is where it was"
+                        else
+                            problem "$postgres_container did not come back with pgvector; see: docker logs $postgres_container"
+                        fi
+                    else
+                        problem "could not recreate $postgres_container from $postgres_image (its data is still in $data_mount); see the docker error above"
+                    fi
                 fi
             fi
         fi
 
         if [ "$answered" -eq 1 ]; then
             ok "PostgreSQL $(pg_version "$database_url") answers at $(redacted "$database_url")"
+            # Created here as well as by the console, so a role that may create
+            # it does so once and the check below asks a database that has it.
+            if PGCONNECT_TIMEOUT=3 psql "$database_url" -w -X -q -c 'create extension if not exists vector' >/dev/null 2>&1 \
+                    && [ -n "$(pg_vector_version "$database_url")" ]; then
+                ok "pgvector $(pg_vector_version "$database_url") is enabled"
+            else
+                problem "pgvector is available but could not be enabled in $(redacted "$database_url"): run 'create extension vector' there as a superuser"
+            fi
             # Written only once a query has gone through it, for SEARXNG_URL's
             # reason: a URL to nothing is worse than no URL.
             if [ -z "${DATABASE_URL:-}" ]; then
@@ -902,8 +975,51 @@ if [ "$POSTGRES" -eq 1 ]; then
                 export DATABASE_URL="$postgres_local"
                 ok "DATABASE_URL=$postgres_local added to .env"
             fi
+
+            # An open port and an extension are presence, not a working store.
+            # So one vector of the embedding model's width goes through the
+            # class a run uses -- into a schema of its own, read back by exact
+            # search, and dropped -- and no corpus is touched.
+            "$PY" - <<'PY' || problem "the corpus store could not write and search a vector; see PostgreSQL above"
+import sys
+import tempfile
+
+import numpy as np
+
+from langgraph_agent.corpus_store import create_corpus_store
+from langgraph_agent.graphrag_server import EMBEDDING_DIMENSIONS, EMBEDDING_MODEL_NAME
+
+with tempfile.TemporaryDirectory() as scratch:
+    try:
+        store = create_corpus_store(
+            f"{scratch}/install-check",
+            embedding_model=EMBEDDING_MODEL_NAME,
+            dimensions=EMBEDDING_DIMENSIONS,
+        )
+    except Exception as exc:
+        print(f"  ✗ {type(exc).__name__}: {exc}")
+        sys.exit(1)
+    try:
+        vector = np.ones(EMBEDDING_DIMENSIONS, dtype=np.float32)
+        store.replace_document(
+            "install-check.md", ["install-check.md#0000"], [vector], ["install check"],
+            [{"doc_id": "install-check.md", "chunk_index": 0}],
+        )
+        hits = store.query([vector], n_results=1)
+        if hits["ids"] != [["install-check.md#0000"]] or abs(hits["distances"][0][0]) > 1e-6:
+            print(f"  ✗ the vector stored is not the vector found: {hits['ids']}")
+            sys.exit(1)
+    except Exception as exc:
+        print(f"  ✗ {type(exc).__name__}: {exc}")
+        sys.exit(1)
+    finally:
+        store.drop()
+print(f"  ✓ the corpus store writes and finds a {EMBEDDING_DIMENSIONS}-dimension vector")
+PY
         fi
     fi
+elif [ -z "${DATABASE_URL:-}" ]; then
+    NOTES+=("--no-postgres: the corpus lives in PostgreSQL, so set DATABASE_URL in .env to a server with pgvector before starting the console")
 fi
 
 # ---------------------------------------------------------------------------
@@ -967,7 +1083,7 @@ step "Console"
 # then stopped. REBUILD_CORPUS=0 is what leaves the machine as it was
 # found: a console brings the corpus up to date as soon as it is serving, so
 # without it this check started a first build -- the embedding model loaded
-# onto the cards, knowledge/ created -- and then killed it seconds in. SIGTERM,
+# onto the cards, a corpus schema created -- and then killed it seconds in. SIGTERM,
 # not SIGINT: bash starts background jobs with SIGINT ignored, and the server
 # would never see it.
 console_log=/tmp/ambiguity-console-check.log

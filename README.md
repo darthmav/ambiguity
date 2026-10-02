@@ -61,9 +61,22 @@ every chunk with its text and metadata. Embeddings are left out: they are most
 of the bytes and the least portable part, and the embedder is local, so a
 reindex regenerates them.
 
-*Clear corpus* empties the store in place. The files under `knowledge/` stay,
-holding an empty index — the same shape a reindex leaves behind. It arms on the
-first click and disarms itself after a few seconds.
+*Clear corpus* empties the store in place: chunks, graph and relevance floor go
+in one database transaction, so a clear that fails takes nothing, and the empty
+schema left is the same shape a reindex leaves behind. It arms on the first
+click and disarms itself after a few seconds.
+
+**The corpus lives in PostgreSQL.** Every chunk is a row with its pgvector
+embedding (4,096 dimensions, `qwen3-embedding`'s width), beside the entity
+graph's nodes and edges and the measured relevance floor — one schema per
+corpus. The database is what makes the corpus consistent rather than merely
+careful: a document's new chunks and its place in the graph are committed
+together, a rebuild prunes departed documents in one set-difference delete, and
+two consoles on one corpus serialize their rebuilds through an advisory lock
+the server releases if either dies. Search is exact: pgvector's approximate
+indexes stop at 4,000 dimensions, and a scan of an archive this size returns
+the true nearest chunks in milliseconds — the cosine the relevance floor is
+read off, never an approximation of it.
 
 **The corpus is an archive, not the project.** It holds exactly three things:
 pages the online research phase fetched (`research/web/`), documents you
@@ -82,8 +95,9 @@ Set `REBUILD_CORPUS=0` for a machine that wants its corpus frozen.
 Indexing being the only act that creates the store is why the header keeps
 three states apart: *absent* (nobody has indexed here),
 *empty* (a corpus that exists and holds nothing — what *Clear corpus* leaves),
-and the counts, once there is something to count. *Export* and *Clear* are
-disabled while it is absent; creating a store in order to empty it would leave
+and the counts, once there is something to count — plus *unavailable*, a
+database that did not answer, which is none of them. *Export* and *Clear* are
+disabled while it is absent or unavailable; creating a store in order to empty it would leave
 behind the thing you were asking to be rid of. The embedding model —
 `qwen3-embedding:latest`, served by the local Ollama daemon — is loaded by the
 daemon on the first index or search, not at startup; the daemon owns which
@@ -182,6 +196,7 @@ reports `tools`, which is why it -- not either dolphin -- holds the Builder.
 |---|---|
 | **LangGraph** | Orchestration: control flow, shared state, loops |
 | **GraphRAG** | Retrieval: hybrid search over a chunked corpus, beside an entity graph |
+| **PostgreSQL + pgvector** | The corpus's store: vectors, graph and floor, transactional |
 | **Tool belts** | Each seat's tools, served in-process under MCP-style names |
 | **Self-healing** | Retries, circuit breakers and a healing journal around every external call |
 
@@ -190,9 +205,10 @@ reports `tools`, which is why it -- not either dolphin -- holds the Builder.
 On Arch / Omarchy, one command does all of it: system packages, `.env`, a
 `.venv`, the Ollama daemon and its sign-in, the seat and embedding models (the
 embedding model included, by `ollama pull`), the embedding model's tokenizer, a
-SearxNG for online research, a PostgreSQL in Docker, the checks, and an
-"Ambiguity Console" entry in the app launcher. Then it proves the result rather
-than assuming it: the embedder embeds, the database answers a query, git and gh
+SearxNG for online research, PostgreSQL with pgvector in Docker, the checks,
+and an "Ambiguity Console" entry in the app launcher. Then it proves the result
+rather than assuming it: the embedder embeds, the database stores and finds a
+vector of the embedding model's width, git and gh
 can finish the Builder's pipeline, the console starts, and every seat answers a
 test prompt. It is safe to re-run.
 
@@ -206,14 +222,19 @@ driver, which CUDA 13 no longer supports — the installer runs
 Ollama's own CUDA 12 build of the same version and proves the model sits 100%
 on the GPU; run it with `--check` to see where it sits now.
 
-The database is the one Omarchy's own installer runs: `postgres:18` as the
-`postgres18` container, published on 127.0.0.1:5432 only, with no password. The
+The database is the one Omarchy's own installer runs — the `postgres18`
+container, published on 127.0.0.1:5432 only, with no password — but from
+`pgvector/pgvector:pg18-trixie`, which is `postgres:18` with the vector
+extension, on the same Debian release so its collations match. A `postgres18`
+already running plain `postgres:18` (what Omarchy's menu makes) is recreated
+from the pgvector image on the same data volume, and nothing in it is lost. The
 installer enables `docker.service` so it survives a reboot, adds you to the
 `docker` group (root-equivalent, and applied after a reboot;
-`--no-docker-group` keeps Docker behind sudo), and writes `DATABASE_URL` into
-`.env`. Nothing in the app reads that URL — the corpus stays in Chroma — but
-the console exports `.env` to everything it runs, so a script the Builder
-writes can use it. `--no-postgres` skips the database entirely.
+`--no-docker-group` keeps Docker behind sudo), enables pgvector, and writes
+`DATABASE_URL` into `.env`. That URL is where the corpus lives; the console also
+exports `.env` to everything it runs, so a script the Builder writes can use
+it. `--no-postgres` skips running one, and then `DATABASE_URL` must name a
+server with pgvector.
 
 ```bash
 ./install.sh            # --help lists --minimal, --no-system, --no-searxng, ...
@@ -251,12 +272,13 @@ its first call and the corpus cannot be embedded.
 What is shared with the host Python install: **code and `.env`, read-only,
 and nothing else.** `src/`, `serve.py`, `frontend/`, `prompts/` and
 `spectral_graph/` are mounted from the checkout so an edit shows on restart, but
-the container cannot write to them. Everything the app writes -- `knowledge/`
-(the corpus and the relevance floor measured for it), `runs/`, `uploads/`,
-`research/web/`, `projects/` and the rest -- is a named Docker volume, so the
-container and a console started on the host (`./launch_console.sh`, port 8080)
-never share a corpus, a run snapshot or a generated project, and can run at
-once. The container is on **8081** (`AMBIGUITY_PORT` moves it). Volumes survive
+the container cannot write to them. Everything the app writes to disk --
+`runs/`, `uploads/`, `research/web/`, `projects/` and the rest -- is a named
+Docker volume, and the corpus is in the database under a schema named after
+the corpus directory's path (`/app/knowledge` inside, the checkout's outside),
+so the container and a console started on the host (`./launch_console.sh`,
+port 8080) never share a corpus, a run snapshot or a generated project, and can
+run at once. The container is on **8081** (`AMBIGUITY_PORT` moves it). Volumes survive
 a rebuild; `docker compose down -v` forgets them. To hand the container a
 document, upload it through its console. It runs as uid 1000
 (`AMBIGUITY_UID`/`AMBIGUITY_GID` for any other account).

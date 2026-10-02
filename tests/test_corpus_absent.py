@@ -35,8 +35,8 @@ from langgraph_agent.graphrag_server import (
     open_knowledge_base,
 )
 
-# The walk's mechanics, laid out at the top of a scratch tree.
-pytestmark = pytest.mark.usefixtures("whole_root_walk")
+# The walk's mechanics; and "absent" is an answer only a reachable database gives.
+pytestmark = pytest.mark.usefixtures("whole_root_walk", "postgres")
 
 
 @pytest.fixture

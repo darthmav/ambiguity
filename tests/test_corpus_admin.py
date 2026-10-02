@@ -1,12 +1,12 @@
 """Tests for clearing and exporting the corpus.
 
-Two layers, both without the embedding model. `GraphRAGKnowledgeBase.__init__`
-opens Chroma, which is the slow part of this
-suite and has nothing to do with what is under test here: `clear` and
-`export_corpus` touch only `self.graph`, `self.collection` and
-`self.persist_dir`. So the knowledge base is built field by field around a fake
-collection, and the RPC layer is called directly the way `test_console_stop.py`
-calls it.
+Two layers, both without the embedding model. Most of what is under test --
+`clear`, `export_corpus`, the graph diagnostics -- touches only `self.graph`
+and `self.collection`, so the knowledge base is built field by field around a
+fake collection, and the RPC layer is called directly the way
+`test_console_stop.py` calls it. What has to survive a restart is asked of a
+real store in PostgreSQL (`pg_kb`): the claim there is about what the database
+holds, which no fake can answer.
 """
 
 from __future__ import annotations
@@ -17,9 +17,11 @@ from typing import Any
 import networkx as nx
 import numpy as np
 import pytest
+from store_doubles import StoreDoubleMixin
 
 import serve
 from langgraph_agent.graphrag_server import (
+    EMBEDDING_DIMENSIONS,
     GraphRAGKnowledgeBase,
     index_corpus_files,
     relevance_floor,
@@ -29,8 +31,8 @@ from langgraph_agent.graphrag_server import (
 pytestmark = pytest.mark.usefixtures("whole_root_walk")
 
 
-class _FakeCollection:
-    """The slice of the Chroma collection API these two methods use.
+class _FakeCollection(StoreDoubleMixin):
+    """The slice of the collection API these two methods use.
 
     `get(include=[])` returning ids is the idiom `index_corpus_files` already
     relies on, so the fake has to honour it: ids always come back, `documents`
@@ -56,7 +58,7 @@ class _FakeCollection:
 
     def delete(self, ids: list[str]) -> None:
         if self.fail_on_delete:
-            raise RuntimeError("chroma is unavailable")
+            raise RuntimeError("the store is unavailable")
         for doc_id in ids:
             self.rows.pop(doc_id, None)
 
@@ -99,6 +101,36 @@ def kb(tmp_path):
     return _make_kb(tmp_path)
 
 
+def _make_pg_kb(tmp_path) -> GraphRAGKnowledgeBase:
+    """The same corpus as `_make_kb`, stored for real."""
+    kb = GraphRAGKnowledgeBase(str(tmp_path / "knowledge"))
+    for path, content in (
+        ("serve.py", "The Architect rules on the plan."),
+        ("README.md", "Ambiguity console."),
+    ):
+        kb.collection.upsert(
+            ids=[path],
+            embeddings=[np.ones(EMBEDDING_DIMENSIONS)],
+            documents=[content],
+            metadatas=[{"path": path, "type": "python", "doc_id": path}],
+        )
+        kb.graph.add_node(path, type="document", content=content[:200], path=path)
+        kb.graph.add_node("Architect", type="entity")
+        kb.graph.add_edge(path, "Architect", relation="mentions")
+    kb._save_graph()
+    return kb
+
+
+@pytest.fixture
+def pg_kb(tmp_path, postgres):
+    return _make_pg_kb(tmp_path)
+
+
+def _stored_graph(kb: GraphRAGKnowledgeBase) -> nx.DiGraph:
+    """The graph a process starting now would load: read from the store."""
+    return GraphRAGKnowledgeBase(str(kb.persist_dir)).graph
+
+
 # ---------------------------------------------------------------------------
 # clear
 # ---------------------------------------------------------------------------
@@ -119,35 +151,38 @@ def test_clear_empties_both_halves_and_reports_what_went(kb):
     assert result["total_documents"] == 0
 
 
-def test_clear_survives_a_restart(kb, tmp_path):
-    """The clear has to reach disk, not just memory.
+def test_clear_survives_a_restart(pg_kb):
+    """The clear has to reach the store, not just memory.
 
     Otherwise the corpus comes back at the next process start, which reloads
-    the graph from `knowledge_graph.json`. `index_corpus_files` had exactly
-    this hole -- its `graph.clear()` was persisted only as a side effect of
-    indexing something afterwards -- and it is pinned next door now that it
-    does not.
+    the graph from the store. `index_corpus_files` had exactly this hole --
+    its `graph.clear()` was persisted only as a side effect of indexing
+    something afterwards -- and it is pinned next door now that it does not.
     """
-    kb.clear()
+    assert _stored_graph(pg_kb).number_of_nodes() == 3
 
-    reloaded = json.loads((tmp_path / "knowledge_graph.json").read_text())
-    assert reloaded["nodes"] == []
-    assert _edges(reloaded) == []
+    pg_kb.clear()
+
+    reloaded = _stored_graph(pg_kb)
+    assert reloaded.number_of_nodes() == 0
+    assert reloaded.number_of_edges() == 0
+    assert pg_kb.collection.count() == 0
 
 
-def test_a_reindex_that_matches_nothing_still_reaches_disk(kb, tmp_path):
+def test_a_reindex_that_matches_nothing_still_reaches_the_store(pg_kb, tmp_path):
     """The other half of `test_clear_survives_a_restart`, one door along.
 
     `index_corpus_files` prunes Chroma and clears the graph before it indexes
     anything, but both were persisted only as a side effect of `add_document`.
     A reindex matching no files therefore emptied the graph in memory, wrote
-    nothing, and left the old `knowledge_graph.json` for the next process start
-    to reload -- reporting `indexed: 0` and success while the corpus it claimed
-    to have rebuilt sat on disk intact.
+    nothing, and left the old graph for the next process start to reload --
+    reporting `indexed: 0` and success while the corpus it claimed to have
+    rebuilt sat in the store intact.
 
     A root with no indexable file in it is the honest way to reach that: the
     same path a walk takes after every match is excluded or deleted.
     """
+    kb = pg_kb
     empty_root = tmp_path / "nothing"
     empty_root.mkdir()
     kb._lexical_index = object()  # stands in for one built before the prune
@@ -155,16 +190,17 @@ def test_a_reindex_that_matches_nothing_still_reaches_disk(kb, tmp_path):
     report = index_corpus_files(kb, str(empty_root))
 
     assert report["indexed"] == 0
+    assert report["dropped"] == 2
     assert kb.collection.count() == 0  # the prune ran
     assert kb.graph.number_of_nodes() == 0  # and the graph was cleared
 
-    reloaded = json.loads((tmp_path / "knowledge_graph.json").read_text())
-    assert reloaded["nodes"] == []
-    assert _edges(reloaded) == []
+    reloaded = _stored_graph(kb)
+    assert reloaded.number_of_nodes() == 0
+    assert reloaded.number_of_edges() == 0
     assert kb._lexical_index is None  # or it answers with the pruned rows
 
 
-def test_a_reindex_that_indexes_something_persists_what_it_built(kb, tmp_path):
+def test_a_reindex_that_indexes_something_persists_what_it_built(pg_kb, tmp_path):
     """The ordinary path must not have been broken to fix the empty one.
 
     The stand-in for `add_document` does what the real one does to the graph
@@ -173,12 +209,16 @@ def test_a_reindex_that_indexes_something_persists_what_it_built(kb, tmp_path):
     merely counted would leave this test passing on the new unconditional save
     alone, which is not the claim being made.
     """
+    kb = pg_kb
     root = tmp_path / "project"
     root.mkdir()
     (root / "notes.md").write_text("The Planner interprets goals.", encoding="utf-8")
 
     def fake_add(path: str, content: str, metadata: dict[str, Any]) -> int:
-        kb.collection.add(path, content, metadata)
+        kb.collection.upsert(
+            ids=[path], embeddings=[np.ones(EMBEDDING_DIMENSIONS)], documents=[content],
+            metadatas=[{**metadata, "doc_id": path}],
+        )
         kb.graph.add_node(path, type="document", path=path)
         kb.graph.add_node("Planner", type="entity")
         kb.graph.add_edge(path, "Planner", relation="mentions")
@@ -192,14 +232,13 @@ def test_a_reindex_that_indexes_something_persists_what_it_built(kb, tmp_path):
     report = index_corpus_files(kb, str(root))
 
     assert report["indexed"] == 1
-    reloaded = json.loads((tmp_path / "knowledge_graph.json").read_text())
-    assert {node["id"] for node in reloaded["nodes"]} == {
-        str(root / "notes.md"), "Planner"}
-    assert _edges(reloaded)  # the rebuild is on disk, not just the emptying
+    reloaded = _stored_graph(kb)
+    assert set(reloaded.nodes) == {str(root / "notes.md"), "Planner"}
+    assert reloaded.number_of_edges()  # the rebuild is stored, not just the emptying
     assert kb._lexical_index is None
 
 
-def test_a_chroma_failure_leaves_the_graph_alone(kb):
+def test_a_store_failure_leaves_the_graph_alone(kb):
     """Half a wipe is worse than none: the two halves have to agree."""
     kb.collection.fail_on_delete = True
     nodes_before = kb.graph.number_of_nodes()
@@ -211,7 +250,7 @@ def test_a_chroma_failure_leaves_the_graph_alone(kb):
     assert kb.collection.count() == 2
 
 
-def test_clear_retires_the_floor_measured_on_what_it_deleted(kb, tmp_path):
+def test_clear_retires_the_floor_measured_on_what_it_deleted(pg_kb):
     """The floor belongs to the corpus, so it cannot outlive one.
 
     A floor is a measurement of *these texts* under this embedding model, and
@@ -222,37 +261,34 @@ def test_clear_retires_the_floor_measured_on_what_it_deleted(kb, tmp_path):
     for it, and every search would go on being judged against a number taken on
     a corpus nobody can consult any more.
     """
-    record = tmp_path / "floor_calibration.json"
-    record.write_text(json.dumps({"model": "qwen3-embedding:latest", "floor": 0.41}),
-                      encoding="utf-8")
+    pg_kb.collection.set_floor_record({"model": "qwen3-embedding:latest", "floor": 0.41})
+    assert relevance_floor(pg_kb.persist_dir) == 0.41
 
-    result = kb.clear()
+    result = pg_kb.clear()
 
     assert result["removed_floor"] is True
-    assert not record.exists()
-    assert relevance_floor(tmp_path) is None
+    assert pg_kb.collection.floor_record() is None
+    assert relevance_floor(pg_kb.persist_dir) is None
 
 
-def test_clear_does_not_claim_a_floor_it_never_found(kb, tmp_path):
+def test_clear_does_not_claim_a_floor_it_never_found(pg_kb):
     """A corpus whose floor was never measured reports no removal."""
-    assert kb.clear()["removed_floor"] is False
+    assert pg_kb.clear()["removed_floor"] is False
 
 
-def test_a_chroma_failure_leaves_the_floor_alone(kb, tmp_path):
+def test_a_store_failure_leaves_the_floor_alone(kb):
     """The third half fails with the other two, not without them.
 
-    The record is removed after both halves are actually empty, so a wipe that
-    raised leaves the corpus and the floor measured on it still agreeing.
+    The store clears chunks, graph and floor in one transaction, so a wipe
+    that raised leaves the corpus and the floor measured on it still agreeing.
     """
-    record = tmp_path / "floor_calibration.json"
-    record.write_text(json.dumps({"model": "qwen3-embedding:latest", "floor": 0.41}),
-                      encoding="utf-8")
+    kb.collection.set_floor_record({"model": "qwen3-embedding:latest", "floor": 0.41})
     kb.collection.fail_on_delete = True
 
     with pytest.raises(RuntimeError):
         kb.clear()
 
-    assert record.exists()
+    assert kb.collection.floor_record() is not None
 
 
 def test_clearing_an_empty_corpus_is_not_an_error(tmp_path):
@@ -314,18 +350,18 @@ def test_export_is_json_serialisable(kb):
     assert json.loads(payload)["stats"]["total_chunks"] == 2
 
 
-def test_a_chroma_failure_still_exports_the_graph(kb):
-    """The graph lives in memory; losing Chroma must not cost us both."""
+def test_a_store_failure_still_exports_the_graph(kb):
+    """The graph lives in memory; losing the database must not cost us both."""
 
     def boom(**_: Any) -> dict[str, Any]:
-        raise RuntimeError("chroma is unavailable")
+        raise RuntimeError("the store is unavailable")
 
     kb.collection.get = boom  # type: ignore[method-assign]
 
     export = kb.export_corpus()
 
     assert export["chunks"] == []
-    assert any("chroma is unavailable" in err for err in export["errors"])
+    assert any("the store is unavailable" in err for err in export["errors"])
     assert export["graph"]["nodes"]
 
 
@@ -1286,7 +1322,7 @@ def test_the_overview_leaves_out_documents_linked_to_nothing_and_counts_them(kb)
     assert shown["total_nodes"] == len(shown["nodes"])
 
 
-def test_rpc_graph_overview_is_registered_and_answers_without_a_corpus(kb, monkeypatch):
+def test_rpc_graph_overview_is_registered_and_answers_without_a_corpus(kb, monkeypatch, postgres):
     assert serve.RPC_METHODS["graph_overview"] is serve.rpc_graph_overview
 
     kb.graph = _topic_corpus(topics=2, docs=30)
@@ -1301,30 +1337,23 @@ def test_rpc_graph_overview_is_registered_and_answers_without_a_corpus(kb, monke
     assert absent["corpus"] == "absent" and absent["nodes"] == []
 
 
-def test_a_save_that_dies_midway_leaves_the_graph_it_replaced(kb, tmp_path, monkeypatch):
-    """`json.dump` straight into the file truncated it before it filled it.
+def test_a_save_that_dies_midway_leaves_the_graph_it_replaced(pg_kb):
+    """A graph save truncates before it refills; dying in between must cost nothing.
 
     The process can end in between -- the console's exit and install.sh's
     start-up check both end it under a rebuild running on a daemon thread --
-    and a graph file cut off mid-write does not load, so the corpus could not
-    be opened by anything, the rebuild that would have repaired it included.
+    and a graph cut off mid-write would be what every later start loaded. The
+    save is one transaction, so a failure partway through rolls the truncate
+    back with it. A node the store cannot serialise is the failure here: it
+    is met after the truncate and after some rows were already copied.
     """
-    import langgraph_agent.graphrag_server as module
+    before = _stored_graph(pg_kb)
+    pg_kb.graph.add_node("Planner", type="entity", unserialisable=object())
 
-    before = (tmp_path / "knowledge_graph.json").read_text(encoding="utf-8")
-    kb.graph.add_node("Planner", type="entity")
+    with pytest.raises(TypeError):
+        pg_kb._save_graph()
 
-    def dies_midway(data, handle, *args, **kwargs):
-        handle.write('{"nodes": [')
-        raise RuntimeError("the process was ended mid-write")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(module.json, "dump", dies_midway)
-        with pytest.raises(RuntimeError, match="mid-write"):
-            kb._save_graph()
-
-    assert (tmp_path / "knowledge_graph.json").read_text(encoding="utf-8") == before
-    reopened = object.__new__(GraphRAGKnowledgeBase)
-    reopened.persist_dir = tmp_path
-    reopened._load_graph()
-    assert "serve.py" in reopened.graph
+    after = _stored_graph(pg_kb)
+    assert set(after.nodes) == set(before.nodes)
+    assert after.number_of_edges() == before.number_of_edges()
+    assert "serve.py" in after

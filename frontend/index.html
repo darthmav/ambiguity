@@ -430,7 +430,7 @@ pre#state-dump{font:11px/1.7 var(--mono);color:var(--ink-2);white-space:pre-wrap
       <button class="go ghost" id="tpbtn"
               title="Group the corpus into topic communities — documents together with the entities that define them. The number of topics is chosen from the eigengap, and the answer is 'no clear structure' rather than a made-up map when the corpus has none.">Topics</button>
       <button class="go danger" id="clrbtn"
-              title="Empty the corpus. The files under knowledge/ stay, holding an empty store — the same shape a reindex leaves. Refused while a run is in flight.">Clear corpus</button>
+              title="Empty the corpus: its chunks, graph and floor go in one database transaction, leaving an empty store — the same shape a reindex leaves. Refused while a run is in flight.">Clear corpus</button>
       <span class="muted" id="restat"></span>
     </div>
     <!-- One scroll for the analyses and the list together. The panel itself
@@ -1270,15 +1270,21 @@ let CORPUS = "absent";
 let BUILDS_ON_RUN = true;
 function setCorpusState(state){
   CORPUS = state;
-  const absent = state === "absent";
+  // `unavailable` is a database that cannot be asked: nothing to export or
+  // clear until it answers, and the postgres chip in the header says why.
+  const absent = state === "absent" || state === "unavailable";
   $("#exbtn").disabled = absent;
   $("#clrbtn").disabled = absent;
-  $("#exbtn").title = absent
+  $("#exbtn").title = state === "unavailable"
+    ? "The corpus database cannot be reached — nothing to export until it answers."
+    : absent
     ? "No corpus has been indexed — nothing to export."
     : "Download the whole corpus as one JSON file — the graph plus every chunk and its metadata. Embeddings are left out; a reindex regenerates them locally.";
-  $("#clrbtn").title = absent
+  $("#clrbtn").title = state === "unavailable"
+    ? "The corpus database cannot be reached — nothing to clear until it answers."
+    : absent
     ? "No corpus has been indexed — nothing to clear."
-    : "Empty the corpus. The files under knowledge/ stay, holding an empty store — the same shape a reindex leaves. Refused while a run is in flight.";
+    : "Empty the corpus: its chunks, graph and floor go in one database transaction, leaving an empty store — the same shape a reindex leaves. Refused while a run is in flight.";
 }
 
 /* ---------- generated projects ---------- */
@@ -2418,6 +2424,8 @@ function embeddingChips(o){
   if(o.corpus === "absent")
     chips.push(`<span class="chip warn" title="The next run rebuilds the corpus with this model before the Architect opens.">no corpus yet</span>`);
   else if(o.corpus === "empty") chips.push(`<span class="chip warn">corpus empty</span>`);
+  else if(o.corpus === "unavailable")
+    chips.push(`<span class="chip warn" title="The PostgreSQL database the corpus lives in did not answer.">database down</span>`);
   else if(o.corpus) chips.push(`<span class="chip">corpus built</span>`);
   if(typeof o.floor === "number"){
     const how = "Measured on the corpus by the run that built it.";

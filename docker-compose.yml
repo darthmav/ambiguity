@@ -3,8 +3,9 @@
 #   docker compose up --build                    # Arch    (dockerfile)
 #
 # Host networking is the whole configuration decision here, and it is what
-# makes the database work unchanged. The postgres18 container Omarchy's
-# installer runs -- the one this project's install.sh brings up -- publishes
+# makes the database work unchanged. The corpus lives in the postgres18
+# container install.sh brings up (pgvector's build of Omarchy's postgres:18),
+# which publishes
 # its port on 127.0.0.1:5432 and nowhere else, which is why it can afford trust
 # authentication. A container on a bridge network reaches the host through the
 # gateway address, which is not an address that port is published on, so a
@@ -36,16 +37,21 @@ services:
 
     # The container never writes into your checkout, and nothing a host console
     # writes reaches the container: the two cannot share a corpus, a run
-    # snapshot, an upload or a generated project.
+    # snapshot, an upload or a generated project. Both keep their corpus in the
+    # one database, each in its own schema: a schema is named after the corpus
+    # directory's resolved path, /app/knowledge here and the checkout's on the
+    # host, so the two never meet.
     #
     #  * Code comes from the checkout, read-only, path by path -- not the whole
     #    tree. A volume mounted under a read-only checkout makes Docker create
-    #    its mount point *in the checkout* (an empty knowledge/, which must not
-    #    exist there until someone indexes), and the whole tree is also where
-    #    knowledge/, runs/ and .env live.
+    #    its mount point *in the checkout* (an empty uploads/, which must not
+    #    exist there until someone uploads), and the whole tree is also where
+    #    runs/ and .env live.
     #  * Everything the app writes is a named volume of this project, so a
-    #    rebuild keeps the corpus and the relevance floor measured for it, and
-    #    `docker compose down -v` is the one command that forgets them. The
+    #    rebuild keeps the archive the corpus is built from, and
+    #    `docker compose down -v` is the one command that forgets it. The corpus
+    #    itself -- vectors, graph, floor -- is in the database, which no volume
+    #    here holds. The
     #    dockerfile creates each directory owned by uid 1000, which is what makes
     #    a fresh volume writable by the user the container runs as.
     #  * .env is config, read-only; it must exist on the host (install.sh makes
@@ -72,7 +78,6 @@ services:
         read_only: true
         bind:
           create_host_path: false
-      - knowledge:/app/knowledge
       - runs:/app/runs
       - uploads:/app/uploads
       - research-web:/app/research/web
@@ -88,8 +93,8 @@ services:
       # same .env takes 8080, and on the host network two cannot share it.
       PORT: "${AMBIGUITY_PORT:-8081}"
       OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
-      # The URL install.sh writes into .env after proving it logs in. Nothing in
-      # the app reads it; the console exports it to everything it runs, so a
+      # The URL install.sh writes into .env after proving it logs in: where the
+      # corpus lives. The console also exports it to everything it runs, so a
       # script the Builder writes finds the database here.
       DATABASE_URL: "${DATABASE_URL:-postgresql://postgres@127.0.0.1:5432/postgres}"
 
@@ -110,7 +115,6 @@ services:
     stop_grace_period: 900s
 
 volumes:
-  knowledge:
   runs:
   uploads:
   research-web:

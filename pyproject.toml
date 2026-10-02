@@ -22,7 +22,10 @@ dependencies = [
     "pydantic>=2.0",               # SecretStr for provider keys
     "python-dotenv>=1.0.0",
     "httpx>=0.27.0",               # online research
-    "chromadb>=0.5.0",
+    # The corpus: PostgreSQL with pgvector (corpus_store.py). psycopg 3, and
+    # pgvector's adapter for numpy vectors.
+    "psycopg[binary]>=3.2",
+    "pgvector>=0.3",
     # The chunker cuts with the embedding model's own tokenizer; nothing embeds
     # in-process.
     "transformers>=4.51.0",

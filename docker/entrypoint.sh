@@ -3,12 +3,13 @@
 # can and cannot reach, then exec the command.
 #
 # It probes rather than waits. Neither dependency is fatal -- the console
-# starts without Ollama and reports each seat's real state itself, and nothing
-# in the app reads DATABASE_URL at all -- so a probe that blocked the start
-# would turn a warning into an outage. What a probe must not do is stay quiet:
-# with no daemon behind them every default seat fails its first call and the
-# corpus cannot be embedded, and the log a container leaves is the first place
-# anyone looks for why.
+# starts without Ollama and reports each seat's real state itself, and without
+# the database it reports the corpus `unavailable` and opens the postgres
+# circuit -- so a probe that blocked the start would turn a warning into an
+# outage. What a probe must not do is stay quiet: with no daemon behind them
+# every default seat fails its first call and the corpus cannot be embedded,
+# without the database it cannot be stored, and the log a container leaves is
+# the first place anyone looks for why.
 
 set -e
 
@@ -64,15 +65,21 @@ else
 fi
 
 # 4. PostgreSQL ------------------------------------------------------------
-# Nothing in the app reads DATABASE_URL -- the corpus is Chroma, under
-# knowledge/ -- but the console exports .env to everything it runs, so this is
-# the URL a script the Builder writes will use. That is exactly the kind of
-# configuration nobody finds out is wrong until an agent is halfway through a
-# task, so it is proved here the way install.sh proves it on the host: with a
-# query, through psql.
+# The corpus lives here -- chunks with pgvector embeddings, the entity graph,
+# the relevance floor -- and the console exports .env to everything it runs,
+# so it is also the URL a script the Builder writes will use. Proved the way
+# install.sh proves it on the host: with a query through psql, and then by
+# asking for the extension the corpus cannot do without.
 if [ -n "${DATABASE_URL:-}" ]; then
     if PGCONNECT_TIMEOUT=5 psql "$DATABASE_URL" -tAc 'select 1' >/dev/null 2>&1; then
-        echo "  postgres: ${DATABASE_URL%%\?*} answers"
+        if [ "$(PGCONNECT_TIMEOUT=5 psql "$DATABASE_URL" -tAc \
+                "select count(*) from pg_available_extensions where name = 'vector'" 2>/dev/null)" = 1 ]; then
+            echo "  postgres: ${DATABASE_URL%%\?*} answers, with pgvector"
+        else
+            echo "  postgres: ${DATABASE_URL%%\?*} answers but has no pgvector, so the corpus"
+            echo "            cannot be stored. Re-run ./install.sh on the host: it moves"
+            echo "            postgres18 to pgvector/pgvector:pg18-trixie on the same data."
+        fi
     else
         echo "  postgres: ${DATABASE_URL%%\?*} does not answer"
         case "$DATABASE_URL" in
