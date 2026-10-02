@@ -112,7 +112,7 @@ qwen3-embedding:latest`, ~4.7GB); a live run also needs the seats' tags.
 ### Self-healing
 
 `rpc healing` returns every circuit (`ollama-daemon`, `anthropic-api`,
-`openai-api`, `web-search:<backend>`), each service's last health check, and
+`web-search:<backend>`), each service's last health check, and
 the healing journal; `rpc reset_circuit '{"name":"ollama-daemon"}'` closes one
 by hand. A stopped daemon shows as an open `ollama-daemon` circuit and a red
 header chip; it closes by itself once the daemon answers a trial call.

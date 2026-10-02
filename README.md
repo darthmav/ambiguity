@@ -8,8 +8,8 @@ Inference is **local by default**. Three of the four seats run a model the
 local Ollama daemon serves from its own weights; the Builder runs a different
 local model because its work *is* tool calls, and the two local dolphin tags
 don't report `tools`. Nothing needs an API key or ollama.com credentials out
-of the box. Ollama Cloud tags, Anthropic and OpenAI are all still available
-per seat if you want them.
+of the box. Ollama Cloud tags and Anthropic are still available per seat if
+you want them.
 
 ## 🎨 Web Console
 
@@ -109,7 +109,7 @@ usually weaker on hard steps. It starts unticked, and the flag is sent either
 way, so an unticked seat is told not to think rather than left to its model's
 own default. The box shows what the next call will
 actually do, and it is grayed out when the model offers no switch: it cannot
-think (`gpt-4o`), always thinks (Claude Fable), or the Ollama daemon did not
+think (the dolphin tags), always thinks (Claude Fable), or the Ollama daemon did not
 say — hover for which. Like a model change, it lasts until the server restarts.
 
 ### Stopping a run
@@ -318,7 +318,7 @@ No API key is required: every default seat runs a model the local Ollama daemon
 serves from its own weights. Sign the daemon in (`ollama signin`) only if you
 move a seat onto a `:cloud` tag.
 
-A key is only needed if you move a seat onto Anthropic or OpenAI:
+A key is only needed if you move a seat onto Anthropic:
 
 ```bash
 ANTHROPIC_API_KEY=sk-ant-...
@@ -352,13 +352,6 @@ ollama pull nemotron-3-ultra:cloud
 
 The embedding model (`qwen3-embedding:latest`) is served by the Ollama daemon like the seats' models and pulled the same way — `install.sh` does it, or `ollama pull qwen3-embedding:latest`. Only its tokenizer is fetched from Hugging Face, so the chunker can cut passages in-process; nothing here runs or needs torch.
 
-### Optional OpenAI provider
-
-```bash
-OPENAI_API_KEY=sk-...
-OPENAI_MODEL=gpt-4o-mini
-```
-
 ## Usage
 
 ### Basic Example
@@ -386,7 +379,7 @@ Every seat defaults to a local model, so a key alone moves nothing. Point a seat
 at a provider in `.env` -- `ARCHITECT_PROVIDER=anthropic`, optionally
 `ARCHITECT_MODEL=...` -- or from its dropdown in the console.
 `python scripts/cloud_smoke.py` runs one goal with every seat moved onto
-whichever of `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` is set.
+Anthropic, when `ANTHROPIC_API_KEY` is set.
 
 ## Running Tests
 
@@ -546,7 +539,7 @@ card and always takes the CPU fallback (see `AGENT_LLM_OPTIONS` in
 `config.py`); the three dolphin-seated roles are 5.3-5.7 GB and load 100% on
 the GPU. A GPU is not required -- everything still runs on CPU, just slower --
 but is what keeps the Architect/Planner/Researcher seats fast. Point any seat
-at Anthropic, OpenAI or an Ollama Cloud tag instead if you'd rather not run
+at Anthropic or an Ollama Cloud tag instead if you'd rather not run
 weights locally at all.
 
 ## Next Steps

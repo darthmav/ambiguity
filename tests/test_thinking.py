@@ -6,8 +6,8 @@ answer per tag.
 
 Nothing here reaches a daemon or a provider. The daemon is stubbed at
 `ollama_model_capabilities` -- the one place it is asked -- or at `urlopen`
-when the asking itself is under test, and the Claude and OpenAI clients are
-built but never invoked, which makes no request.
+when the asking itself is under test, and the Claude client is built but
+never invoked, which makes no request.
 """
 
 from __future__ import annotations
@@ -157,7 +157,7 @@ def test_ollama_is_told_either_way_and_left_alone_when_nobody_asked():
     ("claude-sonnet-4-20250514", (4, 0)),
     ("claude-3-7-sonnet-latest", (3, 7)),
     ("claude-3-5-haiku-20241022", (3, 5)),
-    ("gpt-4o", None),
+    ("qwen3.8:latest", None),
 ])
 def test_a_claude_version_is_read_from_either_naming_order(model, version):
     assert config._claude_version(model) == version
@@ -244,12 +244,12 @@ def test_a_seat_thinks_by_default_and_keeps_its_switch_across_a_move(monkeypatch
 def test_a_model_that_cannot_think_is_locked_and_refuses_the_switch():
     """Refused and said so, rather than stored and ignored: a request that
     changes nothing must not come back looking as though it worked."""
-    config.set_agent_llm("planner", "openai", "gpt-4o")
+    config.set_agent_llm("planner", "anthropic", "claude-3-5-sonnet-20241022")
     status = config.get_agent_status("planner")
 
     assert status["thinking"] is False
     assert status["thinking_switchable"] is False
-    assert status["thinking_note"] == "gpt-4o cannot think"
+    assert status["thinking_note"] == "claude-3-5-sonnet-20241022 cannot think"
     with pytest.raises(ValueError, match="cannot be switched"):
         config.set_agent_thinking("planner", True)
 
@@ -405,9 +405,8 @@ def test_a_daemon_that_cannot_answer_is_unknown_not_a_model_without_tools(monkey
 
 
 def test_a_cloud_provider_is_taken_to_call_tools(monkeypatch):
-    """Anthropic and OpenAI refuse a tool call outright; there is no quiet failure."""
+    """Anthropic refuses an unsupported tool call outright; there is no quiet failure."""
     assert config.tool_support("anthropic", "claude-opus-5")[0] is True
-    assert config.tool_support("openai", "gpt-4o-mini")[0] is True
 
 
 def test_only_the_builder_is_warned_about_a_model_that_cannot_call_tools(monkeypatch):
@@ -559,29 +558,40 @@ def test_sonnet_5_5_is_switched_off_with_between_tools(monkeypatch):
 @pytest.fixture
 def _no_provider_env(monkeypatch):
     """`.env` is loaded at import, so its keys are cleared before each case."""
-    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "OPENAI_API_KEY", "OPENAI_MODEL"):
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"):
         monkeypatch.delenv(name, raising=False)
 
 
 def test_a_named_model_settles_its_provider_before_the_environment(
     monkeypatch, _no_provider_env
 ):
-    """`BUILDER_MODEL=gpt-4o` is an OpenAI seat on a machine with an Anthropic key.
+    """A model's name says whose it is before any key is read.
 
-    The keys were read first, so that seat went to Anthropic and failed every
-    call with a model Anthropic does not have.
+    The keys were read first once, so a seat named for one provider went to
+    another and failed every call with a model that provider does not have. A
+    name that says neither is Anthropic's when Anthropic is configured, and the
+    local daemon's otherwise.
     """
     monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
-    assert config._detect_provider("gpt-4o") == "openai"
     assert config._detect_provider("qwen3.8:latest") == "ollama"
+    assert config._detect_provider("claude-sonnet-5") == "anthropic"
+    assert config._detect_provider("somemodel") == "anthropic"
     assert config._detect_provider(None) == "anthropic"
 
     monkeypatch.delenv("ANTHROPIC_API_KEY")
-    monkeypatch.setenv("OPENAI_API_KEY", "k")
     assert config._detect_provider("claude-sonnet-5") == "anthropic"
-    # A name no provider's naming claims is still decided by the environment.
-    assert config._detect_provider("somemodel") == "openai"
-    assert config._detect_provider(None) == "openai"
+    assert config._detect_provider("somemodel") == "ollama"
+    assert config._detect_provider(None) == "ollama"
+
+
+def test_openai_is_not_a_provider(monkeypatch, _no_provider_env):
+    """Nothing here runs on OpenAI: a seat pointed there is refused by name."""
+    monkeypatch.setenv("BUILDER_PROVIDER", "openai")
+    monkeypatch.setenv("BUILDER_MODEL", "gpt-4o")
+
+    assert config.get_agent_status("builder")["badge"] == "BAD PROVIDER"
+    with pytest.raises(ValueError, match="Unknown provider 'openai'"):
+        config.get_llm(provider="openai", model="gpt-4o")
 
 
 def test_a_tag_written_without_its_version_is_the_pulled_model(monkeypatch):

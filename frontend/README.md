@@ -109,10 +109,9 @@ and `NO KEY`.
 The checkbox shows what the seat's next call will do, because a switchable
 model is always sent the flag — off included. It is grayed out when the model
 offers no switch, with the reason on hover: the model cannot think, always
-thinks, or nobody could say (a daemon that did not answer, or an OpenAI model
-whose reasoning is set by effort rather than on and off). The last case shows
-neither ticked nor clear. Support is asked of the Ollama daemon per tag, so a
-newly pulled model needs no code change.
+thinks, or nobody could say (a daemon that did not answer). The last case
+shows neither ticked nor clear. Support is asked of the Ollama daemon per tag,
+so a newly pulled model needs no code change.
 
 The status chip is the important one, and it distinguishes two different
 failures rather than blaming them both on a missing key:
@@ -206,8 +205,8 @@ ticked. Check `rag_stats` reports non-zero nodes afterwards.
 circuit opened. It closes on its own once a trial call succeeds; click the chip
 to send one now.
 
-**A seat shows NO KEY** — it is pointed at Anthropic or OpenAI and that
-provider's key is unset. The default seats are all local Ollama models; if
+**A seat shows NO KEY** — it is pointed at Anthropic and `ANTHROPIC_API_KEY`
+is unset. The default seats are all local Ollama models; if
 those are the ones failing, the daemon is down (`OFFLINE`) or the model is not
 pulled yet (`NOT PULLED`: `ollama pull` its tag).
 

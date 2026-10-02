@@ -272,8 +272,8 @@ def main():
     print("\nNext steps:")
     print("  - Review output above for any issues")
     print("  - Any seat not live above: start the Ollama daemon and pull its tag;")
-    print("    a :cloud tag also needs `ollama signin`, and an Anthropic or OpenAI")
-    print("    seat that provider's key in .env")
+    print("    a :cloud tag also needs `ollama signin`, and an Anthropic seat")
+    print("    ANTHROPIC_API_KEY in .env")
     print("  - Run: python example_usage.py")
 
 

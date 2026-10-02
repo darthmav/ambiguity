@@ -3,12 +3,11 @@
 Each of the four seats can run a different model on a different provider.
 Inference defaults to local: every seat runs a model the Ollama daemon on this
 machine serves from its own weights, so a fresh checkout needs no API key and
-no ollama.com credentials. Ollama Cloud tags, Anthropic and OpenAI remain
-available per seat. The embedding model runs on the same daemon but belongs to
-GraphRAG, never to a seat.
+no ollama.com credentials. Ollama Cloud tags and Anthropic remain available
+per seat. The embedding model runs on the same daemon but belongs to GraphRAG,
+never to a seat.
 """
 
-import functools
 import json
 import os
 import re
@@ -34,10 +33,10 @@ load_dotenv()
 # The four seats, in the order they hold the loop. Anything that iterates
 # agents reads this rather than repeating the list.
 AgentName = Literal["architect", "planner", "researcher", "builder"]
-Provider = Literal["openai", "anthropic", "ollama"]
+Provider = Literal["ollama", "anthropic"]
 
 AGENTS: tuple[AgentName, ...] = ("architect", "planner", "researcher", "builder")
-PROVIDERS: tuple[Provider, ...] = ("ollama", "anthropic", "openai")
+PROVIDERS: tuple[Provider, ...] = ("ollama", "anthropic")
 
 # Every model tag this project names, spelled once. Seat defaults, the tags
 # install.sh pulls, the seat diagnostic and ollama_client.py all refer to these.
@@ -47,8 +46,6 @@ QWEN3_8 = "qwen3.8:latest"
 NEMOTRON_3_ULTRA = "nemotron-3-ultra:cloud"
 CLAUDE_OPUS = "claude-opus-5"
 CLAUDE_SONNET = "claude-sonnet-5"
-GPT_4O = "gpt-4o"
-GPT_4O_MINI = "gpt-4o-mini"
 
 # The model each seat takes on each provider when `{ROLE}_PROVIDER` names the
 # provider and nothing names the model.
@@ -64,16 +61,12 @@ _DEFAULT_AGENT_MODELS: dict[Provider, dict[AgentName, str]] = {
         "architect": CLAUDE_OPUS, "planner": CLAUDE_OPUS,
         "researcher": CLAUDE_SONNET, "builder": CLAUDE_SONNET,
     },
-    "openai": {
-        "architect": GPT_4O, "planner": GPT_4O,
-        "researcher": GPT_4O_MINI, "builder": GPT_4O_MINI,
-    },
 }
 
 # The model a provider runs when neither the seat nor the environment
-# (`OLLAMA_MODEL`, `ANTHROPIC_MODEL`, `OPENAI_MODEL`) names one.
+# (`OLLAMA_MODEL`, `ANTHROPIC_MODEL`) names one.
 _PROVIDER_DEFAULT_MODELS: dict[Provider, str] = {
-    "ollama": DOLPHIN_9B, "anthropic": CLAUDE_OPUS, "openai": GPT_4O_MINI,
+    "ollama": DOLPHIN_9B, "anthropic": CLAUDE_OPUS,
 }
 
 # Local first: no seat needs an API key or ollama.com credentials by default.
@@ -180,19 +173,18 @@ OLLAMA_DAEMON = Circuit(
     trips_on=daemon_unreachable,
 )
 
-# The cloud providers, one circuit each, opened by outages rather than by
-# refusals. Their SDKs already retry a failed request, so nothing here retries
-# on top of them; the circuit is what stops the next seat from waiting out the
+# The cloud provider's circuit, keyed by provider, opened by outages rather
+# than by refusals. Its SDK already retries a failed request, so nothing here
+# retries on top; the circuit is what stops the next seat from waiting out the
 # same outage.
 PROVIDER_CIRCUIT_COOLDOWN_SECONDS = 60.0
 PROVIDER_CIRCUITS: dict[str, Circuit] = {
-    provider: Circuit(
-        f"{provider}-api",
+    "anthropic": Circuit(
+        "anthropic-api",
         failure_threshold=3,
         recovery_timeout=PROVIDER_CIRCUIT_COOLDOWN_SECONDS,
         trips_on=provider_unavailable,
-    )
-    for provider in ("anthropic", "openai")
+    ),
 }
 
 
@@ -647,22 +639,6 @@ def _claude_thinking(model: str, on: bool) -> dict[str, Any] | None:
     return None
 
 
-@functools.lru_cache(maxsize=64)
-def _openai_reasons(model: str) -> bool | None:
-    """Whether langchain_openai's profile for this model says it reasons; None if
-    it has none. Building the model sends nothing, so a placeholder key is enough.
-    """
-    kwargs: dict[str, Any] = {"model": model, "api_key": SecretStr("unused")}
-    try:
-        from langchain_openai import ChatOpenAI
-
-        profile = ChatOpenAI(**kwargs).profile
-    except Exception:
-        return None
-    reasons = (profile or {}).get("reasoning_output")
-    return reasons if isinstance(reasons, bool) else None
-
-
 def tool_support(provider: str, model: str) -> tuple[bool | None, str]:
     """Whether a model can call tools; None when the daemon could not be asked.
 
@@ -677,8 +653,8 @@ def tool_support(provider: str, model: str) -> tuple[bool | None, str]:
             return None, ""
         return ("tools" in caps), ""
 
-    # Anthropic and OpenAI reject an unsupported tool call at the API, so there
-    # is no quiet failure to warn about.
+    # Anthropic rejects an unsupported tool call at the API, so there is no
+    # quiet failure to warn about.
     return True, ""
 
 
@@ -689,8 +665,6 @@ def thinking_support(provider: str, model: str) -> tuple[ThinkingSupport, str]:
 
     - An Ollama tag answers for itself, through the daemon's capabilities.
     - A Claude model is read off its version: 3.7 and later can think.
-    - An OpenAI model is read off langchain's profile; its reasoning is set by
-      effort, not on and off, so a reasoning model reads `unknown`.
 
     `unknown` is never folded into `never`: "could not ask" is not "cannot think".
     """
@@ -714,14 +688,6 @@ def thinking_support(provider: str, model: str) -> tuple[ThinkingSupport, str]:
         if version >= (3, 7):
             return "switch", ""
         return "never", f"{model} cannot think"
-
-    if provider == "openai":
-        reasons = _openai_reasons(model)
-        if reasons is False:
-            return "never", f"{model} cannot think"
-        return "unknown", (
-            f"{model}'s reasoning is not switchable from the console"
-        )
 
     return "unknown", f"thinking is not switchable for {provider}"
 
@@ -792,7 +758,7 @@ def get_llm(
     """Get a chat model.
 
     Args:
-        provider: "ollama", "anthropic" or "openai"; detected from the model
+        provider: "ollama" or "anthropic"; detected from the model
             name, then the environment, when omitted. Anything else is refused.
         model: The model; the provider's default when omitted.
         temperature: Sampling temperature, where the model accepts one.
@@ -843,72 +809,49 @@ def get_llm(
             num_gpu=num_gpu,
         )
 
-    if provider == "anthropic":
-        from langchain_anthropic import ChatAnthropic
+    # Anthropic, the one cloud provider.
+    from langchain_anthropic import ChatAnthropic
 
-        model_name = str(model or os.getenv("ANTHROPIC_MODEL", _PROVIDER_DEFAULT_MODELS["anthropic"]))
-        key = api_key or os.getenv("ANTHROPIC_API_KEY")
-        if not key:
-            return StubLLM()
-        kwargs: dict[str, Any] = {
-            "model": model_name,
-            "api_key": SecretStr(key),
-            "default_request_timeout": timeout,
-        }
-        thinking_param = (
-            None if thinking is None else _claude_thinking(model_name, thinking)
-        )
-        if thinking_param is not None:
-            kwargs["thinking"] = thinking_param
-        # A model that is thinking takes no temperature.
-        thinks = thinking_param is not None and thinking_param["type"] not in (
-            "disabled", "between_tools"
-        )
-        if _accepts_temperature("anthropic", model_name) and not thinks:
-            kwargs["temperature"] = temperature
-        if base_url:
-            kwargs["base_url"] = base_url
-        return ChatAnthropic(**kwargs)
-
-    # openai (optional cloud provider)
-    from langchain_openai import ChatOpenAI
-
-    model_name = str(model or os.getenv("OPENAI_MODEL", _PROVIDER_DEFAULT_MODELS["openai"]))
-    key = api_key or os.getenv("OPENAI_API_KEY")
+    model_name = str(model or os.getenv("ANTHROPIC_MODEL", _PROVIDER_DEFAULT_MODELS["anthropic"]))
+    key = api_key or os.getenv("ANTHROPIC_API_KEY")
     if not key:
         return StubLLM()
-    kwargs = {
-        "model": str(model_name),
-        "temperature": temperature,
+    kwargs: dict[str, Any] = {
+        "model": model_name,
         "api_key": SecretStr(key),
-        "request_timeout": timeout,
+        "default_request_timeout": timeout,
     }
+    thinking_param = (
+        None if thinking is None else _claude_thinking(model_name, thinking)
+    )
+    if thinking_param is not None:
+        kwargs["thinking"] = thinking_param
+    # A model that is thinking takes no temperature.
+    thinks = thinking_param is not None and thinking_param["type"] not in (
+        "disabled", "between_tools"
+    )
+    if _accepts_temperature("anthropic", model_name) and not thinks:
+        kwargs["temperature"] = temperature
     if base_url:
         kwargs["base_url"] = base_url
-    return ChatOpenAI(**kwargs)
+    return ChatAnthropic(**kwargs)
 
 
 def _detect_provider(model: str | None) -> Provider:
-    """The provider for a model name, then for the environment.
+    """The provider for a model name, then for the environment, then the default.
 
-    The name decides first: `gpt-4o` is OpenAI's whatever keys are set. An Ollama
-    tag has a colon (`qwen3.8:latest`); a bare name that is not recognisably
-    Claude or GPT needs `{ROLE}_PROVIDER=ollama`.
+    The name decides first: an Ollama tag has a colon (`qwen3.8:latest`) and a
+    Claude model says so. A name that says neither is Anthropic's when Anthropic
+    is configured, and the local daemon's otherwise -- `qwen3.8` is a tag too.
     """
     if model:
-        lowered = model.lower()
         if ":" in model:
             return "ollama"
-        if "claude" in lowered:
+        if "claude" in model.lower():
             return "anthropic"
-        if lowered.startswith(("gpt-", "chatgpt", "o1", "o3", "o4")):
-            return "openai"
-
     if os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_MODEL"):
         return "anthropic"
-    if os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_MODEL"):
-        return "openai"
-    return "anthropic" if not model else "openai"
+    return DEFAULT_PROVIDER
 
 
 def _resolve_seat(agent: str) -> dict[str, str | None]:
@@ -1007,8 +950,6 @@ def get_agent_status(agent: AgentName) -> dict[str, Any]:
         live, reason, badge = False, failure, "FAILING"
     elif provider == "anthropic" and not os.getenv("ANTHROPIC_API_KEY"):
         live, reason, badge, stubbed = False, "ANTHROPIC_API_KEY not set", "NO KEY", True
-    elif provider == "openai" and not os.getenv("OPENAI_API_KEY"):
-        live, reason, badge, stubbed = False, "OPENAI_API_KEY not set", "NO KEY", True
     elif provider == "ollama":
         tags = list_ollama_models()
         if not tags:
@@ -1019,7 +960,7 @@ def get_agent_status(agent: AgentName) -> dict[str, Any]:
 
     # Where the prompt goes: a `:cloud` tag's transport is local, but the
     # prompt leaves the machine.
-    remote = provider in ("anthropic", "openai") or model.endswith((":cloud", "-cloud"))
+    remote = provider == "anthropic" or model.endswith((":cloud", "-cloud"))
 
     # What the next call will do; None when nobody can say.
     support, thinking_note = thinking_support(provider, model)

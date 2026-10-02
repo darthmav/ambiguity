@@ -14,7 +14,7 @@
 # account: an Ollama Cloud tag -- which a free ollama.com account can run -- is
 # pulled as an extra seat choice only when the daemon is signed in, and a
 # sign-in is asked for only when a seat is set up to use one. Nothing here asks
-# for an API key: Anthropic and OpenAI stay optional, and unconfigured.
+# for an API key: Anthropic stays optional, and unconfigured.
 #
 # The driver is the machine's own setup, not this script's -- Omarchy installs
 # it. Nothing in this project touches torch or a card itself: the daemon owns

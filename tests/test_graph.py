@@ -1460,16 +1460,12 @@ def test_every_provider_client_carries_a_request_timeout(monkeypatch):
 
     monkeypatch.setattr(config, "LLM_TIMEOUT_SECONDS", 42.0)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
     ollama = config.get_llm(provider="ollama", model="kimi-k3:cloud")
     assert ollama._client._client.timeout.read == 42.0
 
     anthropic = config.get_llm(provider="anthropic", model="claude-sonnet-5")
     assert anthropic.default_request_timeout == 42.0
-
-    openai = config.get_llm(provider="openai", model="gpt-4o-mini")
-    assert openai.request_timeout == 42.0
 
 
 def test_a_timed_out_seat_reads_as_a_failure_not_a_blank(monkeypatch):

@@ -11,8 +11,8 @@ This is **langgraph-agent**, a local-first 4-Agent AI system for software develo
 
 Inference defaults to local: every seat runs a model the Ollama daemon on this
 machine serves from its own weights, so a fresh checkout needs no API key and
-no ollama.com credentials at all. Ollama Cloud tags, Anthropic and OpenAI
-remain available per seat for anyone who wants them. The embedding model also
+no ollama.com credentials at all. Ollama Cloud tags and Anthropic remain
+available per seat for anyone who wants them. The embedding model also
 runs locally through the same daemon, serving `qwen3-embedding:latest` -- the
 daemon owns every model's placement, so nothing in this project touches torch
 or a card itself. The embedding belongs to GraphRAG, not to a seat.
@@ -109,7 +109,7 @@ python example_usage.py
 │   └── test_spectral_graph.py # The spectral_graph package, against closed-form spectra
 ├── scripts/
 │   ├── verify_and_test.py     # Manual verification: dependencies, seats, a search, the suite
-│   ├── cloud_smoke.py         # One run with every seat on Anthropic or OpenAI
+│   ├── cloud_smoke.py         # One run with every seat on Anthropic
 │   ├── spectral_benchmark.py  # Graph-architecture sweep behind the A-numbers
 │   └── diagnose_seats.py      # Role probes + team runs per seating
 ├── frontend/
@@ -157,8 +157,8 @@ python example_usage.py
 
   Three seats run local weights the daemon holds itself; the Builder is the
   exception, since its work *is* tool calls and neither dolphin tag reports
-  `tools` -- `qwen3.8:latest` does. Anthropic, OpenAI and Ollama Cloud tags
-  remain available per seat; no seat uses any of them by default, so a fresh
+  `tools` -- `qwen3.8:latest` does. Anthropic and Ollama Cloud tags remain
+  available per seat; no seat uses any of them by default, so a fresh
   checkout runs without an API key or ollama.com credentials of its own.
 - **Never send `temperature` to a modern Anthropic model.** Sampling parameters
   were removed on the Opus 5 / Sonnet 5 / 4.6+ families and are rejected with a
@@ -415,8 +415,8 @@ every checkout has, so `uploads/`, `projects/` and fetched pages are out.
   console starts and again before the Architect opens, from the directory the
   server was started in, so the usual causes are a server started somewhere
   with nothing to index, or `REBUILD_CORPUS=0`.
-- **No LLM output / canned text** -- A seat pointed at Anthropic or OpenAI needs
-  that provider's key in `.env`; without one it runs `StubLLM` and the console
+- **No LLM output / canned text** -- A seat pointed at Anthropic needs
+  `ANTHROPIC_API_KEY` in `.env`; without one it runs `StubLLM` and the console
   shows a `NO KEY` chip. Ollama seats need the daemon running and signed in
   (`ollama signin`) for `:cloud` tags.
 - **A 400 from Anthropic that looks like an auth error** -- Something is passing

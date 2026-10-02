@@ -84,7 +84,7 @@ def test_only_an_unreachable_daemon_counts_as_one(exc, unreachable):
 
 
 class _APIStatusError(Exception):
-    """An SDK error carrying the HTTP status, as the Anthropic and OpenAI ones do."""
+    """An SDK error carrying the HTTP status, as Anthropic's does."""
 
     def __init__(self, status_code: int) -> None:
         super().__init__(f"HTTP {status_code}")

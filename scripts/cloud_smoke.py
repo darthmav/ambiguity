@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""End-to-end run on a cloud provider: every seat on Anthropic or OpenAI.
+"""End-to-end run on the cloud provider: every seat on Anthropic.
 
 Every seat defaults to a local Ollama model, so a key being present is not
 enough: each seat not already configured through `{ROLE}_PROVIDER` or
-`{ROLE}_MODEL` is pointed at the provider whose key is set (Anthropic when both
-are), on that provider's default model. The run writes into its own generated
-project, `projects/cloud-smoke/`, never into the checkout.
+`{ROLE}_MODEL` is pointed at Anthropic, on its default model there. The run
+writes into its own generated project, `projects/cloud-smoke/`, never into the
+checkout.
 
 Usage:
     python scripts/cloud_smoke.py
@@ -25,17 +25,13 @@ TARGET = Path(OUTPUT_DIR) / "cloud_test.txt"
 
 
 def main() -> int:
-    if os.getenv("ANTHROPIC_API_KEY"):
-        provider = "anthropic"
-    elif os.getenv("OPENAI_API_KEY"):
-        provider = "openai"
-    else:
-        print("Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY is set; nothing to test.")
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        print("ANTHROPIC_API_KEY is not set; nothing to test.")
         return 0
 
     for agent in AGENTS:
         if not os.getenv(f"{agent.upper()}_PROVIDER") and not os.getenv(f"{agent.upper()}_MODEL"):
-            os.environ[f"{agent.upper()}_PROVIDER"] = provider
+            os.environ[f"{agent.upper()}_PROVIDER"] = "anthropic"
     for agent in AGENTS:
         seat = get_agent_status(agent)
         print(f"  {agent:<11}{seat['provider']:<10}{seat['model']}")
@@ -43,7 +39,7 @@ def main() -> int:
     state = initial_state(
         f"Create {TARGET} with the content 'Cloud LLM works!'", output_dir=OUTPUT_DIR
     )
-    print(f"Running the four seats on {provider}...")
+    print("Running the four seats on Anthropic...")
     result = create_agent_graph().invoke(state, {"recursion_limit": RECURSION_LIMIT})
 
     print(f"\nPlan: {result.get('plan', '')!r}")

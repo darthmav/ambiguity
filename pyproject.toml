@@ -17,7 +17,6 @@ dependencies = [
     # A seat whose provider will not import silently becomes StubLLM, so every
     # provider a seat can be pointed at is declared.
     "langchain-ollama>=0.2.0",     # every default seat
-    "langchain-openai>=0.2.0",
     "langchain-anthropic>=0.2.0",
     "ollama>=0.4.0",               # ollama_client.py
     "pydantic>=2.0",               # SecretStr for provider keys
