@@ -72,15 +72,14 @@ RUN python -m venv "$VIRTUAL_ENV"
 WORKDIR /app
 
 # Only what the install reads, so an edit to serve.py or the frontend does not
-# re-resolve the dependency tree. `[dev]` rather than the bare install because
-# two of those extras are runtime requirements of the Builder's own belt, not
-# developer conveniences: `_lint_written_files` runs `ruff check` over every
-# Python file a pass wrote (a machine without ruff blocks nothing and says so,
-# which would quietly retire the lint gate), and the `test_` tools run pytest.
+# re-resolve the dependency tree. `[tools]` because ruff and pytest are runtime
+# requirements of the Builder's own belt: `_lint_written_files` runs `ruff
+# check` over every Python file a pass wrote (without ruff the lint gate says
+# so and blocks nothing), and `run_tests` runs pytest.
 COPY pyproject.toml ./pyproject.toml
 COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install -e ".[dev]"
+    uv pip install -e ".[tools]"
 
 # Two dependencies of chromadb that this project cannot reach, removed after
 # the fact because there is no way to ask for the tree without them: 148 MB of
@@ -88,9 +87,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # here uses it -- there is exactly one embedding model and it is served by the
 # Ollama daemon over HTTP. `kubernetes` is its client for a Chroma running as a
 # server, and this one runs embedded, as files under knowledge/.
-# Measured rather than assumed: the whole suite (755 tests) passes in the image
-# without them. Undo by deleting this line if a chromadb upgrade starts
-# reaching for either.
+# The whole suite passes in the image without them; delete this line if a
+# chromadb upgrade starts reaching for either.
 RUN uv pip uninstall onnxruntime kubernetes
 
 # Debug symbols from 415 compiled extensions: 80 MB, and nothing reads them

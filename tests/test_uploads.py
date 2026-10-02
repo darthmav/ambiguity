@@ -24,10 +24,9 @@ import serve
 from langgraph_agent.graphrag_server import (
     INDEXABLE_SUFFIXES,
     MAX_INDEXABLE_BYTES,
-    PROJECT_INDEX_EXCLUDES,
     UPLOADS_DIR,
     _document_metadata,
-    iter_project_files,
+    iter_corpus_files,
     store_uploaded_document,
 )
 
@@ -84,27 +83,15 @@ def test_the_document_is_written_to_disk_before_it_is_embedded(kb, root):
 def test_an_uploaded_document_survives_a_reindex(kb, tmp_path, monkeypatch):
     """The load-bearing test: the walk has to find what the upload wrote.
 
-    Asserted through `iter_project_files` rather than by reading
-    `PROJECT_INDEX_EXCLUDES` — the excludes are plain substrings, so the way
-    this breaks is someone adding a pattern that happens to match `uploads/`,
-    and only running the walk catches that.
+    Asserted through `iter_corpus_files`, so whatever decides the walk's
+    contents is what is tested.
     """
     store_uploaded_document(kb, "handbook.md", "Retrieval is hybrid.", str(tmp_path))
 
     monkeypatch.chdir(tmp_path)
-    walked = {str(path) for path in iter_project_files(".")}
+    walked = {str(path) for path in iter_corpus_files(".")}
 
     assert f"{UPLOADS_DIR}/handbook.md" in walked
-
-
-def test_the_upload_directory_is_not_excluded_from_the_walk():
-    """Stated separately because the exclude list is edited by hand.
-
-    A new entry that merely *contains* the directory name — the failure
-    `"build"` had against `prompts/builder.txt` — would quietly stop every
-    upload being re-read, and the corpus would lose them one reindex later.
-    """
-    assert not any(pattern in f"{UPLOADS_DIR}/anything.md" for pattern in PROJECT_INDEX_EXCLUDES)
 
 
 def test_the_id_and_metadata_match_what_a_reindex_would_write(kb, tmp_path, monkeypatch):
@@ -118,7 +105,7 @@ def test_the_id_and_metadata_match_what_a_reindex_would_write(kb, tmp_path, monk
     monkeypatch.chdir(tmp_path)
     store_uploaded_document(kb, "notes.md", "Chunking is why this is reachable.")
 
-    walked = next(p for p in iter_project_files(".") if p.name == "notes.md")
+    walked = next(p for p in iter_corpus_files(".") if p.name == "notes.md")
     doc_id, _, metadata = kb.added[0]
 
     assert doc_id == str(walked)
@@ -190,17 +177,9 @@ def test_a_format_with_no_text_extractor_is_refused_rather_than_embedded(kb, roo
     assert not (Path(root) / UPLOADS_DIR).exists(), "refused before anything was written"
 
 
-def test_the_accepted_suffixes_are_the_walk_s_own(kb, root):
-    """Derived, not restated. A suffix accepted here that the walk does not
-    glob is a document embedded once and dropped at the next rebuild."""
-    from langgraph_agent.graphrag_server import PROJECT_INDEX_PATTERNS
-
-    assert set(INDEXABLE_SUFFIXES) == {Path(p).suffix for p in PROJECT_INDEX_PATTERNS}
-
-
 def test_an_upper_case_suffix_is_stored_lower_cased(kb, root):
-    """The walk is a glob and a glob is case-sensitive here, so `NOTES.MD`
-    stored as given is a file the reindex cannot see."""
+    """The walk compares suffixes exactly, so `NOTES.MD` stored as given is a
+    file the reindex cannot see."""
     report = store_uploaded_document(kb, "NOTES.MD", "Case matters to glob.", root)
 
     assert report["name"] == "NOTES.md"

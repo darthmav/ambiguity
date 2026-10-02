@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from langgraph_agent import AgentState, ResearchStatus, Verdict, create_agent_graph
+from langgraph_agent import AgentState, ResearchStatus, Verdict, create_agent_graph, initial_state
 from langgraph_agent.config import StubLLM
 from langgraph_agent.control import ACTIVITY, TURN_RECORD
 from langgraph_agent.graph import RECURSION_LIMIT, _tracked
@@ -30,29 +30,6 @@ def agent_graph(monkeypatch):
         lambda agent, temperature=0.1: StubLLM(),
     )
     return create_agent_graph()
-
-
-def initial_state(goal: str) -> AgentState:
-    """Create initial state per the 4-Agent System specification."""
-    return {
-        "goal": goal,
-        "messages": [],
-        "architecture": "",
-        "verdict": "",
-        "plan": "",
-        "research": "",
-        "builder_report": "",
-        "next_agent": "Researcher",
-        "research_status": "",
-        "blockers": "",
-        "files_changed": [],
-        "failed_verification": [],
-        "unverified": [],
-        "builder_cut_off": "",
-        "lint_failed": [],
-        "expect_failures": False,
-        "step_count": 0,
-    }
 
 
 def test_state_schema_initialization():
@@ -1433,7 +1410,7 @@ def test_a_silent_researcher_is_not_reported_as_research(monkeypatch, content):
 
     monkeypatch.setattr(nodes, "get_agent_llm", lambda agent: _SilentSeat(content))
     monkeypatch.setattr(
-        nodes, "_call_mcp_tool_sync", lambda *a, **k: {"results": []}
+        nodes, "_call_tool", lambda *a, **k: {"results": []}
     )
 
     state = initial_state("Research something the seat will not answer")
@@ -1460,7 +1437,7 @@ def test_real_findings_still_route_as_research(monkeypatch):
     )
     monkeypatch.setattr(nodes, "get_agent_llm", lambda agent: _SilentSeat(answer))
     monkeypatch.setattr(
-        nodes, "_call_mcp_tool_sync", lambda *a, **k: {"results": []}
+        nodes, "_call_tool", lambda *a, **k: {"results": []}
     )
 
     state = initial_state("Research spectral graph theory")
@@ -1577,7 +1554,7 @@ def test_a_tool_call_is_never_abandoned_midway(monkeypatch, tmp_path):
     started = []
     finished = []
 
-    real_call = nodes._call_mcp_tool_sync
+    real_call = nodes._call_tool
 
     def _slow_call(name, args):
         if name == "filesystem_write":
@@ -1588,7 +1565,7 @@ def test_a_tool_call_is_never_abandoned_midway(monkeypatch, tmp_path):
             return result
         return real_call(name, args)
 
-    monkeypatch.setattr(nodes, "_call_mcp_tool_sync", _slow_call)
+    monkeypatch.setattr(nodes, "_call_tool", _slow_call)
     monkeypatch.setattr(
         nodes, "get_agent_llm", lambda agent, temperature=0.1: _ToolCallingLLM(target)
     )
@@ -2178,6 +2155,41 @@ def test_a_stopped_builder_is_not_described_as_out_of_time(monkeypatch, tmp_path
     assert "deadline" not in result["messages"][-1]
 
 
+class _StopsAsItReportsLLM(_ToolCallingLLM):
+    """Writes a script, then trips the stop while writing its closing report."""
+
+    def invoke(self, messages):
+        from langgraph_agent.control import RUN_CONTROL
+
+        reply = super().invoke(messages)
+        if self.calls == 2:
+            RUN_CONTROL.arm("run-under-test")
+            RUN_CONTROL.stop("run-under-test", "Stopped from the console.")
+        return reply
+
+
+def test_a_stop_during_verification_is_not_described_as_the_deadline(
+    monkeypatch, tmp_path
+):
+    """The seat finished; the stop landed before its file was run."""
+    monkeypatch.chdir(tmp_path)
+    from langgraph_agent.nodes import builder_node
+
+    target = tmp_path / "made.py"
+    llm = _StopsAsItReportsLLM(target)
+    monkeypatch.setattr(
+        "langgraph_agent.nodes.get_agent_llm", lambda agent, temperature=0.1: llm
+    )
+
+    result = builder_node(initial_state("Write a script"))
+
+    assert result["unverified"] == [str(target)]
+    assert result["blockers"].startswith("Not executed before the stop")
+    assert "the run was stopped" in result["builder_report"]
+    assert "budget" not in result["builder_report"]
+    assert result["messages"][-1].endswith("1 not run (stopped)")
+
+
 def test_a_stopped_run_leaves_written_files_unproven(monkeypatch, tmp_path):
     """Files nobody executed come back unverified, not clear."""
     from langgraph_agent.control import RUN_CONTROL
@@ -2668,7 +2680,7 @@ def test_a_missing_linter_is_reported_and_blocks_nothing(tmp_path, monkeypatch):
     target.write_text("import os\n")
     monkeypatch.setattr(
         nodes,
-        "_call_mcp_tool_sync",
+        "_call_tool",
         lambda name, args: {
             "success": False, "stdout": "", "stderr": "python: No module named ruff",
         },
@@ -2728,7 +2740,7 @@ def test_a_lint_failure_is_carried_until_it_is_fixed(monkeypatch, tmp_path):
     assert builder_node(dict(state, messages=[]))["lint_failed"] == []
 
 
-# --- The Planner's project map ------------------------------------------------
+# --- The Planner's corpus map -------------------------------------------------
 
 
 class _RecordingPlannerLLM:
@@ -2757,11 +2769,11 @@ def _search_answering(results):
 def test_the_planner_is_shown_the_files_the_corpus_ranks_closest(monkeypatch):
     from langgraph_agent import nodes
 
-    monkeypatch.setattr(nodes, "PLANNER_PROJECT_MAP", True)
+    monkeypatch.setattr(nodes, "PLANNER_CORPUS_MAP", True)
     # The floor is measured per corpus and `None` until then; pin one so the
     # ranking assertion below is about the filter and not about the absence.
     monkeypatch.setattr("langgraph_agent.graphrag_server.relevance_floor", lambda: 0.37)
-    monkeypatch.setattr(nodes, "_call_mcp_tool_sync", _search_answering([
+    monkeypatch.setattr(nodes, "_call_tool", _search_answering([
         {"id": "src/app.py", "score": 0.61, "content": "def render_graph():\n    ...",
          "metadata": {"path": "src/app.py"}},
         {"id": "notes/unrelated.md", "score": 0.12, "content": "nothing to do with it"},
@@ -2782,11 +2794,11 @@ def test_no_map_when_nothing_clears_the_floor(monkeypatch):
     # A pinned floor, so the empty map is the filter's doing -- with the floor
     # unmeasured (`None`) there is no map either, and that path is not this test.
     monkeypatch.setattr("langgraph_agent.graphrag_server.relevance_floor", lambda: 0.37)
-    monkeypatch.setattr(nodes, "_call_mcp_tool_sync", _search_answering([
+    monkeypatch.setattr(nodes, "_call_tool", _search_answering([
         {"id": "a.md", "score": 0.10, "content": "x"},
     ]))
 
-    assert nodes._project_map("anything") == ""
+    assert nodes._corpus_map("anything") == ""
 
 
 def test_a_failed_search_leaves_the_planner_planning(monkeypatch):
@@ -2795,10 +2807,10 @@ def test_a_failed_search_leaves_the_planner_planning(monkeypatch):
     def boom(name, args):
         raise RuntimeError("no corpus here")
 
-    monkeypatch.setattr(nodes, "_call_mcp_tool_sync", boom)
+    monkeypatch.setattr(nodes, "_call_tool", boom)
 
-    assert nodes._project_map("anything") == ""
-    assert nodes._project_map("   ") == ""
+    assert nodes._corpus_map("anything") == ""
+    assert nodes._corpus_map("   ") == ""
 
 
 def test_the_map_stays_off_when_switched_off(monkeypatch):
@@ -2806,15 +2818,15 @@ def test_the_map_stays_off_when_switched_off(monkeypatch):
     from langgraph_agent import nodes
 
     def must_not_search(name, args):
-        raise AssertionError("searched with the project map switched off")
+        raise AssertionError("searched with the corpus map switched off")
 
-    monkeypatch.setattr(nodes, "_call_mcp_tool_sync", must_not_search)
+    monkeypatch.setattr(nodes, "_call_tool", must_not_search)
     llm = _RecordingPlannerLLM()
     monkeypatch.setattr(nodes, "get_agent_llm", lambda agent, temperature=0.1: llm)
 
     nodes._make_plan(initial_state("Fix the graph rendering"))
 
-    assert "Project files the corpus ranks" not in llm.seen
+    assert nodes.CORPUS_MAP_HEADING not in llm.seen
 
 
 # --- Blockers -----------------------------------------------------------------

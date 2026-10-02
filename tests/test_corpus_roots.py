@@ -1,6 +1,6 @@
 """The corpus is research and what the operator embedded -- never the checkout.
 
-`iter_project_files` walks `CORPUS_ROOTS` alone: pages the online research
+`iter_corpus_files` walks `CORPUS_ROOTS` alone: pages the online research
 phase fetched, uploads, and generated projects the operator opted in. The
 checkout's own files -- README, CLAUDE.md, install.sh, config -- are the
 program, and a console coming up used to embed them unasked.
@@ -12,7 +12,7 @@ from langgraph_agent.graphrag_server import (
     CORPUS_ROOTS,
     UPLOADS_DIR,
     WEB_RESEARCH_DIR,
-    iter_project_files,
+    iter_corpus_files,
 )
 from langgraph_agent.projects import PROJECTS_DIR, set_project_embedded
 
@@ -25,7 +25,7 @@ def _write(root, *relatives: str) -> None:
 
 
 def _walked(root) -> set[str]:
-    return {str(path.relative_to(root)) for path in iter_project_files(str(root))}
+    return {str(path.relative_to(root)) for path in iter_corpus_files(str(root))}
 
 
 def test_the_roots_are_research_uploads_and_projects() -> None:
@@ -48,3 +48,22 @@ def test_a_project_is_walked_only_once_embedded(tmp_path) -> None:
     assert _walked(tmp_path) == set()
     set_project_embedded("snake", True, tmp_path)
     assert _walked(tmp_path) == {f"{PROJECTS_DIR}/snake/game.py"}
+
+
+def test_an_embedded_project_is_walked_whole_minus_tool_directories(tmp_path) -> None:
+    """A project's own `src/`, `tests/`, `scripts/` and `frontend/` are its content.
+
+    The walk once excluded those names as substrings left over from indexing
+    the checkout, so an opted-in project lost every file below its top level.
+    Only tool, VCS and build directories are skipped, and by whole name.
+    """
+    kept = ("src/app/core.py", "tests/test_core.py", "scripts/run.sh",
+            "frontend/index.html", "prompts/system.txt", "rebuild/notes.md",
+            "venv_notes.md")
+    skipped = (".venv/lib/site.py", "venv/lib/site.py", "build/lib/out.py",
+               "dist/app.py", "app.egg-info/SOURCES.txt", "__pycache__/core.py",
+               "node_modules/pkg/index.js", ".git/hooks/pre-commit.sh")
+    _write(tmp_path, *(f"{PROJECTS_DIR}/app/{p}" for p in kept + skipped))
+    set_project_embedded("app", True, tmp_path)
+
+    assert _walked(tmp_path) == {f"{PROJECTS_DIR}/app/{p}" for p in kept}

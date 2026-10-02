@@ -6,8 +6,9 @@ Usage:
 
 Then open: http://localhost:8080
 
-The console talks to a single `POST /rpc` endpoint taking {method, params};
-the `/api/*` routes are thin compatibility wrappers over the same dispatch.
+The console talks to a single `POST /rpc` endpoint taking {method, params}.
+`GET /api/status` answers the same payload as the `status` method, for the
+launcher's readiness poll and the container's health check.
 """
 
 import contextlib
@@ -20,7 +21,7 @@ import threading
 import time
 import uuid
 import warnings
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -42,12 +43,14 @@ if str(src_path) not in sys.path:
 
 from langgraph.errors import GraphRecursionError  # noqa: E402
 
-from langgraph_agent import AgentState, create_agent_graph  # noqa: E402
+from langgraph_agent import create_agent_graph, initial_state  # noqa: E402
 from langgraph_agent.config import (  # noqa: E402
     AGENTS,
+    daemon_request,
     get_agent_model_info,
     get_agent_status,
     list_ollama_models,
+    ollama_base_url,
     ollama_model_capabilities,
     set_agent_llm,
     set_agent_thinking,
@@ -55,7 +58,7 @@ from langgraph_agent.config import (  # noqa: E402
 from langgraph_agent.control import ACTIVITY, EMBEDDER_ACTIVITY, RUN_CONTROL  # noqa: E402
 from langgraph_agent.corpus_health import (  # noqa: E402
     corpus_staleness,
-    forget_expected_documents,
+    forget_cached_walk,
 )
 from langgraph_agent.graph import RECURSION_LIMIT  # noqa: E402
 from langgraph_agent.graphrag_server import (  # noqa: E402
@@ -69,8 +72,8 @@ from langgraph_agent.graphrag_server import (  # noqa: E402
     floor_calibration,
     floor_from_calibration,
     get_knowledge_base,
-    index_project_files,
-    iter_project_files,
+    index_corpus_files,
+    iter_corpus_files,
     open_knowledge_base,
     resolve_persist_dir,
     store_uploaded_document,
@@ -82,26 +85,30 @@ from langgraph_agent.projects import (  # noqa: E402
     project_name_error,
     set_project_embedded,
 )
-from langgraph_agent.web_research import research_online  # noqa: E402
+from langgraph_agent.self_healing import (  # noqa: E402
+    CircuitOpenError,
+    circuit_states,
+    get_healing_logger,
+    reset_circuit,
+)
+from langgraph_agent.web_research import research_online, search_backend_health  # noqa: E402
 
 # Initialize graph. The knowledge base is deliberately *not* initialized here.
 graph = create_agent_graph()
 
-# The corpus, once something has opened one. There is no preload: this used to
-# be filled by a background thread started at import, which meant starting the
-# server created a store on disk and loaded the embedding model whether or not
-# anyone wanted a corpus. A corpus exists because someone indexed, or it does
-# not exist.
+# The healing journal every retry, circuit, health check and recovery in this
+# process writes to; a run is one healing session in it.
+HEALING = get_healing_logger()
+
+# The corpus, once something has opened one. Nothing preloads it: a corpus
+# exists because someone indexed, or it does not exist.
 kb: GraphRAGKnowledgeBase | None = None
 
-# Whether a run may build the corpus it is about to search, on a machine where
-# nobody has built one -- see `_index_the_project_before_the_run`. It switches
-# off the way `WEB_SEARCH_ENABLED` does, because the one caller that must never
-# have it on is the test suite: `tests/conftest.py` turns it off for every
-# test, or a suite run in a checkout with no `knowledge/` -- CI's, every time
-# -- would index the whole project once per test that starts a run.
-INDEX_PROJECT_BEFORE_RUN = os.getenv(
-    "INDEX_PROJECT_BEFORE_RUN", "1"
+# Whether this console may rebuild its own corpus: at startup, before every
+# run, and for the monitor. `tests/conftest.py` turns it off, or every run a
+# test starts would index a corpus.
+REBUILD_CORPUS = os.getenv(
+    "REBUILD_CORPUS", "1"
 ).strip() not in {"0", "false", "no"}
 
 
@@ -121,14 +128,11 @@ MAX_GRAPH_DEPTH = 10
 MAX_MIN_DEGREE = 1_000_000
 MAX_LIST_LIMIT = 500
 MAX_TOPICS = 100
+MAX_EVENT_SEQUENCE = 2**53 - 1  # the largest integer a browser holds exactly
 
-# Every method used to take its parameters through a bare `int()`, `float()`,
-# `bool()` or `str()`. `top_k="abc"` came back as Python's own "invalid literal
-# for int() with base 10"; a negative `top_k` as an empty result the console
-# showed as "no results", as though the query had found nothing; and the string
-# "false" as True -- which on `research_web` fetched and permanently embedded
-# pages, and on `expect_failures` stopped failing files blocking approval. These
-# refuse by name instead, and the methods parse before they touch anything.
+# Parameters are parsed by these before a method touches anything, and refused
+# by name: a bare `int()` answered in Python's words, a negative `top_k` came
+# back as "no results", and `bool("false")` is True.
 
 
 def _refusal(name: str, wanted: str, value: Any) -> ValueError:
@@ -194,12 +198,10 @@ def _str_param(params: dict[str, Any], name: str, default: str = "") -> str:
 
 
 def _open_kb() -> GraphRAGKnowledgeBase | None:
-    """The corpus if one has been built, `None` if none has. Never builds one.
+    """The corpus if one has been built, `None` if not. Never builds one.
 
-    Every read goes through here. The console polls `rag_stats` every five
-    seconds, so a read that creates is a corpus nobody asked for, arriving
-    within seconds of the server starting and reporting itself as a knowledge
-    base thereafter.
+    Every read goes through here, and the console polls `rag_stats` every few
+    seconds: a read that created would leave a corpus nobody asked for.
     """
     global kb
     if kb is None:
@@ -208,13 +210,10 @@ def _open_kb() -> GraphRAGKnowledgeBase | None:
 
 
 def _kb_for_indexing() -> GraphRAGKnowledgeBase:
-    """The corpus, **created if it does not exist**. Two callers, both writers.
+    """The corpus, created if it does not exist -- for writers only.
 
-    Indexing is the act that is allowed to bring a corpus into being, because
-    it is the act that is a request for one -- and so is uploading a document,
-    which is a request for a corpus to hold it. Every *read* goes through
-    `_open_kb()` instead: a corpus that appeared because something looked at it
-    is a corpus nobody asked for.
+    Indexing, an upload and the online research phase are each a request for a
+    corpus to hold something; every read goes through `_open_kb()` instead.
     """
     global kb
     if kb is None:
@@ -243,10 +242,9 @@ def rpc_rag_stats(_: dict[str, Any]) -> dict[str, Any]:
             "total_chunks": 0,
             "total_nodes": 0,
             "total_edges": 0,
-            # Same keys as the indexed branch, so the console renders one shape
-            # rather than branching on which fields happen to exist. `lambda_2`
-            # is None, not 0.0: there is no graph to measure, and 0.0 is a real
-            # reading that means "totally disconnected".
+            # Same keys as an indexed corpus, so the console renders one shape.
+            # `lambda_2` is None, not 0.0: 0.0 is a real reading, meaning
+            # disconnected.
             "components": 0,
             "largest_component": 0,
             "isolated_nodes": 0,
@@ -256,14 +254,9 @@ def rpc_rag_stats(_: dict[str, Any]) -> dict[str, Any]:
     stats = kb_or_none.stats()
     stats["corpus"] = "indexed" if stats["total_chunks"] else "empty"
 
-    # A corpus rots in silence: it is a function of what is on disk, nothing
-    # rebuilds it automatically, and every counter above stays non-zero and
-    # internally consistent while it drifts. On 2026-09-09 this project's store
-    # held 8 documents against a walk offering 103 -- every project query
-    # scored under the relevance floor and the Researcher's seat answered from
-    # memory on every run, with nothing anywhere reporting a problem. The
-    # comparison is advisory and must never take the header down with it, so a
-    # failure to walk leaves the counters alone rather than replacing them.
+    # The corpus drifts from the archive silently: every counter above stays
+    # non-zero and consistent while retrieval finds less. The comparison is
+    # advisory, so a walk that fails leaves the counters alone.
     try:
         documents = [
             node
@@ -271,33 +264,15 @@ def rpc_rag_stats(_: dict[str, Any]) -> dict[str, Any]:
             if attrs.get("type") == "document"
         ]
         report = corpus_staleness(documents)
-        # A run in flight is the one time the corpus is *supposed* to be moving:
-        # the online research phase writes each page to disk and embeds it as a
-        # separate step, so between those two there is a file the walk can see
-        # and the store cannot. Observed live -- the header read
-        # "stale: 1 not indexed" mid-phase and cleared itself moments later.
-        # A verdict that flickers is the credibility problem the exact size test
-        # was built to avoid, so the *counts* stay (they are the truth about
-        # this instant) and only the accusation is withheld.
-        # A startup index is the same instant seen from the other phase: it
-        # prunes the store's stale rows before re-adding anything, so a poll
-        # landing inside one sees a corpus that is *mid-repair* of exactly what
-        # the verdict would accuse it of. Withheld on the same terms, and the
-        # counts stay, because they are the truth about this instant.
+        # Mid-run and mid-rebuild the corpus is supposed to be moving -- a page
+        # written but not yet embedded, a store being repaired -- so the
+        # verdict is withheld and the counts, true for this instant, stay.
         if report.get("stale") and (
-            _run_progress.get("running") or _startup_index.get("running")
+            _run_progress.get("running") or _background_rebuild.get("running")
         ):
             report = {**report, "stale": False, "settling": True}
-        # An empty corpus is not a drifting one. Staleness is worth reporting
-        # because a corpus that has stopped matching the project looks exactly
-        # like one that has not -- every counter non-zero and consistent while
-        # retrieval quietly finds nothing. A corpus holding nothing wears no
-        # such disguise: `corpus: empty` is the header's own word for it, it is
-        # what Clear leaves behind by design, and "112 not indexed" restates
-        # that as an accusation the operator just created on purpose and cannot
-        # act on except by starting the run that would rebuild it anyway. The
-        # counts stay, as they do under `settling`, because they are the truth
-        # about this instant; only the verdict is withheld.
+        # An emptied corpus is not a drifting one: `empty` already says so, and
+        # "not indexed" would accuse the operator of the Clear they just did.
         if report.get("stale") and stats["corpus"] == "empty":
             report = {**report, "stale": False, "emptied": True}
         stats["staleness"] = report
@@ -347,11 +322,7 @@ def rpc_query_graph(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def rpc_graph_overview(params: dict[str, Any]) -> dict[str, Any]:
-    """The whole corpus as one drawable graph, for the console's sweep.
-
-    One call where the console used to make one per document; see
-    `GraphRAGKnowledgeBase.overview` for why the result is the same.
-    """
+    """The whole corpus as one drawable graph, for the console's sweep."""
     min_degree = _int_param(params, "min_degree", 4, low=1, high=MAX_MIN_DEGREE)
     include_isolated = _bool_param(params, "include_isolated")
     kb_or_none = _open_kb()
@@ -388,44 +359,26 @@ def rpc_search_documents(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def _refuse_while_a_run_is_in_flight(action: str) -> None:
-    """Guard the corpus against being changed underneath a run.
+    """Refuse to change the corpus underneath a run or a rebuild.
 
-    Shared by the two methods that write to it, because the hazard is the same
-    for both and it is not the obvious one. Changing the corpus mid-run does
-    not break the Researcher's search -- that is the problem. A cleared corpus
-    returns no hits, and a corpus in the middle of a rebuild returns whatever
-    fraction of itself has been re-added so far; either reads as
-    `no_relevant_knowledge` and routes the run as though the knowledge base had
-    simply had nothing useful to say. Nothing raises, nothing is logged, and
-    the run goes on to plan around an absence that was manufactured out from
-    under it. The seat cannot find out, so the operator is told instead.
-
-    A startup index is refused on the same grounds and reported apart, because
-    it is the hazard without the run: `_index_the_project_at_startup` holds the
-    corpus mid-rebuild for tens of seconds with nothing running, so a clear
-    landing in there empties a store that is being re-added to and an upload
-    mutates the same graph the rebuild is walking. What the operator has to do
-    about it differs too -- a run is theirs to stop, a rebuild is theirs to wait
-    out -- and one refusal offering to stop a run that does not exist is the
-    wrong instruction rather than a vague one.
-
-    Reads both flags under `_run_lock` and names the goal, the way
-    `rpc_shutdown` refuses: a refusal that does not say what is running leaves
-    the operator to guess whether they still care about it.
+    Changing it mid-run breaks nothing visibly, which is the problem: a cleared
+    or half-rebuilt corpus reads to the Researcher as one with nothing to say,
+    and the run plans around an absence made out from under it. A background
+    rebuild is the same hazard without the run, worded apart because the
+    operator stops a run but waits out a rebuild.
 
     Args:
-        action: Past participle of what was refused -- "cleared", "rebuilt".
+        action: Past participle of what was refused -- "cleared", "added to".
 
     Raises:
-        ValueError: if a run or a rebuild is in flight. The console's `rpc()`
-            helper turns this into a telemetry line and the tab's status text.
+        ValueError: naming the goal in flight, or the rebuild.
     """
     with _run_lock:
         running = bool(_run_progress["running"])
         goal = str(_run_progress["goal"])
         # A run takes precedence in the wording: it is the one of the two the
         # operator can end, and a run started into a rebuild sets both flags.
-        indexing = bool(_startup_index["running"])
+        indexing = bool(_background_rebuild["running"])
 
     if running:
         detail = f" Running: {goal}" if goal else ""
@@ -435,7 +388,7 @@ def _refuse_while_a_run_is_in_flight(action: str) -> None:
         )
     if indexing:
         raise ValueError(
-            f"The corpus is being rebuilt to match the project, so it cannot be "
+            f"The corpus is being rebuilt to match the archive, so it cannot be "
             f"{action} right now. The header says how far it has got; try again "
             f"when it stops."
         )
@@ -449,14 +402,9 @@ def rpc_list_projects(_: dict[str, Any]) -> dict[str, Any]:
 def rpc_embed_project(params: dict[str, Any]) -> dict[str, Any]:
     """Opt a generated project into the corpus, or take it back out.
 
-    Records the choice on disk and starts the same background rebuild the
-    console runs at startup, so the project's files are embedded -- or pruned
-    -- by the one path that already reports progress and yields to a run. The
-    rebuild re-embeds only what changed, so opting one project in costs that
-    project's files and nothing else.
-
-    Refused mid-run and mid-rebuild for the reason the other corpus writers
-    are: see `_refuse_while_a_run_is_in_flight`.
+    Records the choice, then starts the background rebuild, which embeds or
+    prunes only what changed. Refused mid-run and mid-rebuild, like every corpus
+    writer (`_refuse_while_a_run_is_in_flight`).
     """
     name = _str_param(params, "name")
     embed = _bool_param(params, "embed", default=True)
@@ -467,11 +415,11 @@ def rpc_embed_project(params: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"There is no project {name!r} under projects/.")
     _refuse_while_a_run_is_in_flight("changed")
     set_project_embedded(name, embed)
-    forget_expected_documents()
-    rebuilding = INDEX_PROJECT_BEFORE_RUN
+    forget_cached_walk()
+    rebuilding = REBUILD_CORPUS
     if rebuilding:
         threading.Thread(
-            target=_index_the_project_at_startup,
+            target=_rebuild_the_corpus_in_background,
             args=(f"after {'embedding' if embed else 'removing'} {project_dir(name)}",),
             name="embed-project",
             daemon=True,
@@ -481,44 +429,25 @@ def rpc_embed_project(params: dict[str, Any]) -> dict[str, Any]:
         "embedded": embed,
         "rebuilding": rebuilding,
         "note": "" if rebuilding else (
-            "INDEX_PROJECT_BEFORE_RUN is off, so nothing will rebuild the "
+            "REBUILD_CORPUS is off, so nothing will rebuild the "
             "corpus; the choice is recorded for when it is back on."
         ),
     }
 
 
-# There is no `rpc_reindex`, and that is the design rather than an omission.
-# Rebuilding the corpus was a button on the Corpus tab, which made keeping the
-# corpus current a thing the operator had to know to do -- and the failure when
-# they did not know is silent: the search answers with whatever the store holds,
-# the seats plan around it, and every counter in the header stays non-zero and
-# self-consistent. `_index_the_project_before_the_run` does it on every run
-# instead, at the moment it matters and against the files as they are then.
-# Nor is there a script that does it, an install step, or anything else: two
-# things index, and both are a request for a corpus rather than housekeeping --
-# a run, which searches one, and embedding a document into the corpus from the
-# console, which is a request for a corpus to hold it.
+# There is no `rpc_reindex`: the corpus is rebuilt when the console starts,
+# before every run, when a project is opted in or out, and by the monitor after
+# an outage, so keeping it current is never the operator's job.
 
 
 def rpc_upload_document(params: dict[str, Any]) -> dict[str, Any]:
     """Embed one document the operator uploaded, from either upload control.
 
-    One method behind both of them -- the Engineer tab's attach button and the
-    Corpus tab's -- so the two entry points cannot come to mean different
-    things. The file is written under `uploads/` before it is embedded, which
-    is what puts it inside the next reindex rather than underneath it; see
-    `store_uploaded_document`.
-
-    Refused mid-run, like the other two writers, but for a different reason
-    than theirs. An upload only ever adds, so a Researcher would see more
-    rather than less -- what it cannot do is add while a search is reading the
-    graph, since `add_document` mutates the same networkx object
-    `neighborhood` and the lexical index iterate. And a run should be answered
-    by the corpus it started against either way.
-
-    One document per call. The console loops for a multi-file drop, so one
-    file that the corpus cannot take -- a PDF among the markdown -- fails on
-    its own and says so, instead of taking the batch down with it.
+    The file is written under `uploads/` before it is embedded, which puts it
+    inside the next rebuild rather than underneath it (`store_uploaded_document`).
+    Refused mid-run: an upload only adds, but `add_document` mutates the graph a
+    search is reading. One document per call, so a file the corpus cannot take
+    fails alone instead of taking a batch down with it.
     """
     _refuse_while_a_run_is_in_flight("added to")
     name = params.get("name", "")
@@ -526,22 +455,17 @@ def rpc_upload_document(params: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(name, str) or not isinstance(content, str):
         raise ValueError("An upload is a filename and its text; both must be strings.")
     report = store_uploaded_document(_kb_for_indexing(), name, content)
-    # An upload puts a *file* on disk, so the cached walk is now behind the
-    # corpus rather than ahead of it -- and the staleness report would call the
-    # freshly embedded document `extra` until the cache expired. This is the
-    # one writer that changes what the walk would find.
-    forget_expected_documents()
+    # The upload is a new file, so the cached walk is behind the corpus now;
+    # forgotten, or the new document would read as `extra`.
+    forget_cached_walk()
     return report
 
 
 def rpc_bottleneck(params: dict[str, Any]) -> dict[str, Any]:
     """The narrowest cut in the knowledge graph, and the nodes bridging it.
 
-    Read-only, and deliberately not part of the five-second poll: it is an
-    eigenvector plus a sweep over every edge, and it answers a question the
-    operator asks rather than one the header needs. Like `export_corpus` it
-    takes no run guard -- reading the corpus takes nothing away from the run
-    using it.
+    Read-only and off the poll: an eigenvector plus a sweep over every edge, for
+    a question the operator asks rather than one the header needs.
     """
     limit = _int_param(params, "limit", 12, low=1, high=MAX_LIST_LIMIT)
     kb_or_none = _open_kb()
@@ -570,15 +494,8 @@ def rpc_topics(params: dict[str, Any]) -> dict[str, Any]:
 def rpc_duplicate_entities(params: dict[str, Any]) -> dict[str, Any]:
     """Entities playing the same structural role: candidates to merge.
 
-    Read-only and off the poll, like `topics` and `bottleneck`. It proposes; it
-    never merges. `add_document` mints an entity per capitalised token, so the
-    duplicates are a property of the corpus rather than a fault to be repaired
-    behind the operator's back, and merging one is a decision about meaning
-    that the graph alone cannot make.
-
-    Candidates are generated from the names and the structure is the evidence,
-    not the other way round -- see `duplicate_entities` for the measurement
-    that settled which way that runs.
+    Read-only and off the poll. It proposes and never merges: merging is a
+    decision about meaning that the graph alone cannot make.
     """
     limit = _int_param(params, "limit", 20, low=1, high=MAX_LIST_LIMIT)
     name_similarity = _float_param(params, "name_similarity", None, low=0.0, high=1.0)
@@ -637,20 +554,14 @@ def rpc_set_seat(params: dict[str, Any]) -> dict[str, Any]:
     if not provider or not model:
         raise ValueError("Provider and model are both required")
 
-    # The dropdowns are `ollama ls` and nothing else, so a tab still showing an
-    # older list cannot seat a model the daemon no longer carries. A seat's
-    # *own* current model is the one exception, and it is not a courtesy: the
-    # console renders it under "Current" precisely when it is not in the list
-    # -- a seat configured from `.env` on a provider the offer does not carry --
-    # so refusing it makes that option unselectable and the only way back to
-    # where the process started is editing `.env` and restarting.
+    # Only what the dropdowns offer, so a stale tab cannot seat a model the
+    # daemon no longer has -- plus the seat's own current model, which the
+    # console lists under "Current" when the offer lacks it, or a seat
+    # configured from `.env` could never be selected back.
     allowed = {(o["provider"], o["model"]) for o in _seat_model_options()}
 
-    # `get_agent_model_info`, not `get_agent_status`: this asks a pure config
-    # question -- which model is seated -- and the status call answers a live
-    # one, reaching the daemon for `list_ollama_models` and `thinking_support`
-    # to derive liveness fields nothing here reads. `set_agent_llm` compares
-    # the seat the same way two lines below.
+    # Config, not liveness: `get_agent_status` would ask the daemon for fields
+    # nothing here reads.
     seated = get_agent_model_info(agent)
     allowed.add((seated["provider"], seated["model"]))
 
@@ -683,12 +594,9 @@ def rpc_set_thinking(params: dict[str, Any]) -> dict[str, Any]:
 def _seat_model_options() -> list[dict[str, str]]:
     """Every tag `ollama ls` reports that a seat can run, and nothing else.
 
-    The daemon is the only source: nothing is offered from a list kept here, so
-    a tag someone pulls shows up on the next poll and one they remove goes.
-    A tag whose capabilities say no `completion` (the embedder) is left out;
-    one the daemon would not describe stays in -- "could not ask" is not "cannot
-    run". Cloud tags (`:cloud`, `-cloud`) are listed by the daemon once pulled
-    or used, and are grouped apart from weights that run on this machine.
+    A tag whose capabilities lack `completion` (the embedder) is left out; one
+    the daemon would not describe stays in -- "could not ask" is not "cannot
+    run". Cloud tags are grouped apart from weights on this machine.
     """
     options = []
     for tag in list_ollama_models():
@@ -728,13 +636,12 @@ def _embedding_choice() -> dict[str, Any]:
 
 
 def rpc_embedding_options(_: dict[str, Any]) -> dict[str, Any]:
-    """The embedding model -- a single one, served by the Ollama daemon.
+    """The embedding model -- the only one, served by the Ollama daemon.
 
-    `qwen3-embedding:latest` is the only embedding model. The entry carries the
-    state of the corpus and the relevance floor measured against it -- `None`
-    until the first run on a whole corpus has measured one. The card reports
-    rather than offers (`set_embedding_model` refuses by name), so there is no
-    `switchable`: nothing here can be switched.
+    The entry carries the state of the corpus and the relevance floor measured
+    against it, `None` until the first run on a whole corpus has measured one.
+    The card reports rather than offers: a corpus is only ever built and
+    searched by the model it was built with.
     """
     return {
         "active": EMBEDDING_MODEL_NAME,
@@ -743,37 +650,11 @@ def rpc_embedding_options(_: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def rpc_set_embedding_model(params: dict[str, Any]) -> dict[str, Any]:
-    """Switch the embedding model -- not supported. There is only the one.
-
-    This endpoint is kept for compatibility but always refuses:
-    `qwen3-embedding:latest` is the only embedding model, served by the local
-    Ollama daemon, and a corpus is only ever built and searched by the model it
-    was built with.
-    """
-    raise ValueError(
-        "Switching embedding models is not supported. qwen3-embedding:latest "
-        "is the only embedding model and is served by the local Ollama daemon."
-    )
-
-
 def rpc_status(_: dict[str, Any]) -> dict[str, Any]:
-    """Everything the console polls for: the embedding model and the corpus.
+    """What the console polls for: the embedding model and the corpus.
 
-    `corpus` is `absent`, `empty` or `indexed`. The older `graphrag` boolean is
-    kept beside it -- `launch_console.sh` polls this route as its readiness
-    check -- but it collapses the first two, and they are the pair worth
-    telling apart: nothing was ever indexed, versus a corpus that exists and
-    holds nothing.
-
-    The seats are deliberately **not** here. They used to arrive four ways at
-    once -- `agents`, `selected` (the same dict serialised twice), `degraded`,
-    and the Architect's seat again as `llm` -- and nothing read one of them:
-    the console draws its crew from `list_seats`, which is the one place a seat
-    is reported. Both routes are polled every five seconds, so every open tab
-    swept all four seats twice a tick to build half a payload it threw away.
-    A field with no reader is worse than absent: the next person to need seat
-    state here cannot tell which of the four the page believes.
+    `corpus` is `absent` (nothing was ever indexed), `empty` or `indexed`. The
+    seats are not here: the console draws them from `list_seats` alone.
     """
     try:
         state, embedding_model = corpus_state()
@@ -781,44 +662,32 @@ def rpc_status(_: dict[str, Any]) -> dict[str, Any]:
         state, embedding_model = "absent", "unknown"
 
     return {
-        # The embedding model is the one thing that would run on this machine,
-        # and it is not loaded until something indexes or searches.
+        # The embedding model, which is not loaded until something indexes or
+        # searches.
         "embedding": embedding_model,
-        # Where it runs, which only a loaded model can say: the setting names a
-        # device, and a card with no kernels or no room leaves the model on the
-        # CPU. Read without loading anything, so `active` is None until
-        # something has embedded.
+        # Where it runs, which only a loaded model can say; `active` is None
+        # until something has embedded.
         "embedding_device": embedding_device_status(),
         "corpus": state,
-        # Whether a run would build the corpus itself from here. Reported
-        # rather than assumed by the console, which otherwise has to promise
-        # on the operator's behalf that the next run will index the project --
-        # a promise `INDEX_PROJECT_BEFORE_RUN=0` makes false, in the one place
-        # someone looks to find out why retrieval is empty.
-        "indexes_on_run": INDEX_PROJECT_BEFORE_RUN,
-        # Whether a rebuild is in flight right now, and how far it has got. The
-        # header has to say so: a first index is tens of seconds during which
-        # the corpus reads `absent` and the staleness verdict is withheld, and
-        # without this the console shows a server that has decided to do
-        # nothing about either.
-        "indexing": _startup_index_status(),
-        # Whether a run is in flight, whoever started it. The console keeps the
-        # Graph tab blank while a run or a rebuild can load the embedder: the
-        # model is pinned wholly to two 3 GB cards, and a browser rasterising a
-        # two-thousand-node SVG at the moment of the load is VRAM the load then
-        # does not get. A run started from another tab has to count too.
+        # Whether a run rebuilds the corpus first. Reported, not assumed:
+        # `REBUILD_CORPUS=0` makes empty retrieval the expected answer.
+        "indexes_on_run": REBUILD_CORPUS,
+        # Whether a rebuild is in flight, and how far it has got: meanwhile the
+        # corpus may read `absent` and the stale verdict is withheld, and the
+        # header says why.
+        "indexing": _background_rebuild_status(),
+        # Whether a run is in flight, from any tab: the console keeps the Graph
+        # tab blank while the embedder may load, since drawing a large SVG
+        # takes GPU memory the load needs.
         "run_in_flight": _run_in_flight(),
         # What an upload may be, for the console's pickers and tooltips. From
         # the walk's own list, so the page cannot promise a different one.
         "indexable_suffixes": list(INDEXABLE_SUFFIXES),
-        "graphrag": state == "indexed",
     }
 
 
-# What the in-flight run has done so far. A run is many cloud calls long, and
-# the POST that started it does not return until all of them are done, so
-# without this the console can only show elapsed seconds -- a working run and a
-# wedged one look exactly alike from the browser.
+# What the in-flight run has done so far. The POST that started it returns only
+# when the run ends, so without this a working run and a wedged one look alike.
 _run_progress: dict[str, Any] = {
     "running": False,
     "goal": "",
@@ -832,11 +701,8 @@ _run_progress: dict[str, Any] = {
 }
 _run_lock = threading.Lock()
 
-# The last run's final state, kept so a stop is recoverable. Until now the
-# final state was returned to the caller and then dropped: a stopped run whose
-# partial plan, research and builder report were lost would be no better than
-# killing the server, which is the thing the stop exists to replace. Also
-# written to disk, so it survives a page reload and a restart.
+# The last run's final state, so a stopped run is recoverable; also on disk, so
+# it survives a reload and a restart.
 _last_run_snapshot: dict[str, Any] | None = None
 RUNS_DIR = Path(__file__).parent / "runs"
 LAST_RUN_PATH = RUNS_DIR / "last_run.json"
@@ -879,32 +745,24 @@ def _load_snapshot() -> dict[str, Any] | None:
         return _last_run_snapshot
     return None
 
-# Wall-clock budget for one run. MAX_STEPS bounds how many times the Architect
-# may send work back, which is the right logical bound but says nothing about
-# how long that takes: giving the Builder a tool loop raised the cost of a
-# single step from about four cloud calls to as many as eleven, and a step is
-# only as fast as the slowest model in it. A run that never converges was
-# reaching tens of minutes with nothing to show. This bounds the symptom
-# directly and does not have to be re-guessed when a seat or a model changes.
+
+# Wall-clock budget for one run, checked between supersteps. MAX_STEPS bounds
+# how often the Architect sends work back, not how long that takes.
 RUN_BUDGET_SECONDS = float(os.getenv("RUN_BUDGET_SECONDS", "300"))
 
 
 def rpc_run_progress(_: dict[str, Any]) -> dict[str, Any]:
     """A snapshot of the run currently in flight, for the console to poll."""
     with _run_lock:
-        # `ACTIVITY` is read inside `_run_lock`, although it carries a lock of
-        # its own, because its turn record is reset as a run is claimed under
-        # this one. Read beside it, a reply could pair the new run's `running`
-        # with the last run's turns, and a console would light a seat for a
-        # turn that belongs to a run already over.
+        # `ACTIVITY` is read under `_run_lock` because its turn record is reset
+        # as a run is claimed under this lock: read beside it, a reply could
+        # pair the new run's `running` with the last run's turns.
         return {
             "running": bool(_run_progress["running"]),
             "goal": str(_run_progress["goal"]),
             "node": str(_run_progress["node"]),
-            # `node` is the seat that last *finished* -- `graph.stream` yields
-            # on completion -- which is what the feed lists. `active` is the
-            # seat whose node is on the stack right now. They are usually
-            # different, and during the slowest node of the run they always are.
+            # `node` is the seat that last finished (`graph.stream` yields on
+            # completion); `active` is the seat working now.
             "active": ACTIVITY.current(),
             "active_for": round(ACTIVITY.busy_for(), 1),
             # What the console's seat lights are driven from. `active` is only
@@ -939,15 +797,10 @@ def rpc_embedding_activity(_: dict[str, Any]) -> dict[str, Any]:
 def rpc_stop_run(params: dict[str, Any]) -> dict[str, Any]:
     """Ask the run in flight to stop at its next safe boundary.
 
-    Cooperative, and returns immediately: this only sets a flag. Work already
-    started -- a file write, a staged commit, a test run, a model call -- runs
-    to completion, because abandoning it would leave a half-written file or a
-    worker still writing into the project. So the run ends within one tool call
-    or one model call, not instantly, and the caller is told so.
-
-    Served on a different thread from the run it stops: `rpc_run_goal` blocks
-    its own request thread for the whole run, which is why the server is a
-    ThreadingHTTPServer.
+    Cooperative, and returns at once: work already started -- a write, a
+    commit, a test run, a model call -- finishes first, so the run ends within
+    one call, not instantly. Served on its own thread, since `rpc_run_goal`
+    holds its request thread for the whole run.
     """
     run_id = _str_param(params, "run_id")
     reason = _str_param(params, "reason")
@@ -962,9 +815,9 @@ def rpc_stop_run(params: dict[str, Any]) -> dict[str, Any]:
         return {"stopping": False, "run_id": armed, "detail": detail}
 
     with _run_lock:
-        # The stop above is what sends the run to its teardown, and that
-        # teardown clears this flag under this same lock. Setting it blind
-        # pinned "STOPPING" on a run that had already ended.
+        # Only while still running: the teardown the stop triggers clears this
+        # flag under the same lock, and setting it blind would pin "STOPPING"
+        # on an ended run.
         if _run_progress["running"]:
             _run_progress["stopping"] = True
 
@@ -1007,9 +860,9 @@ def _finish_run() -> None:
     sees it finished and takes the exit itself. Exactly one of those happens.
     """
     RUN_CONTROL.disarm()
-    # Belt and braces behind each node's own `finally`: a run that ended is a
-    # run with no seat working, and a light left on would claim otherwise for
-    # as long as the console stayed open.
+    HEALING.end_healing_session()
+    # A run that ended has no seat working, whatever a node's own `finally`
+    # did.
     ACTIVITY.clear()
     with _run_lock:
         _run_progress["running"] = False
@@ -1024,26 +877,16 @@ def _finish_run() -> None:
 def rpc_shutdown(params: dict[str, Any]) -> dict[str, Any]:
     """Exit the server -- what the console's X asks for.
 
-    A run in flight is not killed by surprise. Without `stop_first` this
-    refuses and says what is running, so the console can ask; with it, the run
-    is stopped through the ordinary emergency stop and the exit is deferred to
-    the run's own `finally`. That deferral is the point: it is what puts the
-    snapshot on disk before the process ends, so an exit mid-run is as
-    recoverable as a stop.
+    A run in flight is never killed by surprise: without `stop_first` this
+    refuses and names it; with it, the run is stopped and the exit waits for the
+    run's own `finally`, so its snapshot is on disk before the process ends.
     """
     stop_first = _bool_param(params, "stop_first")
 
-    # Read the run's state and claim the exit in one hold of `_run_lock`.
-    # Claiming it afterwards lost the exit outright: `RUN_CONTROL.stop()` below
-    # is what makes the run race for its own `finally`, and a run sitting at a
-    # superstep boundary gets there in microseconds. It would read
-    # `_exit_after_run` unset, decline to request the shutdown -- correctly, on
-    # what it could see -- and by the time this function set the flag there was
-    # no longer a run left to honour it. Nothing then set `_shutdown_requested`
-    # at all: the process stayed up, the console sat on "Closing..." until its
-    # own patience ran out, and `stopping` stayed pinned True on a run that had
-    # already finished. Set inside the lock and *before* the stop, so the flag
-    # is always in place before the run it defers to can look at it.
+    # Read the run's state and claim the exit in one hold of `_run_lock`,
+    # before the stop below: a run at a superstep boundary reaches its
+    # `finally` in microseconds, and one that found the flag unset would never
+    # request the exit.
     with _run_lock:
         running = bool(_run_progress["running"])
         goal = str(_run_progress["goal"])
@@ -1063,11 +906,9 @@ def rpc_shutdown(params: dict[str, Any]) -> dict[str, Any]:
         }
 
     if running:
-        # The run may already have finished between the lock above and here.
-        # That is safe now and needs no branch: `_exit_after_run` was set while
-        # the run was still live, so its `finally` saw the flag and requested
-        # the shutdown itself. This stop then lands on a disarmed control and
-        # is refused, which is exactly right.
+        # If the run finished since the lock above, it saw the flag and
+        # requested the exit itself; this stop then lands on a disarmed control
+        # and is refused, correctly.
         RUN_CONTROL.stop("", "Stopped so the console could exit.")
         return {
             "exiting": True,
@@ -1085,22 +926,17 @@ def rpc_shutdown(params: dict[str, Any]) -> dict[str, Any]:
 def _calibrate_the_floor_before_the_run(corpus_report: dict[str, Any]) -> dict[str, Any]:
     """Measure the relevance floor the first time the corpus is whole.
 
-    A cosine similarity means nothing absolute and nothing across models, so
-    the floor is never a constant: the run that finishes building the corpus
-    asks `embedding_calibration.json`'s twelve questions the corpus answers and
-    twelve it cannot, and puts the floor in the middle of the gap. A model that
-    leaves no gap gets none, and then the Researcher's model answers every
-    search and the Planner gets no map, rather than a borrowed number misfiling
-    some question silently.
-
-    Skipped when the corpus phase did not leave a whole corpus: a stopped or
-    failed build would calibrate against a fraction of the project.
+    A cosine means nothing absolute and nothing across models, so the floor is
+    measured, never set: `embedding_calibration.json` holds questions the
+    corpus answers and questions it cannot, and the floor sits in the gap. A
+    model that leaves no gap gets no floor. Skipped unless the corpus phase left
+    a whole corpus.
     """
     if floor_calibration() is not None:
         return {"source": "known", "model": EMBEDDING_MODEL_NAME}
     if RUN_CONTROL.stopped() or corpus_report.get("stopped"):
         return {"source": "stopped", "model": EMBEDDING_MODEL_NAME}
-    if corpus_report.get("source") in ("error", "nothing_to_index"):
+    if corpus_report.get("source") in ("error", "nothing_to_index", "unavailable"):
         return {"source": "no_corpus", "model": EMBEDDING_MODEL_NAME}
     kb_or_none = _open_kb()
     if kb_or_none is None or corpus_state()[0] != "indexed":
@@ -1132,7 +968,7 @@ def _calibration_feed_line(report: dict[str, Any]) -> str | None:
             return (
                 f"[Embedder] {model} left no gap between the two populations ({span}), "
                 "so it has no relevance floor: the Researcher's model answers every "
-                "search and the Planner gets no project map."
+                "search and the Planner gets no corpus map."
             )
         return (
             f"[Embedder] Measured a relevance floor for {model}: {span}, so retrieval "
@@ -1147,39 +983,22 @@ def _calibration_feed_line(report: dict[str, Any]) -> str | None:
     return None
 
 
-# One corpus, so one rebuild at a time. Two callers ask for one now -- the
-# startup index below and a run's own phase -- and `index_project_files` prunes
-# the store's stale rows and clears the graph *before* it re-adds anything, so
-# two of them interleaved produce neither caller's result: the second clear
-# lands on the first's half-built graph and both report success. That is the
-# half-rebuilt corpus `_refuse_while_a_run_is_in_flight` exists to stop an
-# operator manufacturing by hand, reachable without an operator.
+# One corpus, so one rebuild at a time: `index_corpus_files` prunes and clears
+# before it re-adds, so two interleaved rebuilds both report success on a half-
+# built corpus.
 #
-# Lock order: whoever wants both takes **this** one first and `_run_lock`
-# briefly inside it, never the other way round. The startup index holds this
-# for its whole build and reaches for `_run_lock` from its `progress` and
-# `should_stop`; a run claims `_run_progress` under `_run_lock`, releases it,
-# and only then asks for this. Reversing either side would be a cycle with a
-# whole build's width to land in.
+# Lock order: this one first, `_run_lock` briefly inside it, never the reverse.
 _index_lock = threading.Lock()
 
-# Where the cross-process claim is taken, beside the store and named after it,
-# so it keys the thing being protected: two consoles rebuilding one checkout
-# share a corpus directory and therefore this file, while two checkouts share
-# neither. Outside `knowledge/` rather than in it, because creating that
-# directory is the one act reserved for indexing -- a lock file inside it would
-# leave a corpus directory behind on a machine that turned out to have nothing
-# to index, which is the door-and-walk ordering the phases go to some trouble
-# to get right.
+# The cross-process claim is a file beside the store, named after it, so two
+# consoles on one corpus share it and two checkouts do not. Outside
+# `knowledge/`, because creating that directory is reserved for indexing.
 CORPUS_LOCK_SUFFIX = ".lock"
 
-# How long a run waits out a rebuild another process is running. A cold build
-# of this project is ~52s and a changed-only one is seconds, so this clears a
-# foreign cold build with room to spare; past it the run goes ahead against the
-# corpus as it stands and says so, because a run that hangs indefinitely behind
-# another process is worse than a run against a corpus that is one rebuild old.
-# The startup index waits 0 instead: whoever holds the lock is rebuilding the
-# same corpus from the same walk, so there is nothing to wait for.
+# How long a run waits out a rebuild another process is running before going
+# ahead against the corpus as it stands: longer than a cold build. The
+# background rebuild waits 0, since the holder is rebuilding the same corpus
+# from the same walk.
 CORPUS_LOCK_WAIT_SECONDS = 180.0
 
 # How often the wait above re-tries, which is also how quickly it notices a stop.
@@ -1195,37 +1014,18 @@ except ImportError:  # pragma: no cover - Windows has no flock
 def _claim_the_rebuild(
     wait_seconds: float, should_stop: Callable[[], bool], waiting: Callable[[], None]
 ) -> "Iterator[bool]":
-    """Hold the right to rebuild this corpus, across threads *and* processes.
+    """Hold the right to rebuild this corpus, across threads and processes.
 
-    `_index_lock` serializes the two phases inside one process, and that is all
-    it can do: two consoles started in one checkout share the store on disk and
-    not the lock in memory, so both could prune and clear it at once. That was
-    hard to reach while a run was the only thing that rebuilt -- two runs at
-    once needed two servers *and* someone starting a goal in each -- and the
-    startup index makes it ordinary: every console rebuilds the moment it comes
-    up, so two consoles is two rebuilds with nothing between them. The port
-    stops the common case (the server binds before this thread starts, so a
-    second console on the same port never gets here) and stops nothing on
-    `PORT=8081`.
+    `_index_lock` serializes the phases inside one process; two consoles in one
+    checkout share the store but not that lock, so the claim is also an `flock`
+    on a file beside the store. The kernel releases it when the process dies,
+    so a stale claim cannot exist, and it is taken without blocking, so "someone
+    else is rebuilding" is an answer rather than an unbounded wait.
 
-    So the claim is an `flock` on a file beside the store. Three properties are
-    why it is that and not a pid file: the kernel owns it, so it is released by
-    the process *dying* as surely as by the process finishing and there is no
-    such thing as a stale claim to clear up; the file's existence means nothing,
-    so a leftover empty file after a reboot claims naught; and it is taken
-    non-blockingly, so "somebody else is rebuilding" is an answer rather than a
-    wait nobody bounded. `flock` conflicts between two descriptors in one
-    process as well, so this would serialize the two phases on its own --
-    `_index_lock` is kept because a lock in memory is where a *waiting* thread
-    belongs, and because it means only one thread per process ever opens the
-    file.
-
-    Yields True when the claim is held for the body, False when another process
-    holds it and `wait_seconds` ran out. A machine where the claim cannot be
-    taken at all -- no `fcntl`, or a directory that cannot be written -- yields
-    True and relies on `_index_lock` alone: the lock is an extra guarantee about
-    a rare collision, and refusing to index because it could not be taken would
-    turn that into a corpus nobody rebuilds.
+    Yields True when the claim is held, False when another process holds it
+    past `wait_seconds`. Where no claim can be taken at all -- no `fcntl`, or a
+    directory that cannot be written -- it yields True on `_index_lock` alone:
+    refusing to index would turn a rare collision into a corpus nobody rebuilds.
     """
     with _index_lock:
         handle = None
@@ -1233,10 +1033,8 @@ def _claim_the_rebuild(
             granted = True
             if fcntl is not None:
                 try:
-                    # Appended rather than `with_suffix`, which *replaces* one:
-                    # a corpus directory called `my.knowledge` would otherwise
-                    # be claimed through `my.lock`, a name shared with anything
-                    # else called `my.<something>`.
+                    # Appended, not `with_suffix`, which replaces a suffix:
+                    # `my.knowledge` would claim through `my.lock`.
                     store = resolve_persist_dir()
                     path = store.parent / (store.name + CORPUS_LOCK_SUFFIX)
                     handle = path.open("a+")
@@ -1246,11 +1044,8 @@ def _claim_the_rebuild(
                     granted = _flock_until(handle, wait_seconds, should_stop, waiting)
             yield granted
         finally:
-            # Closing the descriptor releases the flock; the file stays, holding
-            # nothing, which is the point of not keeping the claim in its
-            # contents. Explicit rather than left to collection: refcounting
-            # would close it on the way out of this frame today, and a traceback
-            # holding the frame is all it takes for "today" to stop being true.
+            # Closing the descriptor releases the flock; the empty file stays
+            # and claims nothing.
             if handle is not None:
                 handle.close()
 
@@ -1280,13 +1075,11 @@ def _flock_until(
             return False
         time.sleep(CORPUS_LOCK_POLL_SECONDS)
 
-# What the startup index is doing, for the console header. Not a field of
-# `_run_progress`: a startup index is not a run, and the stop button, the
-# recovery block and the snapshot all key off that dict -- a corpus rebuild
-# reported there would offer the operator a Stop that stops nothing and would
-# be restored from `runs/last_run.json` as though a run had happened. Guarded
-# by `_run_lock`, which is only ever held briefly, never across a build.
-_startup_index: dict[str, Any] = {"running": False, "message": "", "report": {}}
+
+# What the background rebuild is doing, for the console header. Not part of
+# `_run_progress`: a rebuild is not a run, and the stop button, the recovery
+# block and the snapshot all key off that dict. Guarded by `_run_lock`.
+_background_rebuild: dict[str, Any] = {"running": False, "message": "", "report": {}}
 
 
 def _rebuild_the_corpus(
@@ -1297,35 +1090,21 @@ def _rebuild_the_corpus(
     wait_seconds: float = 0.0,
     waiting: Callable[[], None] = lambda: None,
 ) -> dict[str, Any]:
-    """Make the corpus match the project, once, serialized against the other caller.
+    """Make the corpus match the archive, once, serialized against every other rebuild.
 
-    Shared by the two phases that rebuild it -- `_index_the_project_at_startup`
-    and `_index_the_project_before_the_run` -- so what a rebuild *did* is
-    classified in one place. `_corpus_feed_line` renders that vocabulary, and
-    two copies of it would drift into two accounts of the same five outcomes.
-    Each caller keeps its own wording: one writes into the run feed, the other
-    into the console header and the server log.
+    Shared by both phases so what a rebuild did is classified in one place,
+    which `_corpus_feed_line` renders. `announce(total)` is called once the walk
+    has found something and before any work. Not at all when there is nothing:
+    the walk is counted before the creating door opens, so a machine with
+    nothing to index keeps reporting `absent`, and the claim is taken after it,
+    so such a machine is left without even a lock file.
 
-    `announce(total)` is called once the walk has something in it, before any
-    work, because a first index is tens of seconds and both callers have to say
-    so before going quiet rather than after. It is **not** called when there is
-    nothing to index, which is what keeps the walk counted before the creating
-    door is opened -- see `_index_the_project_before_the_run` for why a machine
-    with nothing to index must keep reporting `absent` rather than `empty`. The
-    same ordering is why the claim below is taken after the walk: no work, no
-    lock file, so a machine with nothing to index is left exactly as it was.
-
-    `wait_seconds` and `waiting` belong to the cross-process claim; see
-    `_claim_the_rebuild`. A rebuild that could not be claimed is
-    `busy_elsewhere`, which is neither a failure nor a no-op: another process is
-    doing this work right now, and the report has to say so rather than let the
-    caller read "nothing changed".
-
-    Never raises. A corpus that could not be built makes for a worse run, not a
-    refused one, and the report says which of these happened.
+    A rebuild another process holds is `busy_elsewhere` -- neither a failure nor
+    a no-op. Never raises: a corpus that could not be built makes for a worse
+    run, not a refused one, and the report says which.
     """
     state, _ = corpus_state()
-    files = iter_project_files()
+    files = iter_corpus_files()
     # An empty walk over an existing store is still work: whatever the store
     # holds is no longer in the archive and has to be pruned.
     if not files and state == "absent":
@@ -1341,7 +1120,7 @@ def _rebuild_the_corpus(
                     "corpus": state,
                     "waited_s": round(time.monotonic() - started, 1),
                 }
-            report = index_project_files(
+            report = index_corpus_files(
                 _kb_for_indexing(), progress=progress, should_stop=should_stop
             )
     except Exception as exc:
@@ -1349,6 +1128,8 @@ def _rebuild_the_corpus(
 
     if report.get("stopped"):
         source = "stopped_midway"
+    elif report.get("unavailable"):
+        source = "unavailable"
     elif state != "indexed":
         source = "built"
     elif report.get("embedded") or report.get("dropped"):
@@ -1361,93 +1142,43 @@ def _rebuild_the_corpus(
         model=EMBEDDING_MODEL_NAME,
         elapsed_s=round(time.monotonic() - started, 1),
     )
+    with _run_lock:
+        _last_rebuild.clear()
+        _last_rebuild.update(report)
     return report
 
 
-def _index_the_project_at_startup(when: str = "at startup") -> None:
-    """Bring the corpus up to date when the console comes up.
+def _rebuild_the_corpus_in_background(when: str = "at startup") -> dict[str, Any] | None:
+    """Bring the corpus up to date without a run: at startup, and on request.
 
-    Also what `rpc_embed_project` starts, with its own `when`: opting a
-    project in or out changes the walk, and this is the rebuild that already
-    reports itself in the header and yields to a run.
+    `main()` starts it once the server is serving (never at import, which every
+    test does, and never ahead of readiness, which `launch_console.sh` polls);
+    `rpc_embed_project` and the self-healing monitor start it with their own
+    `when`. A run wins and does not wait: `should_stop` is "a run has claimed
+    the flag, or the console is exiting", and the run's own phase finishes the
+    job, reusing every vector already embedded. A second console finds the
+    claim taken (`_claim_the_rebuild`) and leaves the corpus to it.
 
-    Rebuilding the corpus was a run's job alone, and a run is something the
-    operator asks for -- so between runs the header reported drift it had no
-    way to fix, and restarting the server did not clear it: starting up only
-    *opens* the store, and the one thing that rebuilds it was behind a request
-    to search it. There is no Reindex button either; it was removed because a
-    run does this, which was the right reason and left the state where a run is
-    not what the operator wants unattended.
-
-    Observed on 2026-09-18. A commit added `ollama_client.py` and put
-    `experimental/` into `PROJECT_INDEX_EXCLUDES`; the store was two days older
-    than both, so the header read `stale: 1 not indexed, 1 not in the walk` and
-    went on reading it across every restart, correctly and permanently. The
-    only route to a current corpus was to start a run nobody wanted, which is
-    the button again wearing a worse hat -- and a standing stale verdict that
-    the operator cannot act on is the credibility problem `corpus_health`
-    measures every file's size twice to avoid, one level up.
-
-    Five decisions in it are not interchangeable with the obvious alternatives.
-
-    *It is started from `main()` and never at import.* This module used to fill
-    `kb` from a thread started at import, so importing it -- which the whole
-    test suite does -- created a store on disk and loaded the embedding model
-    whether or not anybody wanted a corpus. `main()` is the one entry point
-    that means a person is running the console.
-
-    *It does not block readiness.* `launch_console.sh` polls `/api/status` and
-    opens a browser when it answers, so indexing before `serve_forever` would
-    present a server that never came up -- tens of seconds warm on this
-    project, minutes on a first build. It runs on its own thread, the header
-    reports it, and the staleness verdict is withheld while it does, for the
-    reason it is withheld mid-run.
-
-    *A run wins, and does not wait.* `should_stop` is "a run has claimed the
-    flag, or the console is exiting", so a run started into a build takes over
-    within one embedding batch and finishes the job through its own phase --
-    what is already embedded keeps its vectors, so nothing is done twice.
-    Making the *run* wait instead would hold `running` True with no node on the
-    stack for up to a whole build, which is exactly what a wedged run looks
-    like from the console.
-
-    *It counts the walk before it opens the door*, through `_rebuild_the_corpus`
-    -- a machine with nothing to index must keep reporting `absent`, because
-    only `absent` means nothing has ever been built here.
-
-    *And it obeys `INDEX_PROJECT_BEFORE_RUN`.* One switch rather than two,
-    because there is one question -- may this machine rebuild its own corpus --
-    and a machine that wants a frozen corpus wants it frozen at startup too.
-
-    The relevance floor is still measured by the first run rather than here:
-    `_calibrate_the_floor_before_the_run` writes into the run feed, and a
-    corpus this phase has just finished makes that a matter of seconds.
-
-    Two *consoles* in one checkout are a different collision and are not
-    `_index_lock`'s to stop -- they share the store on disk and not the lock in
-    memory. The port stops the common case, since the server binds before this
-    thread starts and a second console on the same port never gets here, and it
-    stops nothing on `PORT=8081`. This was a rare shape while a run was the only
-    thing that rebuilt, needing two servers *and* a goal started in each; a
-    phase that rebuilds the moment a console comes up makes it ordinary, so
-    `_claim_the_rebuild` takes an `flock` beside the store and a second console
-    finds the corpus `busy_elsewhere` and leaves it alone -- correctly, since the
-    process holding it is rebuilding the same corpus from the same walk.
+    Returns the rebuild's report, or None when `REBUILD_CORPUS` is off or a
+    rebuild is already under way.
     """
-    if not INDEX_PROJECT_BEFORE_RUN:
-        return
+    if not REBUILD_CORPUS:
+        return None
 
-    # Raised before the walk rather than with the file count, so the flag covers
-    # the whole phase: `_refuse_while_a_run_is_in_flight` reads it, and a window
-    # where a rebuild is under way and says it is not is the window an upload
-    # lands in. `announce` then names the count once there is one.
+    # Claimed before the walk rather than with the file count, so the flag
+    # covers the whole phase: `_refuse_while_a_run_is_in_flight` reads it, and a
+    # rebuild under way that says it is not is the window an upload lands in.
+    # Checked in the same hold, so a second caller finds one under way and
+    # leaves it to finish the same walk.
     with _run_lock:
-        _startup_index["running"] = True
-        _startup_index["message"] = "checking the archive against the corpus"
+        if _background_rebuild["running"]:
+            return None
+        _background_rebuild["running"] = True
+        _background_rebuild["message"] = "checking the archive against the corpus"
 
     def announce(total: int) -> None:
         with _run_lock:
-            _startup_index["message"] = (
+            _background_rebuild["message"] = (
                 f"checking {total} archive file(s) against the corpus"
             )
         print(
@@ -1458,7 +1189,7 @@ def _index_the_project_at_startup(when: str = "at startup") -> None:
     def progress(done: int, total: int) -> None:
         # Rewritten in place, so a slow build reads as moving rather than stuck.
         with _run_lock:
-            _startup_index["message"] = f"indexing: {done} of {total} file(s) checked"
+            _background_rebuild["message"] = f"indexing: {done} of {total} file(s) checked"
 
     def should_stop() -> bool:
         if _shutdown_requested.is_set():
@@ -1468,7 +1199,7 @@ def _index_the_project_at_startup(when: str = "at startup") -> None:
 
     def waiting() -> None:
         with _run_lock:
-            _startup_index["message"] = "another process is rebuilding this corpus"
+            _background_rebuild["message"] = "another process is rebuilding this corpus"
 
     try:
         report = _rebuild_the_corpus(
@@ -1482,22 +1213,19 @@ def _index_the_project_at_startup(when: str = "at startup") -> None:
             waiting=waiting,
         )
     finally:
-        # In a `finally` for the reason a run's bookkeeping is: a phase that
-        # raised where nothing expected it to would otherwise leave `running`
-        # True forever on a thread that has died, and every later upload and
-        # clear would be refused by a rebuild that is not happening -- with no
-        # run to stop and no way back but restarting the console. The phase is
-        # allowed to raise (a dead thread with a traceback is a fault someone
-        # can read); it is not allowed to leave that behind.
+        # In a `finally`: a phase that raised must not leave `running` set, or
+        # every later upload and clear is refused by a rebuild that is not
+        # happening.
         with _run_lock:
-            _startup_index["running"] = False
-            _startup_index["message"] = ""
+            _background_rebuild["running"] = False
+            _background_rebuild["message"] = ""
     with _run_lock:
-        _startup_index["report"] = report
+        _background_rebuild["report"] = report
 
     line = _corpus_feed_line(report, when=when)
     if line is not None:
         print(line)
+    return report
 
 
 def _run_in_flight() -> bool:
@@ -1505,105 +1233,41 @@ def _run_in_flight() -> bool:
         return bool(_run_progress["running"])
 
 
-def _startup_index_status() -> dict[str, Any]:
+def _background_rebuild_status() -> dict[str, Any]:
     """What the header needs: whether a rebuild is in flight, and its last word."""
     with _run_lock:
         return {
-            "running": bool(_startup_index["running"]),
-            "message": str(_startup_index["message"]),
-            "source": str(_startup_index["report"].get("source", "")),
+            "running": bool(_background_rebuild["running"]),
+            "message": str(_background_rebuild["message"]),
+            "source": str(_background_rebuild["report"].get("source", "")),
         }
 
 
-def _index_the_project_before_the_run() -> dict[str, Any]:
-    """Make the corpus match the project, before any seat searches it.
+def _rebuild_the_corpus_before_the_run() -> dict[str, Any]:
+    """Make the corpus match the archive, before any seat searches it.
 
-    A fresh install has no corpus, and nothing used to bring one into being
-    except the operator asking for it by name. Missing that costs nothing
-    visible: `search_knowledge_graph` answers `no_corpus`, `_gather_research`
-    falls through to the Researcher's own model, and the Builder works from
-    whatever that model remembers. Nothing raises, nothing is logged, and the
-    run reports itself finished. The same silence covers the other half of the
-    problem -- a corpus that was built once and has been drifting from the
-    project ever since. Measured here on 2026-09-09: 8 documents in the store
-    against a walk offering 103, every project query under
-    the relevance floor, and `rag_stats` reporting `indexed` with every
-    counter non-zero and consistent.
+    Runs on every run, however recent the startup rebuild: that one may have
+    been stopped, lost a race with a file written seconds ago, or be as old as
+    the console. Rebuilding is cheap when nothing changed, since
+    `index_corpus_files` keeps every vector whose text still hashes the same,
+    and it compares content, so it sees an edit the staleness report cannot.
 
-    Both were left to a button. There is no button now: this runs on **every**
-    run, and it is why there is nothing left for anyone to press. It is no
-    longer the only phase that rebuilds -- `_index_the_project_at_startup` does
-    the same work when the console comes up, because a run is something the
-    operator asks for and the corpus drifts between runs. This one stays, and
-    stays unconditional: the startup index can have been stopped by the
-    operator exiting, can have lost a race with a file written seconds ago, and
-    on a long-running console is as old as the console is.
+    It runs before the online research phase, which embeds its pages on top, and
+    not at all once the run is stopped: `index_corpus_files` clears the graph up
+    front, so an abandoned rebuild is a half-built corpus. A discussion run still
+    does it -- it embeds files already on disk, and changes nothing else.
 
-    Five decisions in it are not interchangeable with the obvious
-    alternatives.
-
-    *It rebuilds every time rather than only when the corpus is missing.* That
-    is affordable because `index_project_files` keeps the vectors of documents
-    whose text still hashes to what the store holds -- measured warm on this
-    project, 52.0s to re-embed 77 files and 0.09s when nothing changed, with
-    the embedding model never loaded in the second case. A rebuild gated on
-    `absent`/`empty` would have been cheap in the same way and would have left
-    drift exactly where it was: the state that needs fixing most is the one
-    where every counter already looks right.
-
-    *It compares content, not the walk.* `corpus_staleness` answers the
-    header's question -- which documents are in one and not the other -- and it
-    cannot see an edit, because an edited file is in both. The Builder edits
-    files, so that is the common case here rather than the exotic one.
-
-    *It runs before the online research phase, not after.* That phase embeds
-    the pages it keeps and writes them under `research/web/`, which is inside
-    the walk -- so a rebuild afterwards would re-read them from disk, and a
-    rebuild before leaves them to be added on top. Going second also meant a
-    corpus holding nothing but fetched pages counted above zero. A test pins
-    the order.
-
-    *It counts the walk before it opens the door*, now through
-    `_rebuild_the_corpus`, which both phases share. `_kb_for_indexing()`
-    creates the store, so calling it on a machine with nothing to index leaves
-    an empty corpus behind and every later poll reports `empty` where the truth
-    is `absent` -- and only one of those two means anything is wrong. That is
-    exactly the mistake `research_online` made by resolving its door on the way
-    in, one caller along, and it is guarded the same way: ask what there is to
-    index first.
-
-    *And a run already stopped does not start one.* The check is before the
-    work rather than inside it, like every stop check guarding something that
-    cannot be half-done: `index_project_files` clears the graph up front, so a
-    rebuild abandoned midway is the half-finished corpus
-    `_refuse_while_a_run_is_in_flight` exists to stop anyone else from
-    manufacturing.
-
-    A discussion run still does it, where it never researches online. That
-    phase brings in material from outside and makes it a permanent corpus
-    member; this one embeds files already on disk into a runtime artifact a
-    reindex reproduces exactly, and adds nothing to the project. "Nothing was
-    changed" is a promise about the project, and it still holds.
-
-    Never raises. A corpus that could not be built makes for a worse run, not a
-    refused one, and the report says which of these happened.
+    Never raises; the report says what happened.
     """
-    if not INDEX_PROJECT_BEFORE_RUN:
+    if not REBUILD_CORPUS:
         return {"source": "disabled", "corpus": corpus_state()[0]}
     if RUN_CONTROL.stopped():
         return {"source": "stopped", "corpus": corpus_state()[0]}
 
     def announce(total: int) -> None:
-        # Said before the work rather than after it. A first index takes tens of
-        # seconds, and for all of them `running` is True with no node on the
-        # stack and no messages -- which is precisely what a wedged run looks
-        # like from the console. This is the same reason `#run-live` names the
-        # last stage instead of only counting seconds. A rebuild that changes
-        # nothing overwrites this line in under a second and nobody reads it.
-        # It is also what the operator sees while this phase waits out a startup
-        # index that has not yet noticed the run: `_rebuild_the_corpus` calls it
-        # before reaching for `_index_lock`, so the wait is a phase that has
-        # said what it is doing rather than a silence.
+        # Said before the work: a first build takes tens of seconds, and a run
+        # with no node on the stack and no messages looks wedged. It also
+        # covers the wait for a background rebuild to notice the run.
         with _run_lock:
             _run_progress["messages"] = [
                 f"[Corpus] Checking {total} archive file(s) against the {EMBEDDING_MODEL_NAME} "
@@ -1631,48 +1295,27 @@ def _index_the_project_before_the_run() -> dict[str, Any]:
         announce=announce,
         progress=progress,
         should_stop=RUN_CONTROL.stopped,
-        # The run waits, where the startup index does not: this phase is what
-        # makes the corpus whole before any seat searches it, and a fraction of a
-        # corpus reads to the Researcher as a corpus with nothing to say.
+        # The run waits, where the background rebuild does not: a fraction of a
+        # corpus reads to the Researcher as one with nothing to say.
         wait_seconds=CORPUS_LOCK_WAIT_SECONDS,
         waiting=waiting,
     )
 
 
 def _corpus_feed_line(report: dict[str, Any], *, when: str = "before the run") -> str | None:
-    """One line for the feed on every run that checked the corpus.
+    """One line for the feed whenever a rebuild checked the corpus.
 
-    `when` is the only thing the startup index changes about it: the same five
-    outcomes read as a lie if a phase that ran when the console came up reports
-    having indexed "before the run". Everything else -- the counts, the split
-    between re-read and unchanged, what it means for the Researcher -- is the
-    same account of the same work, which is why there is one of these rather
-    than one per caller.
-
-    It used to say nothing when the corpus already matched the project, on the
-    argument that a line on every run is a line nobody reads by the third one.
-    That was wrong in a way worth recording, because the silence is
-    indistinguishable from the phase not having run: a rebuild that re-embeds
-    nothing takes ~0.1s and loads no model, so an operator watching a second
-    run sees the corpus line from the first one and then, for the rest of the
-    project's life, nothing -- and reasonably concludes no embedding ever
-    happens. That is the same failure `#run-live` fixed by naming the last
-    stage instead of only counting seconds: a working run and a run that
-    skipped the work must not look identical. The `current` line is therefore
-    the *cheapest* one to write and the most often read, and it says what it
-    checked rather than merely that it ran.
-
-    `disabled` is the one state that still says nothing, and for a reason that
-    does not apply above: it is a machine-level setting the operator chose,
-    which the console header already reports on every poll, rather than
-    something that happened to this run.
+    `when` is all the background rebuild changes about it. The `current` line
+    is said too, since silence would be indistinguishable from the phase never
+    having run; only `disabled`, a setting the header already reports, says
+    nothing.
     """
     source = report.get("source", "")
     if source == "disabled":
         return None
     if source == "current":
         return (
-            f"[Corpus] The corpus already matched the project, so nothing was "
+            f"[Corpus] The corpus already matched the archive, so nothing was "
             f"re-embedded: {report.get('indexed', 0)} document(s), "
             f"{report.get('total_chunks', 0)} passage(s), checked in "
             f"{report.get('elapsed_s', 0)}s. The Researcher searches it as it "
@@ -1702,7 +1345,7 @@ def _corpus_feed_line(report: dict[str, Any], *, when: str = "before the run") -
                 "has nothing to retrieve."
             )
         return (
-            f"[Corpus] {was}, so the project was indexed {when}: "
+            f"[Corpus] {was}, so the archive was indexed {when}: "
             f"{report['indexed']} document(s), {report.get('total_chunks', 0)} "
             f"passage(s) in {report.get('elapsed_s', 0)}s.{note} The Researcher "
             "searches this like any other corpus."
@@ -1714,12 +1357,12 @@ def _corpus_feed_line(report: dict[str, Any], *, when: str = "before the run") -
         if changed:
             parts.append(f"{changed} document(s) re-read")
         if dropped:
-            parts.append(f"{dropped} no longer in the project dropped")
+            parts.append(f"{dropped} no longer in the archive dropped")
         return (
-            f"[Corpus] The corpus was behind the project, so it was brought up "
+            f"[Corpus] The corpus was behind the archive, so it was brought up "
             f"to date {when}: {', '.join(parts)}, {report.get('reused', 0)} "
             f"unchanged, in {report.get('elapsed_s', 0)}s.{note} The Researcher "
-            "searches the project as it is now."
+            "searches the archive as it is now."
         )
     if source == "stopped_midway":
         return (
@@ -1728,6 +1371,13 @@ def _corpus_feed_line(report: dict[str, Any], *, when: str = "before the run") -
             f"{report.get('embedded', 0)} embedded, in {report.get('elapsed_s', 0)}s. "
             "The next run carries on from there: what is already embedded keeps its "
             "vectors."
+        )
+    if source == "unavailable":
+        return (
+            f"[Corpus] The embedder could not be reached {when}, so the rebuild "
+            f"stopped after {report.get('indexed', 0)} document(s): "
+            f"{report.get('unavailable')}.{note} The console rebuilds the corpus "
+            "once the daemon answers again."
         )
     if source == "nothing_to_index":
         return (
@@ -1756,71 +1406,21 @@ def _corpus_feed_line(report: dict[str, Any], *, when: str = "before the run") -
 def _research_online_before_the_run(goal: str, requested: bool) -> dict[str, Any]:
     """Search the web for the goal and embed what earns a place. Never raises.
 
-    Runs only when the caller asked for it (`requested`), and the caller is the
-    operator -- never an agent, exactly as `expect_failures` is. That is a
-    measured decision, not caution. Three gates were built and graded against
-    thirteen hand-labelled pages from two real runs, and all three failed:
-    ranking fetched pages against the project's own documents (a keyword-dense
-    marketing page outscores every file in the checkout), skipping the phase
-    when the corpus already answers the goal (backwards on the measurement --
-    0.351 for a goal needing no web at all, 0.405 for one that did), and the
-    calibrated relevance floor itself (3/13: every page cleared it).
-    The lambda run shows why no fourth threshold will do better -- the *wrong*
-    pages outscore the right ones on both instruments, 0.553-0.631 for AWS
-    Lambda deployment guides against 0.459-0.550 for the Dolphin model pages
-    the goal was actually about. "LAMBDA" meant a model on this machine and
-    the web means AWS; "local project data" is, as a bag of words, generic
-    project-documentation advice. The information that settles it is the
-    operator's intent, and it is in no comparison of goal text to page text.
+    Only when the operator asked (`requested`), never by an agent's choice:
+    three automatic gates were built and graded against hand-labelled pages,
+    and all three failed -- whether the web helps is the operator's intent, and
+    no comparison of goal text to page text recovers it. A kept page is a
+    permanent corpus member, so guessing wrong costs every later run.
 
-    The cost of guessing wrong is not one bad run. A fetched page becomes a
-    permanent corpus member indistinguishable from project knowledge: after the
-    run of 2026-09-11 the five blogs it kept took every one of the top five
-    retrieval slots for that goal, shutting the project's own files out
-    entirely, and would have gone on answering any query near "project
-    documentation" for as long as they sat there.
-
-    This runs **before** `graph.stream` and never during it, and that ordering
-    is the design rather than a convenience. `_refuse_while_a_run_is_in_flight`
-    refuses every other corpus write while a run is live because a corpus
-    changing underneath the Researcher manufactures an absence no seat can
-    detect: a rebuild half-done returns whatever fraction of itself has been
-    re-added, which reads as `no_relevant_knowledge` and routes the run around
-    a gap created out from under it. Doing the research first is not a way
-    around that rule -- it is the only ordering that obeys it. By the time the
-    Architect opens, the corpus is whole and stays that way for the rest of the
-    run.
-
-    It reaches the Researcher through the **corpus**, not through state. There
-    is deliberately no path by which a fetched page skips retrieval: the pages
-    are embedded, and the Researcher finds them with the same search, the same
-    hybrid re-rank and the same relevance floor it applies to everything else.
-    A web page that cannot be retrieved for this goal should not reach the
-    Builder just because it was fetched for it.
-
-    The creating door (`_kb_for_indexing`) is correct here, unlike everywhere
-    else the console reads: this *is* indexing, and a goal researched against a
-    machine with no corpus should leave one behind holding what it found. The
-    staleness report will then say, accurately, that the project's own files
-    are still missing from it.
-
-    It is handed over **unopened** for that same sentence to hold. Passing
-    `_kb_for_indexing()` created the store on the way into a phase that had not
-    yet read a page and might never store one -- switched off, or a goal the
-    web cannot answer -- so a machine that had never been indexed came out of
-    its first run reporting `empty` instead of `absent`. `research_online`
-    calls it on the first page that earns a place.
-
-    Every failure is swallowed into the report. A goal the web cannot answer,
-    a search engine that is down, a machine with no network -- none of those is
-    a reason to refuse to run against the corpus already on disk, and the
-    report distinguishes them so the feed can say which happened.
+    It runs before `graph.stream`, the one ordering that keeps the corpus still
+    while the Researcher searches it, and reaches the Researcher through the
+    corpus alone: a page that cannot be retrieved for this goal does not reach
+    the Builder because it was fetched for it. The creating door is handed over
+    unopened, so a run that stores nothing leaves no corpus behind.
     """
     if not requested:
-        # Kept apart from `disabled` for the reason `search_web` keeps its three
-        # empty outcomes apart: "this run did not ask" and "this machine has it
-        # switched off" call for different things from the operator, and an
-        # empty count reads identically in both.
+        # Kept apart from `disabled`: "not asked" and "switched off" call for
+        # different things from the operator.
         return {"source": "not_requested", "documents": 0, "considered": 0, "note":
                 "Online research was not requested for this run."}
     if RUN_CONTROL.stopped():
@@ -1834,18 +1434,16 @@ def _research_online_before_the_run(goal: str, requested: bool) -> dict[str, Any
     # The phase writes files under research/web/, so the cached walk is now
     # behind what is on disk and the header would call the freshly embedded
     # pages `extra` until it expired.
-    forget_expected_documents()
+    forget_cached_walk()
     return report
 
 
 def _research_feed_line(report: dict[str, Any]) -> str:
     """One line for the feed, saying what the phase actually did.
 
-    Worded so the three empty outcomes cannot be mistaken for each other, for
-    the reason `search_web` keeps them apart in the first place: "the web had
-    nothing on this" and "we never asked" and "we asked and it broke" call for
-    completely different things from the operator, and an empty count reads
-    identically in all three.
+    Worded so the empty outcomes cannot be mistaken for one another: "the web
+    had nothing", "nobody asked" and "it broke" need different things from the
+    operator, and an empty count reads the same in all three.
     """
     source = report.get("source", "")
     considered = report.get("considered", 0)
@@ -1875,37 +1473,109 @@ def _research_feed_line(report: dict[str, Any]) -> str:
     )
 
 
+def _before_the_run(goal: str, research_web: bool) -> tuple[list[str], dict[str, Any]]:
+    """Ready the corpus, its floor and online research: (opening lines, research report).
+
+    All three write to the corpus, so all three run before `graph.stream` --
+    the one ordering `_refuse_while_a_run_is_in_flight` allows -- and the corpus
+    goes first; see `_rebuild_the_corpus_before_the_run`.
+    """
+    corpus_report = _rebuild_the_corpus_before_the_run()
+    corpus_line = _corpus_feed_line(corpus_report)
+    if corpus_line:
+        print(f"[run] corpus -> {corpus_line}")
+
+    # The floor needs the whole corpus: measured after the rebuild, before any
+    # seat searches.
+    calibration_line = _calibration_feed_line(
+        _calibrate_the_floor_before_the_run(corpus_report)
+    )
+    if calibration_line:
+        print(f"[run] calibration -> {calibration_line}")
+
+    research_report = _research_online_before_the_run(goal, research_web)
+    research_line = _research_feed_line(research_report)
+    print(f"[run] research -> {research_line}")
+    lines = [line for line in (corpus_line, calibration_line, research_line) if line]
+    return lines, research_report
+
+
+def _how_it_ended(
+    last: Mapping[str, Any], *, stopped: bool, over_budget: bool, elapsed: int, node_at_stop: str
+) -> str | None:
+    """The closing line for a run the emergency stop or the budget ended, or None."""
+    # Both exits are checked between supersteps, so the Architect may already
+    # have ruled `approved` when one lands: the verdict is read, not assumed.
+    verdict_clause = (
+        "The Architect had already ruled approved; the loop was ending anyway"
+        if str(last.get("verdict", "")) == "approved"
+        else "without an approved verdict"
+    )
+    if stopped:
+        return (
+            f"[Graph] Stopped by the emergency stop after {elapsed}s, at the "
+            f"{node_at_stop or 'first'} boundary, {verdict_clause}. "
+            "Nothing further was started. Anything already written is listed "
+            "below, and anything nobody ran is unproven rather than working."
+        )
+    if over_budget:
+        return (
+            f"[Graph] Stopped after {elapsed}s, over the {int(RUN_BUDGET_SECONDS)}s "
+            f"budget, {verdict_clause}. The work above is what the run "
+            "produced. Raise RUN_BUDGET_SECONDS to give it longer."
+        )
+    return None
+
+
+def _run_payload(
+    last: Mapping[str, Any],
+    run_id: str,
+    *,
+    stopped: bool,
+    over_budget: bool,
+    elapsed_s: int,
+    web_research: dict[str, Any],
+    **extra: Any,
+) -> dict[str, Any]:
+    """The run's final state, plus how the run ended -- which AgentState does not hold."""
+    payload = dict(last)
+    payload.update(
+        run_id=run_id,
+        stopped=stopped,
+        stop_reason=RUN_CONTROL.reason() if stopped else "",
+        over_budget=over_budget,
+        elapsed_s=elapsed_s,
+        finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+        web_research=web_research,
+        healing=HEALING.events(session_id=run_id),
+        **extra,
+    )
+    return payload
+
+
 def rpc_run_goal(params: dict[str, Any]) -> dict[str, Any]:
-    """Run a goal through the four-agent loop and return the final state."""
+    """Run a goal through the four-agent loop and return the final state.
+
+    One run at a time: it is checked, claimed and armed in one hold of
+    `_run_lock`, and everything after the claim sits in a try/finally, so
+    whatever raises, the run is released and its snapshot written.
+    """
     run_id = uuid.uuid4().hex
+    # Everything is parsed before anything is claimed or touched, so a refused
+    # parameter never leaves a run armed with nothing behind it.
     goal = _str_param(params, "goal")
-    # Refused before the lock is claimed or the corpus touched. A blank goal
-    # otherwise indexed the project and put four seats to work on nothing, and
-    # only the console's own textarea stood in the way -- `/api/run` and any
-    # other caller went straight through.
     if not goal.strip():
         raise ValueError("A run needs a goal, and this one was empty.")
-    # Parsed before anything is claimed, so a refused flag never leaves a run
-    # armed with nothing behind it.
     discuss_only = _bool_param(params, "discuss_only")
     research_web = _bool_param(params, "research_web")
     expect_failures = _bool_param(params, "expect_failures")
-    # Where the Builder writes: a project under projects/, or this checkout
-    # when blank. The caller's choice, never an agent's.
+    # Where the Builder writes: a project under projects/, or this checkout when
+    # blank. The caller's choice, never an agent's.
     project = _str_param(params, "project").strip()
     if project and (error := project_name_error(project)):
         raise ValueError(error)
     output_dir = project_dir(project) if project and not discuss_only else ""
 
-    # One run at a time, said out loud. The server already assumed it --
-    # `_run_progress` is a single global -- and the console could break the
-    # assumption, because the textarea's Enter handler was not gated behind the
-    # disabled Run button. It also makes the stop unambiguous: there is exactly
-    # one run for a Stop to mean.
-    #
-    # Checked and claimed under one lock, arming included. Two acquisitions
-    # would leave a window where two POSTs both pass the check, and a stop
-    # armed outside it could reach a run that was then refused.
     with _run_lock:
         if _run_progress["running"]:
             raise ValueError(
@@ -1924,44 +1594,12 @@ def rpc_run_goal(params: dict[str, Any]) -> dict[str, Any]:
             stopping=False,
         )
 
-    state: AgentState = {
-        "goal": goal,
-        # Seeded below with what the pre-run phases said, rather than pushed
-        # only to `_run_progress`, which every node update overwrites
-        # wholesale: those lines have to survive into the final payload and the
-        # snapshot, because what the run was told is part of how its result
-        # should be read.
-        "messages": [],
-        "architecture": "",
-        "verdict": "",
-        "plan": "",
-        "research": "",
-        "builder_report": "",
-        "next_agent": "Researcher",
-        "research_status": "",
-        "blockers": "",
-        "files_changed": [],
-        "failed_verification": [],
-        "unverified": [],
-        "builder_cut_off": "",
-        "lint_failed": [],
-        # Opt-out for goals whose product is a file that does not run. Off
-        # unless the caller asks, so the default stays strict. Untouched by the
-        # stop: a file nobody executed is unproven, not expected-to-fail, and
-        # goes on blocking approval either way.
-        "expect_failures": expect_failures,
-        # Reasoning without acting: the Builder is offered no tools at all.
-        # Set by the caller, never by an agent.
-        "discuss_only": discuss_only,
-        # Held out of the corpus until the operator embeds it; see
-        # `langgraph_agent.projects`.
-        "output_dir": output_dir,
-        "step_count": 0,
-    }
-    # Streamed rather than invoked so the last state survives the ceiling.
-    # `graph.invoke` raises GraphRecursionError with no partial result, so a run
-    # that ran for minutes and produced real work reported nothing at all --
-    # from the console it was indistinguishable from a request never sent.
+    state = initial_state(
+        goal,
+        expect_failures=expect_failures,
+        discuss_only=discuss_only,
+        output_dir=output_dir,
+    )
     last = state
     research_report: dict[str, Any] = {}
     started = time.monotonic()
@@ -1969,62 +1607,24 @@ def rpc_run_goal(params: dict[str, Any]) -> dict[str, Any]:
     stopped = False
     node_at_stop = ""
 
-    # Everything from the claim above to the end is in a try/finally, so the
-    # bookkeeping runs whatever raises. Without it a run that died left
-    # `running` True forever and the console polled a run that no longer
-    # existed -- and the snapshot, which is the whole recovery story, would only
-    # ever be written by runs that did not need recovering. The pre-run phases
-    # are inside it too: they used to run between the claim and the `try`, so
-    # one that raised left the run claimed with nothing behind it -- every later
-    # run refused as "already in flight", every upload and clear refused, and
-    # an exit waiting on a `finally` that would never come.
     try:
-        # The corpus first, then online research, then the Architect opens.
-        # Both phases write to the corpus and both run outside `graph.stream`,
-        # because `_refuse_while_a_run_is_in_flight` forbids every other writer
-        # from touching it once the stream starts -- doing them here is not a
-        # way around that rule but the only ordering that obeys it. Which of
-        # the two goes first is itself load-bearing: see
-        # `_index_the_project_before_the_run`.
-        corpus_report = _index_the_project_before_the_run()
-        corpus_line = _corpus_feed_line(corpus_report)
-        if corpus_line:
-            print(f"[run] corpus -> {corpus_line}")
-
-        # The embedder has no relevance floor until its corpus is whole, so it
-        # is measured here: after the corpus phase, before any seat searches.
-        calibration_report = _calibrate_the_floor_before_the_run(corpus_report)
-        calibration_line = _calibration_feed_line(calibration_report)
-        if calibration_line:
-            print(f"[run] calibration -> {calibration_line}")
-
-        # Online research is off unless the caller asks, the same shape as
-        # `expect_failures` and for the same reason: what this turns on cannot
-        # be judged from the goal. A discussion run never researches online
-        # whatever the box says -- the phase writes pages under research/web/
-        # and embeds them, which is a change to this machine and to every later
-        # run's corpus. "No actions" has to mean that too, so the two flags are
-        # resolved here rather than left to the operator to keep consistent.
-        research_report = _research_online_before_the_run(
-            goal, research_web and not discuss_only
-        )
-        research_line = _research_feed_line(research_report)
-        print(f"[run] research -> {research_line}")
-        opening = [
-            line
-            for line in (corpus_line, calibration_line, research_line)
-            if line
-        ]
+        HEALING.start_healing_session(run_id)
+        # A discussion run never researches online, whatever the box says: the
+        # phase writes pages to disk and into every later run's corpus.
+        opening, research_report = _before_the_run(goal, research_web and not discuss_only)
+        # Into the state as well as the feed: what the run was told is part of
+        # how its result should be read.
         state["messages"] = list(opening)
         with _run_lock:
             _run_progress["messages"] = list(opening)
 
-        # The budget is the graph's, as it always was: RUN_BUDGET_SECONDS is
-        # checked between supersteps, and the phases above are bounded by
-        # their own limits. Reset here so their time is not charged to it.
+        # The budget is the graph's; the phases above are bounded by their own
+        # limits, so their time is not charged to it.
         started = time.monotonic()
         if output_dir:
             Path(output_dir).mkdir(parents=True, exist_ok=True)
+        # Streamed rather than invoked, so the last state survives the
+        # recursion ceiling: `graph.invoke` raises with no partial result.
         try:
             for event in graph.stream(state, {"recursion_limit": RECURSION_LIMIT}):
                 for node, node_state in event.items():
@@ -2035,14 +1635,10 @@ def rpc_run_goal(params: dict[str, Any]) -> dict[str, Any]:
                     with _run_lock:
                         _run_progress["node"] = node
                         _run_progress["messages"] = messages
-                    # Also on the server's own terminal: a run that is working and
-                    # a run that is wedged are otherwise indistinguishable there too.
                     print(f"[run] {node} -> {messages[-1] if messages else '...'}")
 
-                # Both checks sit between supersteps, so the run stops at a node
-                # boundary with its state intact rather than mid-call. The nodes
-                # carry their own stop checks as well; this one is the backstop
-                # that guarantees the run ends however far in the seats got.
+                # Between supersteps, so the run stops at a node boundary with
+                # its state intact; the nodes' own stop checks come first.
                 if RUN_CONTROL.stopped():
                     stopped = True
                     node_at_stop = str(_run_progress["node"])
@@ -2059,48 +1655,22 @@ def rpc_run_goal(params: dict[str, Any]) -> dict[str, Any]:
             ]
 
         elapsed = int(time.monotonic() - started)
-
-        # "without an approved verdict" is the usual case and was written as if
-        # it were the only one. It is not: both exits are checked *between*
-        # supersteps, so a stop or a budget that expires while the Architect is
-        # ruling lands after that ruling is already in state. Measured on
-        # 2026-09-09 -- a stop sent while the gate was working produced
-        # "[Architect] Verdict: approved" immediately above "[Graph] Stopped ...
-        # without an approved verdict", the run's own record contradicting
-        # itself in the one place anyone finds out how it ended. The verdict is
-        # read rather than assumed.
-        ruled = str(last.get("verdict", "")) == "approved"
-        verdict_clause = (
-            "The Architect had already ruled approved; the loop was ending anyway"
-            if ruled
-            else "without an approved verdict"
-        )
-        if stopped:
-            last["messages"] = [
-                *last.get("messages", []),
-                f"[Graph] Stopped by the emergency stop after {elapsed}s, at the "
-                f"{node_at_stop or 'first'} boundary, {verdict_clause}. "
-                "Nothing further was started. Anything already written is listed "
-                "below, and anything nobody ran is unproven rather than working.",
-            ]
-        elif over_budget:
-            last["messages"] = [
-                *last.get("messages", []),
-                f"[Graph] Stopped after {elapsed}s, over the {int(RUN_BUDGET_SECONDS)}s "
-                f"budget, {verdict_clause}. The work above is what the run "
-                "produced. Raise RUN_BUDGET_SECONDS to give it longer.",
-            ]
-
-        # Run-level facts, added to the payload rather than to AgentState:
-        # AgentState describes what the agents wrote, not how the run ended.
-        payload = dict(last)
-        payload.update(
-            run_id=run_id,
+        ending = _how_it_ended(
+            last,
             stopped=stopped,
-            stop_reason=RUN_CONTROL.reason() if stopped else "",
+            over_budget=over_budget,
+            elapsed=elapsed,
+            node_at_stop=node_at_stop,
+        )
+        if ending:
+            last["messages"] = [*last.get("messages", []), ending]
+
+        payload = _run_payload(
+            last,
+            run_id,
+            stopped=stopped,
             over_budget=over_budget,
             elapsed_s=elapsed,
-            finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
             web_research=research_report,
             project_embedded=bool(project) and project in embedded_projects(),
         )
@@ -2108,22 +1678,140 @@ def rpc_run_goal(params: dict[str, Any]) -> dict[str, Any]:
         return payload
     except Exception as exc:
         # A run that raised still produced whatever it produced, and that is
-        # exactly the case where the operator most wants it back.
-        payload = dict(last)
-        payload.update(
-            run_id=run_id,
+        # when the operator most wants it back.
+        _save_snapshot(_run_payload(
+            last,
+            run_id,
             stopped=stopped,
-            stop_reason=RUN_CONTROL.reason() if stopped else "",
             over_budget=over_budget,
             elapsed_s=int(time.monotonic() - started),
-            finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
-            error=str(exc),
             web_research=research_report,
-        )
-        _save_snapshot(payload)
+            error=str(exc),
+        ))
         raise
     finally:
         _finish_run()
+
+
+# --------------------------------------------------------------------------
+# Self-healing: health checks, the monitor, and what the console reads of them
+# --------------------------------------------------------------------------
+
+# How often the console checks the services it depends on and repairs what it
+# can: an open circuit is re-probed, and a corpus whose last rebuild stopped
+# because the embedder could not be reached is rebuilt once it answers again.
+HEALTH_CHECK_SECONDS = float(os.getenv("HEALTH_CHECK_SECONDS", "30"))
+
+# The latest answer from each service, as `{status, details}` per component.
+_health: dict[str, dict[str, str]] = {}
+_health_lock = threading.Lock()
+
+# The newest rebuild either phase finished, for the monitor to judge.
+_last_rebuild: dict[str, Any] = {}
+
+
+def _check_health() -> dict[str, dict[str, str]]:
+    """Ask each service the console depends on whether it is answering."""
+    results: dict[str, dict[str, str]] = {}
+    # Through the daemon's circuit: while it is open this is a refusal, and
+    # once the cooldown is over this probe is the trial call that closes it.
+    try:
+        version = daemon_request("/api/version", timeout=3.0)
+        results["ollama-daemon"] = {
+            "status": "healthy",
+            "details": f"Ollama {version.get('version', '?')} at {ollama_base_url()}",
+        }
+    except CircuitOpenError as exc:
+        results["ollama-daemon"] = {"status": "unhealthy", "details": str(exc)}
+    except Exception as exc:
+        results["ollama-daemon"] = {
+            "status": "unhealthy",
+            "details": f"{ollama_base_url()}: {type(exc).__name__}: {exc}",
+        }
+
+    search = search_backend_health()
+    if search is not None:
+        results["searxng"] = search
+
+    with _run_lock:
+        last = dict(_last_rebuild)
+    if last.get("source") == "unavailable":
+        results["corpus"] = {
+            "status": "unhealthy",
+            "details": "the last rebuild stopped because the embedder could not be reached",
+        }
+    else:
+        results["corpus"] = {"status": "healthy", "details": f"corpus {corpus_state()[0]}"}
+    return results
+
+
+def _heal() -> None:
+    """One pass of the monitor: check every service, then repair what can be repaired."""
+    results = _check_health()
+    with _health_lock:
+        previous = dict(_health)
+        _health.clear()
+        _health.update(results)
+    for component, result in results.items():
+        if result["status"] != previous.get(component, {}).get("status"):
+            HEALING.log_health_check(component, result["status"], result["details"])
+
+    # A rebuild stopped by an unreachable embedder is finished once it is back.
+    # Nothing else rebuilds on its own: any other failure is not one waiting
+    # on a service, and a run rebuilds before it starts anyway.
+    if (
+        REBUILD_CORPUS
+        and results["corpus"]["status"] == "unhealthy"
+        and results["ollama-daemon"]["status"] == "healthy"
+        and not _run_in_flight()
+    ):
+        when = "after the embedder came back"
+        report = _rebuild_the_corpus_in_background(when)
+        if report is not None:  # None: another rebuild was already under way
+            recovered = report.get("source") not in ("unavailable", "error", "busy_elsewhere")
+            HEALING.log_recovery_action(
+                "rebuild corpus", "corpus", recovered,
+                _corpus_feed_line(report, when=when) or str(report.get("source", "")),
+            )
+
+
+def _self_healing_monitor() -> None:
+    """Run `_heal` now and every `HEALTH_CHECK_SECONDS` until the console exits."""
+    while True:
+        try:
+            _heal()
+        except Exception as exc:  # the monitor must outlive any one bad pass
+            HEALING.error(f"A self-healing pass failed: {type(exc).__name__}: {exc}",
+                          action="monitor_failed")
+        if _shutdown_requested.wait(HEALTH_CHECK_SECONDS):
+            return
+
+
+def rpc_healing(params: dict[str, Any]) -> dict[str, Any]:
+    """Self-healing at a glance: circuits, service health, and the journal after `since`."""
+    since = _int_param(params, "since", 0, low=0, high=MAX_EVENT_SEQUENCE)
+    with _health_lock:
+        health = {name: dict(result) for name, result in _health.items()}
+    return {
+        "circuits": circuit_states(),
+        "health": health,
+        "events": HEALING.events(since=since),
+        "session": HEALING.session_id,
+        "interval_s": HEALTH_CHECK_SECONDS,
+    }
+
+
+def rpc_reset_circuit(params: dict[str, Any]) -> dict[str, Any]:
+    """Close a circuit now, for an operator who knows its service is back."""
+    name = _str_param(params, "name")
+    if not name:
+        raise ValueError("Name the circuit to reset.")
+    try:
+        closed = reset_circuit(name)
+    except KeyError:
+        raise ValueError(f"There is no circuit called {name!r}.") from None
+    HEALING.log_recovery_action("reset circuit", name, True, "asked for from the console")
+    return {"reset": closed, "circuits": circuit_states()}
 
 
 RPC_METHODS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
@@ -2145,22 +1833,18 @@ RPC_METHODS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "set_thinking": rpc_set_thinking,
     "llm_options": rpc_llm_options,
     "embedding_options": rpc_embedding_options,
-    "set_embedding_model": rpc_set_embedding_model,
     "status": rpc_status,
     "run_goal": rpc_run_goal,
     "run_progress": rpc_run_progress,
     "embedding_activity": rpc_embedding_activity,
     "stop_run": rpc_stop_run,
     "last_run": rpc_last_run,
+    "healing": rpc_healing,
+    "reset_circuit": rpc_reset_circuit,
     "shutdown": rpc_shutdown,
 }
 
-# Methods the console polls on a timer. Logging these buries everything else.
-# `llm_options` is not polled on a timer of its own -- it rides along with
-# `list_seats` in the console's `loadCrew`, which is how it was missed when the
-# rest of this set was written. It is the same 5s cadence either way: it left
-# 851 of the 1233 lines in one session's log, so the run that session was
-# started to look at could not be found by reading it.
+# Methods the console polls on a timer; logging them buries everything else.
 QUIET_METHODS = {
     "status",
     "rag_stats",
@@ -2171,18 +1855,14 @@ QUIET_METHODS = {
     # Polled several times a second, though only while a search or an upload of
     # the console's own is in flight; a run's poll carries the same reading.
     "embedding_activity",
+    "healing",
 }
 
 
-# Where the console listens. Loopback unless the operator says otherwise, and
-# the reason is what the console *is*: it runs goals, and a goal reaches a
-# Builder that runs programs, so an address anyone on the network can reach is
-# a shell for anyone on the network. It listened on 0.0.0.0, with nothing in
-# front of it. `CONSOLE_HOST=0.0.0.0` restores that for an operator who wants
-# it -- a bridged container publishing its port, a machine behind a firewall
-# they trust. Not `HOST`: some shells and container runtimes export that as the
-# machine's own name, which would have bound a LAN address without anyone
-# asking for one.
+# Where the console listens: loopback unless the operator says otherwise,
+# because the console runs goals and a goal reaches a Builder that runs
+# programs. `CONSOLE_HOST=0.0.0.0` opens it up for an operator who wants that.
+# Not `HOST`, which some shells export as the machine's own name.
 CONSOLE_HOST = os.getenv("CONSOLE_HOST", "127.0.0.1").strip() or "127.0.0.1"
 
 # The names a browser gives this machine's loopback, as a Host header carries
@@ -2198,25 +1878,17 @@ def _listening_on_loopback() -> bool:
 def _foreign_request(headers: Any, *, writes: bool) -> str | None:
     """Why this request did not come from the console's own page, or None.
 
-    Two checks, each closing a way for a web page the operator merely *visits*
-    to drive the console -- which, since the console runs goals, is a way to
-    run programs on this machine:
+    Each check closes a way for a page the operator merely visits to drive the
+    console, and so run programs on this machine:
 
-    - **Origin**, on anything that writes. A browser names the page a request
-      came from, and a page on another site had only to POST with a `text/plain`
-      body -- a "simple" request, sent without asking first -- to reach
-      `run_goal`; the handler never looked at the content type, and the wildcard
-      `Access-Control-Allow-Origin` it answered with let that page read the
-      reply as well. The console's own page is the same origin as the server,
-      so its Origin names the Host it asked.
-    - **Host**, while listening on loopback. A page that re-points its own
-      domain at 127.0.0.1 (DNS rebinding) makes its requests same-origin by the
-      browser's account, and its Host header is the one thing that still names
-      the site that sent it. Off loopback the operator chose other names for
-      this machine, and this check steps aside.
+    - **Origin**, on anything that writes: a cross-site `text/plain` POST is a
+      "simple" request, sent without asking first.
+    - **Host**, while listening on loopback: a page that re-points its own
+      domain at 127.0.0.1 (DNS rebinding) is same-origin by the browser's
+      account, and its Host header still names it.
 
     Nothing without those headers is refused: curl, the launcher's readiness
-    poll and the tests send no Origin, and a Host is only judged when present.
+    poll and the tests send no Origin.
     """
     host = str(headers.get("Host") or "")
     if host and _listening_on_loopback():
@@ -2254,17 +1926,8 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self) -> None:
         if self._refused_as_foreign(writes=False):
             return
-        parsed = urlparse(self.path)
-
-        if parsed.path == "/api/status":
-            # Compatibility route: launch_console.sh polls this as its
-            # readiness check, and it is the same payload as rpc "status".
+        if urlparse(self.path).path == "/api/status":
             self.send_json(rpc_status({}))
-        elif parsed.path == "/api/llm-options":
-            self.send_json(rpc_llm_options({}))
-        elif parsed.path in ("/", "/index.html"):
-            self.path = "/index.html"
-            super().do_GET()
         else:
             super().do_GET()
 
@@ -2272,10 +1935,8 @@ class Handler(SimpleHTTPRequestHandler):
         if self._refused_as_foreign(writes=True):
             return
         parsed = urlparse(self.path)
-        # A body whose length is unusable is refused before it is read, and one
-        # that is not a JSON object after. `data.get` on a list or a string
-        # raised in `handle_rpc` ahead of its error handling, so a body of `[]`
-        # came back as a dropped connection and a traceback in the log.
+        # A body of unusable length is refused before it is read, and one that
+        # is not a JSON object after.
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -2299,39 +1960,15 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/rpc":
             self.handle_rpc(data)
             return
-
-        # Compatibility routes for the previous /api surface.
-        aliases: dict[str, tuple[str, dict[str, Any]]] = {
-            "/api/run": ("run_goal", data),
-            "/api/stop": ("stop_run", data),
-            "/api/search": ("search_documents", data),
-            "/api/set-llm": ("set_seat", data),
-        }
-        if parsed.path in aliases:
-            method, params = aliases[parsed.path]
-            try:
-                self.send_json(RPC_METHODS[method](params))
-            except Exception as exc:
-                self.send_json({"error": str(exc)})
-            return
-
         self.send_error(404)
 
     def handle_rpc(self, data: dict[str, Any]) -> None:
         """Dispatch one {method, params} call.
 
-        Errors come back as a 200 with an `error` member rather than an HTTP
-        status: the console renders them into its telemetry log, and a failed
-        method is not a failed request.
-
-        The reply is written apart from the method's outcome, because the caller
-        can be gone by then without anything having failed. A console reloaded
-        mid-run drops the request that started the run and reattaches through
-        `run_progress` -- a supported path; the run still finishes and saves its
-        snapshot. With the write inside the same `try`, the closed socket was
-        caught as the method failing: the log read `run_goal FAILED ... Broken
-        pipe` for a run that had ended cleanly, then carried two tracebacks,
-        because the error reply hit the same socket.
+        Errors come back as a 200 with an `error` member: a failed method is not a
+        failed request. The reply is written apart from the method's outcome, so a
+        caller gone by then -- a console reloaded mid-run, which reattaches through
+        `run_progress` -- is not reported as the method failing.
         """
         method = str(data.get("method", ""))
         params = data.get("params") or {}
@@ -2379,9 +2016,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
-        # No Access-Control-Allow-Origin. The console's page is served from
-        # this same origin and needs none; the `*` this sent let any other
-        # site read every reply, run results included.
+        # No Access-Control-Allow-Origin: the console's page is this same
+        # origin, and a `*` would let any other site read every reply.
         self.end_headers()
         self.wfile.write(payload)
 
@@ -2397,21 +2033,13 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 def _exit_the_way_the_console_would(signum: int, _frame: Any) -> None:
-    """Handle SIGTERM: ask for the exit the console's X asks for.
+    """Handle SIGTERM by asking for the exit the console's X asks for.
 
-    SIGTERM is how a container runtime and systemd ask a process to stop, and
-    Python's default handler ends it where it stands. That is the one exit path
-    that loses a run: `rpc_run_goal` writes its snapshot from a `finally`, and
-    a signal that kills the interpreter never runs one -- so a `docker stop`
-    mid-run would leave nothing for a restarted console to reattach to, which
-    is the failure the deferred exit was built to prevent.
-
-    Asking for the console's own exit is the whole fix: with nothing running it
-    sets the flag `main` waits on, and with a run in flight it stops the run
-    and defers the exit to that `finally`. The signal arrives on the main
-    thread, which never holds `_run_lock` -- it only ever waits -- so the
-    handshake cannot deadlock against the handler reaching for it. SIGINT is
-    left alone: Ctrl+C raises KeyboardInterrupt, which `main` already catches.
+    SIGTERM is how a container runtime and systemd stop a process, and Python's
+    default ends it where it stands, skipping the `finally` that writes a run's
+    snapshot. This stops the run and defers the exit to that `finally`. The
+    signal arrives on the main thread, which never holds `_run_lock`, so the
+    handshake cannot deadlock. SIGINT is left alone: `main` catches Ctrl+C.
     """
     print(f"\nReceived {signal.Signals(signum).name}; exiting through the console's own path")
     reply = rpc_shutdown({"stop_first": True})
@@ -2421,13 +2049,9 @@ def _exit_the_way_the_console_would(signum: int, _frame: Any) -> None:
 
 def main() -> None:
     """Serve until Ctrl+C or the console asks to exit."""
-    # launch_console.sh redirects this process to a log file and tails it, and
-    # a redirected stdout is block-buffered -- so the progress and timing lines
-    # sat in an 8KB buffer instead of appearing as they happened, which is the
-    # opposite of what they are for. A TTY would have line-buffered them, which
-    # is why this only shows up under the launcher.
-    # (typed as TextIO, which does not declare reconfigure; it is a
-    # TextIOWrapper at runtime whenever stdout is a real stream.)
+    # Line-buffered: launch_console.sh redirects this process to a log and
+    # tails it, and a redirected stdout is block-buffered. `reconfigure` is on
+    # the TextIOWrapper stdout is at runtime, not on the TextIO it is typed as.
     sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
 
     port = int(os.getenv("PORT", "8080"))
@@ -2442,21 +2066,21 @@ def main() -> None:
     # Threaded: a run takes as long as four seat models take, and a
     # single-threaded server would stall every status poll behind it.
     server = ThreadingHTTPServer((CONSOLE_HOST, port), Handler)
-    # `serve_forever` moves off the main thread so the main thread is free to
-    # wait on both ways out: Ctrl+C, and the console asking to exit. Calling
-    # `shutdown()` from the request thread that asked for it would deadlock --
-    # it blocks until the serve loop stops, and that loop is what has to
-    # deliver the reply.
+    # `serve_forever` runs off the main thread, which waits on both ways out:
+    # Ctrl+C, and the console asking to exit. Shutting down from the request
+    # thread that asked would deadlock.
     threading.Thread(target=server.serve_forever, name="http", daemon=True).start()
 
-    # Started here rather than at import, and after the serve loop rather than
-    # before it: see `_index_the_project_at_startup` for both. A daemon thread,
-    # so Ctrl+C is not held up by a build -- the phase asks `_shutdown_requested`
-    # between files and between embedding batches, and what it has embedded
-    # keeps its vectors, so an interrupted build is finished by the next one
-    # rather than repeated.
+    # After the serve loop, never at import (see
+    # `_rebuild_the_corpus_in_background`). A daemon thread, so Ctrl+C is not
+    # held up: the rebuild checks for the exit between files and keeps what it
+    # has embedded.
     threading.Thread(
-        target=_index_the_project_at_startup, name="startup-index", daemon=True
+        target=_rebuild_the_corpus_in_background, name="corpus-rebuild", daemon=True
+    ).start()
+
+    threading.Thread(
+        target=_self_healing_monitor, name="self-healing", daemon=True
     ).start()
 
     signal.signal(signal.SIGTERM, _exit_the_way_the_console_would)

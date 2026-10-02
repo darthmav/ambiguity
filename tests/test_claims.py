@@ -1,37 +1,26 @@
 """Documentation claims, made executable.
 
-Prose goes stale silently. On 2026-09-09 this project found four claims that
-had been true when written and had quietly stopped being true: a comment
-saying `graphrag_server.py` sat ~250 characters under the indexing limit when
-it had 28,000 to spare, a seat diagnostic quoting a relevance floor of 0.40
-when the constant read 0.37, a note asserting the twenty best-connected
-entities were all real terms when three were sentence-openers, and twelve
-citations pointing at reports deleted the same day.
-
-Every one was found by a person reading carefully. That does not scale and it
-does not repeat, which is why each of them survived being read many times
-before someone measured it. The rule this file enforces instead:
+Prose goes stale silently, and a person reading carefully does not scale. The
+rule this file enforces instead:
 
     a claim worth writing down is a claim worth failing a build over.
 
-Two kinds of guard live here. Most **recompute** the claim from the repository,
-so they need no maintenance and catch drift nobody anticipated. A few compare
-prose against a constant, and those carry a registry that has to be extended
-when a new figure is written into the docs -- the honest architectural answer
-for a figure is not to restate it at all but to read it, the way
-`scripts/diagnose_seats.py` reads `relevance_floor()` from the corpus's stored
-record rather than quoting it. Markdown cannot do that, so markdown gets a
-registry.
+Most guards **recompute** the claim from the repository, so they need no
+upkeep and catch drift nobody anticipated. A few compare prose against a
+constant through a registry, extended whenever a new figure is written into
+the docs -- better still, the prose names the constant instead.
 
-These tests read the real repository rather than a fixture. That is the point:
-a fixture would test the checker.
+These tests read the real repository rather than a fixture: a fixture would
+test the checker.
 """
 
 from __future__ import annotations
 
 import re
+import subprocess
+import sys
 import tomllib
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import pytest
 
@@ -42,7 +31,7 @@ from langgraph_agent.graphrag_server import (
     MAX_INDEXABLE_BYTES,
     UPLOADS_DIR,
     _mints_entities,
-    iter_project_files,
+    iter_corpus_files,
 )
 from langgraph_agent.projects import PROJECTS_DIR
 
@@ -65,26 +54,6 @@ RUNTIME_PATHS = (
 RUNTIME_NAMES = frozenset({
     "knowledge_graph.json", "last_run.json", "report.md", "results.json",
     "floor_calibration.json",
-})
-
-# Filenames the seat diagnostic *asks an agent to create*. They are goals, not
-# citations: a checkout that contains them has a stray build artifact.
-EXERCISE_ARTIFACTS = frozenset({"slugify_tool.py", "retry_helper.py"})
-
-# Deleted files that the docs name *as deleted*. Recording what was removed and
-# why is the opposite of a dangling citation. Listed by name rather than
-# detected by pattern for the reason `ENTITY_STOPWORDS` is a list and not a
-# rule: a pattern loose enough to excuse these would also excuse a real one,
-# and its failures would be invisible. A reader can audit this.
-HISTORICAL_PATHS = frozenset({
-    # the spectral write-ups, removed 2026-09-09
-    "reports/spectral_applicability.md",
-    "reports/spectral_architecture_benchmark.md",
-    # the dead run artifacts and the withdrawn line of work, same cleanup
-    "AUDIT_REPORT.md", "CLARIFICATION_NEEDED.md", "run_exercise.py",
-    "ai_efficiency_report.md", "docs/legal-boundaries.md",
-    "docs/research/bot-detection-techniques.md",
-    "reports/security-circumvention-blocker.md",
 })
 
 PATH_LIKE = re.compile(
@@ -116,25 +85,15 @@ def _cited_path_exists(cited: str) -> bool:
 
 
 def _excused(cited: str) -> bool:
-    return (cited in HISTORICAL_PATHS
-            or cited in EXERCISE_ARTIFACTS
-            or Path(cited).name in RUNTIME_NAMES
-            or cited.startswith(RUNTIME_PATHS))
+    return Path(cited).name in RUNTIME_NAMES or cited.startswith(RUNTIME_PATHS)
 
 
 def _source_files() -> list[Path]:
     """Every Python file a reader would call part of this project.
 
-    The root is a glob, not `serve.py` by name. Naming one file left the class
-    it belongs to uncovered: `example_usage.py`, `test_cloud.py` and
-    `ollama_client.py` are root-level modules too, and the last of those arrived
-    carrying a strict-mode error, absent from CLAUDE.md's tree and named in
-    neither CI check list -- invisible to all three guards below at once, on the
-    one path where a hand-written file escapes `_lint_written_files` as well.
-
-    `spectral_graph/` is in for the same reason and not because it is installed:
-    it is importable only with the project root on `sys.path`, which is exactly
-    why a reader needs the tree to know it is there.
+    The root is a glob rather than a list of names, so a new root-level module
+    is covered the day it lands; `spectral_graph/` is in although it is not
+    installed, because it is importable only with the project root on the path.
     """
     return sorted(
         list((ROOT / "src").rglob("*.py"))
@@ -151,12 +110,8 @@ def _source_files() -> list[Path]:
 
 
 def test_every_path_the_docs_cite_exists():
-    """Twelve citations pointed at deleted reports and nothing noticed.
-
-    A path in prose is a promise that a reader can go and look. This recomputes
-    the promise, so a file deleted or renamed tomorrow fails here rather than
-    being discovered by someone who went looking and found nothing.
-    """
+    """A path in prose is a promise that a reader can go and look; recomputed,
+    so a file deleted or renamed tomorrow fails here rather than on a reader."""
     dangling: list[str] = []
     for name in PROSE_FILES:
         for cited in _cited_paths((ROOT / name).read_text(encoding="utf-8")):
@@ -168,16 +123,11 @@ def test_every_path_the_docs_cite_exists():
 
 
 def test_every_path_the_source_cites_exists():
-    """The same rule one level down. Five of the twelve dangling citations were
-    in docstrings, where they are read by whoever is changing that code.
+    """The same rule in docstrings, narrower in two deliberate ways.
 
-    Narrower than the prose rule in two ways, both deliberate. Only citations
-    carrying a directory are checked: a bare `foo.py` in a docstring is an
-    *example*, not a promise about a location, and a rule that cannot tell
-    those apart fails on placeholder names until someone deletes the rule.
-    And `tests/` is not scanned at all -- naming files that do not exist is
-    what a test fixture does (`spectral_graph/imaginary.py` proves an import
-    error is raised), so every hit there would be a false one.
+    Only citations carrying a directory are checked: a bare `foo.py` in a
+    docstring is an example, not a promise about a location. And `tests/` is
+    not scanned: naming files that do not exist is what a fixture does.
     """
     dangling: list[str] = []
     for path in _source_files():
@@ -233,10 +183,8 @@ def test_the_structure_tree_lists_every_module_test_and_script():
         if p.name != "__init__.py" and "__pycache__" not in str(p)
     }
     on_disk |= {str(p.relative_to(ROOT)) for p in (ROOT / "scripts").glob("*.sh")}
-    # Root-level shell scripts are the project's entry points -- the installer
-    # and the console launcher -- so a new one belongs in the tree as much as a
-    # module does. `launch_console.sh` was missing from it, which is what this
-    # line found.
+    # Root-level shell scripts are entry points -- the installer, the launcher
+    # -- so a new one belongs in the tree as much as a module does.
     on_disk |= {str(p.relative_to(ROOT)) for p in ROOT.glob("*.sh")}
     unlisted = sorted(on_disk - _structure_tree())
     assert not unlisted, f"real files missing from CLAUDE.md's tree: {unlisted}"
@@ -307,13 +255,11 @@ def test_every_provider_the_seats_can_use_is_a_declared_dependency():
     Read out of `config.py` rather than listed here, so a provider added
     tomorrow is covered without anyone remembering this test exists.
     """
-    import tomllib as _tomllib  # noqa: PLC0415 - local to keep the import block small
-
     config = (ROOT / "src/langgraph_agent/config.py").read_text(encoding="utf-8")
     imported = set(re.findall(r"from (langchain_\w+) import", config))
     assert imported, "config.py imports no provider packages; has the seat wiring moved?"
 
-    declared = _tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    declared = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     names = {re.split(r"[<>=!\[]", d)[0].strip().replace("-", "_").lower()
              for d in declared["project"]["dependencies"]}
 
@@ -341,6 +287,15 @@ def test_the_seat_table_matches_the_shipped_defaults():
             f"CLAUDE.md says {seat} runs {provider}/{model}; "
             f"DEFAULT_SEATS says {real['provider']}/{real['model']}"
         )
+
+    # .env.example's override templates start from the same defaults.
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    for role, real in DEFAULT_SEATS.items():
+        for key in ("provider", "model"):
+            line = f"# {role.upper()}_{key.upper()}={real[key]}"
+            assert re.search(rf"^{re.escape(line)}$", example, re.MULTILINE), (
+                f".env.example has no `{line}` matching DEFAULT_SEATS"
+            )
 
 
 def test_a_container_stop_outlasts_the_node_in_flight():
@@ -375,6 +330,38 @@ def test_a_container_stop_outlasts_the_node_in_flight():
     )
 
 
+def test_the_documented_rpc_methods_are_the_served_ones():
+    """frontend/README.md listed a `reindex` that no longer existed and missed
+    fifteen methods that did."""
+    import serve
+
+    readme = (ROOT / "frontend/README.md").read_text(encoding="utf-8")
+    table = readme.split("| Method | Params | Returns |", 1)[1].split("\n\n", 1)[0]
+    documented = set(re.findall(r"^\| `(\w+)` \|", table, re.MULTILINE))
+    served = set(serve.RPC_METHODS)
+    assert documented == served, (
+        f"documented but not served: {sorted(documented - served)}; "
+        f"served but not documented: {sorted(served - documented)}"
+    )
+
+
+def test_a_bare_pytest_collects_the_suite_and_nothing_else():
+    """A bare `pytest` from the root collects `tests/` alone, and can import it.
+
+    A root-level `test_*.py` would be collected (one once ran a live agent at
+    import), and without the root on the path every module importing `serve`
+    fails to collect. `-P` leaves the working directory off the path, exactly
+    as the `pytest` script does and `python -m pytest` does not.
+    """
+    collected = subprocess.run(
+        [sys.executable, "-P", "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider"],
+        cwd=ROOT, capture_output=True, text=True, timeout=300,
+    )
+    assert collected.returncode == 0, collected.stdout[-2000:] + collected.stderr[-2000:]
+    ids = [line for line in collected.stdout.splitlines() if "::" in line]
+    assert ids and all(line.startswith("tests/") for line in ids)
+
+
 def test_ci_runs_the_checks_the_quick_reference_documents():
     """"Run all checks" in CLAUDE.md and "CI is green" have to mean one thing.
 
@@ -398,63 +385,18 @@ def test_ci_runs_the_checks_the_quick_reference_documents():
         f"CI does not run what CLAUDE.md documents: {missing}"
     )
 
+    # And lints with the ruff the tools extra pins, so a pass means one thing.
+    extras = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    pinned = next(d for d in extras["project"]["optional-dependencies"]["tools"]
+                  if d.startswith("ruff"))
+    assert f'pip install "{pinned}"' in workflow, (
+        f"pyproject pins {pinned}, but CI's lint job installs something else"
+    )
+
 
 # ---------------------------------------------------------------------------
-# claims about the corpus, recomputed from the corpus
+# the entity census
 # ---------------------------------------------------------------------------
-
-
-def test_every_file_the_walk_offers_is_indexable():
-    """`oversized` reports a file the walk offers and the indexer must skip.
-
-    Reported apart from `stale` because a reindex cannot fix it, and asserted
-    here because the fix is to split the file and nobody notices the need.
-    """
-    oversized = [
-        f"{p} at {len(t):,} characters"
-        for p in iter_project_files(str(ROOT))
-        if (t := (ROOT / p).read_text(encoding="utf-8", errors="replace"))
-        and len(t) > MAX_INDEXABLE_BYTES
-    ]
-    assert not oversized, (
-        f"over MAX_INDEXABLE_BYTES ({MAX_INDEXABLE_BYTES:,}): {oversized}"
-    )
-
-
-# The share of MAX_INDEXABLE_BYTES a file may reach before this suite starts
-# asking for it to be dealt with. It exists because the guard above is a cliff:
-# it fires the moment a file is already too large to index, which is the moment
-# the only remaining fix is emergency surgery. CLAUDE.md reached 13 characters
-# of headroom and nothing said a word until a paragraph would not fit, and
-# `graphrag_server.py` had already been split once for the same reason. 0.8
-# leaves a fifth of the budget to notice in, which on the current limit is
-# 50,000 characters -- room to plan a split rather than perform one.
-INDEXABLE_WARN_RATIO = 0.8
-
-
-def test_no_file_is_creeping_up_on_the_index_limit():
-    """The ramp the cliff above never gave anyone.
-
-    A file that crosses this is not broken and nothing is dropped yet -- it is
-    a file to split, move detail out of, or deliberately exclude, decided with
-    time in hand. Raise the limit only on the reasoning at
-    `MAX_INDEXABLE_BYTES` itself, never to silence this.
-    """
-    threshold = int(MAX_INDEXABLE_BYTES * INDEXABLE_WARN_RATIO)
-    creeping = sorted(
-        (
-            (len(t), p)
-            for p in iter_project_files(str(ROOT))
-            if (t := (ROOT / p).read_text(encoding="utf-8", errors="replace"))
-            and len(t) > threshold
-        ),
-        reverse=True,
-    )
-    assert not creeping, (
-        f"within {1 - INDEXABLE_WARN_RATIO:.0%} of MAX_INDEXABLE_BYTES "
-        f"({MAX_INDEXABLE_BYTES:,}): "
-        + ", ".join(f"{p} at {n:,} characters" for n, p in creeping)
-    )
 
 
 # A capital is forced when position explains it: the first word of a line, the
@@ -465,63 +407,29 @@ _STRIP = "\"'`()[]{}<>.,!?;:*=+-/\\|"
 _SENTENCE_END = (".", "!", "?", ":", ";")
 
 
-def _is_upload(path: str) -> bool:
-    """True for a document the operator handed *this machine*.
-
-    Uploads are the other per-machine corner of the walk, and the reason this
-    exists is in `_capital_census` below.
-    """
-    parts = PurePosixPath(path.replace("\\", "/")).parts
-    return UPLOADS_DIR in parts[:-1]
-
-
-def _is_generated_project(path: str, root: Path) -> bool:
-    """True for a file of a run's generated project under `projects/`.
-
-    The walk takes one only once the operator embeds it, which makes it the
-    same per-machine corner as `uploads/`, for the same reason.
-    """
-    parts = Path(path).relative_to(root).parts if Path(path).is_absolute() else Path(path).parts
-    return bool(parts) and parts[0] == PROJECTS_DIR
+# Top-level directories the census leaves out: the tests, whose fixtures are
+# invented words and whose audit lists would count themselves; agent tooling and
+# run notes; and everything per-machine. What is left is the prose this checkout
+# ships -- docs, prompts, the package, the scripts -- the same on every machine.
+CENSUS_SKIPPED_DIRS = frozenset({
+    "tests", ".claude", ".qwen", "experimental", "knowledge", "reports",
+    UPLOADS_DIR, PROJECTS_DIR,
+})
 
 
 def _capital_census(root: Path = ROOT) -> dict[str, dict[str, int | set[str]]]:
     """Per minted token: documents, and capitals position does not explain.
 
-    Skips what `add_document` skips. A page the research phase fetched is
-    walked like any markdown file but mints no entities (`_mints_entities`, which
-    also leaves out markup, script and config),
-    so counting it audits a graph that does not exist -- and one that exists
-    only on machines that have run web research. On 2026-09-10 eight pages
-    under `research/web/` pushed two sentence-openers over the positional
-    floor and a third word into the top twenty, failing both guards below over
-    entities the real graph never held. They are not named here on purpose:
-    this file is in the walk, and naming a word mid-sentence gives it the free
-    capital that takes it out of the first guard's reach.
-
-    **And skips `uploads/`, which is the same failure one directory over.** An
-    upload does mint entities, unlike a fetched page, so this one is not
-    mirroring `add_document` -- it is the only way a *pinned* list can be a
-    claim anybody else can check. The walk includes whatever the operator
-    handed this machine, so the census differed per machine and the two guards
-    below could not be green in both places at once: measured on 2026-09-18,
-    `Research` sits at 14 documents here and outside the top 24 in a clean
-    checkout, which put it in the audited twenty on every developer machine and
-    out of it in CI. That had been red in CI for three commits and was invisible
-    the whole time, because a missing `scipy` aborted collection before any test
-    ran -- the guard that cannot run pins nothing, one level up from the guard
-    that cannot fail. An audit of what the *project* is about should not move
-    because somebody uploaded a PDF's worth of prose to their own console.
-
-    **It walks the checkout, not the corpus.** The corpus holds research and
-    deliberate embeds only (`CORPUS_ROOTS`), which a clean checkout has none
-    of, so a census of it would pass vacuously. What is audited is the entity
-    extractor's behaviour on the prose this project writes.
+    Walks the checkout, not the corpus: the corpus holds research and
+    deliberate embeds (`CORPUS_ROOTS`), which a clean checkout has none of, so
+    what is audited is the extractor's behaviour on this project's own prose.
+    Skips what `add_document` skips (`_mints_entities`), and per-machine
+    directories too, so the pinned list reads the same in CI as anywhere else.
     """
     census: dict[str, dict] = {}
-    for path in iter_project_files(str(root), roots=("",)):
-        if (not _mints_entities(str(path)) or _is_upload(str(path))
-                or _is_generated_project(str(path), root)):
+    for path in iter_corpus_files(str(root), roots=("",)):
+        if (path.relative_to(root).parts[0] in CENSUS_SKIPPED_DIRS
+                or not _mints_entities(str(path))):
             continue
         try:
             text = (root / path).read_text(encoding="utf-8")
@@ -549,39 +457,24 @@ def _capital_census(root: Path = ROOT) -> dict[str, dict[str, int | set[str]]]:
 
 
 # Below this, a token is too rare to be worth a build failure: the graph reads
-# a handful of pendant edges, not a hub. Four is where the 2026-09-09 audit
-# drew the line, and every token it removed sat at or above it.
+# a handful of pendant edges, not a hub.
 _POSITIONAL_DOC_FLOOR = 4
 
 
-# Tokens that score zero position-free capitals and are entities anyway. Each
-# needs a reason, because each is a hole in the guard below.
-POSITIONAL_EXCEPTIONS = frozenset({
-    # An assignment starts its line, so every capital is "forced" by position.
-    # It is a real identifier in the spectral code.
-    "L_dense",
-})
+# Tokens that score zero position-free capitals and are entities anyway, each
+# with its reason beside it: every entry is a hole in the guard below.
+POSITIONAL_EXCEPTIONS: frozenset[str] = frozenset()
 
 
 def test_no_capital_forced_by_position_becomes_a_hub_entity():
-    """A token minted by many documents with no capital that position fails to
-    explain is recording where it sits rather than what it means.
+    """A token many documents mint, with no capital position fails to explain,
+    records where it sits rather than what it means.
 
-    **This guard is deliberately weaker than the audit it comes from, and the
-    reason is worth knowing before anyone tries to strengthen it.** It fires
-    only at *zero* free capitals. The obvious improvement -- a ratio, "almost
-    all its capitals are positional" -- cannot be made to work: measured on
-    this corpus, `Measured` sits at 4 free against 34 forced and `Spectral` at
-    2 against 24. The first is a sentence-opener and the second is a term the
-    project is about, and no threshold separates them. That is the same
-    finding CLAUDE.md records when it rejects the positional heuristic as a
-    *filter*, met again one level up.
-
-    So this catches a positional word **before anyone writes about it**, which
-    is the window where it is unambiguous. Once a word has been discussed in
-    prose it acquires free capitals and leaves this guard's reach -- which is
-    exactly what happened to `Measured` and `Tests` while they were being
-    fixed. The test below is what covers them afterwards.
+    Deliberately weaker than the audit it comes from: it fires only at zero
+    free capitals, because no ratio separates a sentence-opener from a domain
+    term (`Measured` once sat at 4 free capitals against 34 forced, `Spectral`
+    at 2 against 24). It catches a positional word before anyone writes about
+    it; the pinned audit below covers it after.
     """
     offenders = sorted(
         (token, len(e["docs"]))
@@ -596,80 +489,18 @@ def test_no_capital_forced_by_position_becomes_a_hub_entity():
     )
 
 
-# The best-connected entities in the graph, as of the 2026-09-09 audit. Not a
-# statistic -- a record of what a human looked at and accepted. Redone on
-# 2026-09-12, when `NetworkX` displaced `Search`: the graph library this
-# project is built on, named throughout the docstrings of an agent-written
-# spectral-analysis module in the quisce prototype. A real term, so it stays.
-# Redone again on
-# 2026-09-15, the other way: removing the machine-specific dolphin-model
-# modules before rollout took `NetworkX` from 13 documents to 12, and `Search`
-# came back at 13 with 7 position-free capitals -- the entity the 2026-09-09
-# audit had already cleared by that count. Redone on 2026-09-16: `NetworkX`
-# returned at 14 documents (26 free capitals) while `Search` dropped to 13 --
-# the graph library is a core term, so it stays and `Search` rotates out. And
-# again the same day, the other way: the qwen3-embedding change deleted
-# `RETRIEVAL_RELEVANCE_FLOOR` from the corpus's vocabulary entirely, which
-# rotated `Search` back in -- already cleared by the 2026-09-09 audit. Redone
-# again later on 2026-09-16, when the quisce prototype and the dolphin-model
-# experiments were moved out of the checkout entirely: `NetworkX` fell from 14
-# documents to 11 and out of the top twenty, and `Embedding` (11 documents, 5
-# position-free capitals -- a term this project is about) took the last slot.
-# Redone on 2026-09-18, in both directions at once. `Research` arrived at 13
-# documents with 22 position-free capitals -- the Researcher's seat, the
-# research phase, `research/web/`, `research_status` -- so it is a term the
-# project is about and it stays. `Embedding` left at 12 documents, which is
-# `Cheeger`'s count exactly: the two tie, the ranking breaks the tie by name,
-# so the twentieth slot is settled alphabetically and one document either way
-# rotates it back. Both movements predate the change that surfaced them -- this
-# guard was already failing this way before two run artifacts were excluded
-# from the walk, and an audit left outstanding is the claim going stale quietly.
-# Redone on 2026-09-29, after `PROJECT_INDEX_EXCLUDES` grew `src/`, `tests/`,
-# `prompts/`, `frontend/` and `spectral_graph/` -- the corpus stopped
-# indexing the program's own source, and with it the census lost every
-# entity that lived only in docstrings and comments under those trees:
-# `BUILDER_DEADLINE_SECONDS`, `Cheeger`, `Embedding`, `GraphRAG`,
-# `GraphRAGKnowledgeBase`, `LangGraph`, `MAX_INDEXABLE_BYTES`, `System`,
-# `ValueError` and `Verdict` all left on subtraction, not on losing an
-# argument about what the project is about. `System` and `ValueError` climbed
-# back in from lower down the list once the shrunken census reshuffled ranks;
-# named identically to two names that just left, they are the same
-# entities, not new arrivals.
-#
-# What actually arrived is prose that used to be outnumbered by source: doc
-# names (`Anthropic`, `OpenAI`, `Ollama`, `Cloud`, `Corpus`, `ANTHROPIC_API_KEY`)
-# and two more read off `AgentState`'s own vocabulary (`State`, `StubLLM`).
-# All eight are terms the project is about. Four more arrived and are not:
-# `Hello` and `Inference` never carry a free capital at all -- `Inference is
-# cloud only` opens both CLAUDE.md and README.md verbatim, and every `Hello`
-# is a canned example string (`"Hello, how are you?"`, `'Hello World'`), never
-# the entity that gave the word its capital. `Three` and `Verification` keep
-# one free capital each, but only because a header or a docstring's first
-# line puts the sentence-final word after it ("The Three Technologies",
-# "Verification script for ..." three times over) -- the word describes a
-# class of thing (a count, a category of script), not a thing the project has
-# one of. All four joined `ENTITY_STOPWORDS` instead.
-#
-# Redone on 2026-09-30, after the example scripts caught up with the seats
-# moving to local models (0b2152f): `example_usage.py` stopped warning that a
-# missing cloud key meant canned stub output, and both it and `test_cloud.py`
-# now read the seats and the recursion backstop off the package. `AGENTS`
-# (config's tuple of the four seats) and `RECURSION_LIMIT` (the graph's
-# superstep backstop) arrived at 3 documents each -- `serve.py`,
-# `example_usage.py`, `test_cloud.py` -- and both are identifiers this project
-# defines, so both stay. `ANTHROPIC_API_KEY` and `StubLLM` left on
-# subtraction, falling to 2 documents each when that warning went, not by
-# losing an argument about what the project is about. Later the same day the
-# console stopped listening on every interface: `CONSOLE_HOST`, the variable
-# that says where it listens, arrived at 3 documents -- `serve.py`, CLAUDE.md,
-# README.md -- and is an identifier this project defines, so it stays.
-# `ValueError` left without losing a document: still at 3, it is the tie at
-# the twentieth slot, which the ranking settles by name.
+# The twenty best-connected entities, as a person last read and accepted them:
+# 2026-10-01, when the census widened back to all the prose the checkout ships.
+# The arrivals were ruled real terms -- `ValueError`, `GraphRAG`, `Callable`,
+# `Verdict`, `Architecture` (the Architect's section and state field) and
+# `CircuitOpenError` -- and four sentence-openers the positional guard caught
+# joined `ENTITY_STOPWORDS`. The twentieth slot is a tie at six documents,
+# settled by name. Earlier rulings: `git log -p tests/test_claims.py`.
 AUDITED_TOP_ENTITIES = frozenset({
-    "Architect", "Builder", "Researcher", "Laplacian", "Planner", "System",
-    "CONSOLE_HOST", "Fiedler", "AgentState", "Exception", "AGENTS",
-    "Anthropic", "Python", "Cloud", "Corpus", "OpenAI", "Ollama", "Search",
-    "State", "RECURSION_LIMIT",
+    "Builder", "Architect", "Planner", "Researcher", "Exception", "ValueError",
+    "GraphRAG", "Ollama", "Python", "AgentState", "Callable", "Search",
+    "Verdict", "Anthropic", "Fiedler", "Laplacian", "RECURSION_LIMIT", "AGENTS",
+    "Architecture", "CircuitOpenError",
 })
 
 

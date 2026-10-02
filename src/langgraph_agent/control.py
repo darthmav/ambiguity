@@ -1,16 +1,11 @@
-"""The stop signal for the run currently in flight.
+"""Process-wide run state: the emergency stop, the activity lights, the GPU arbiter.
 
-Deliberately a module-level object rather than a field on `AgentState`. The
-graph is compiled without a checkpointer, so LangGraph's `update_state` /
-`interrupt` machinery is unavailable and nothing outside a node can write into a
-state the graph is already streaming. A flag the nodes read is the only channel
-that reaches a run in progress.
-
-The stop is cooperative. Nothing here interrupts anything: it sets a flag, and
-the checkpoints in `nodes.py` and `serve.py` decline to start the *next* piece of
-work. Work already in flight -- a `filesystem_write`, a staged commit, a test
-run, a model call -- always finishes, because the alternative is a half-written
-file and a worker still writing into the project after the node returned.
+`RUN_CONTROL` is a module-level flag rather than a field on `AgentState`: the
+graph runs without a checkpointer, so nothing outside a node can write into a
+state being streamed. The stop is cooperative -- the checkpoints in `nodes.py`
+and `serve.py` decline to start the next piece of work, and work in flight (a
+write, a commit, a model call) always finishes rather than leave a half-written
+file behind.
 """
 
 import threading
@@ -27,9 +22,7 @@ DEFAULT_STOP_REASON = "Stopped from the console."
 class RunControl:
     """An armed/stopped flag for one run, shared across threads.
 
-    The run executes on the HTTP request thread that started it, so the stop
-    arrives on a different thread -- which is why `ThreadingHTTPServer` is
-    load-bearing and why this is guarded rather than a plain bool.
+    The stop arrives on a different request thread from the run's own.
     """
 
     def __init__(self) -> None:
@@ -55,11 +48,9 @@ class RunControl:
     def stop(self, run_id: str = "", reason: str = "") -> bool:
         """Ask the armed run to stop. False if there is nothing to stop.
 
-        A `run_id` that does not match the armed run is refused rather than
-        applied to whatever is running now: the console can hold a stale id
-        across a page reload, and a Stop meant for a finished run must not kill
-        the run that replaced it. An empty `run_id` means "whatever is armed",
-        which is what a caller with no id (curl, a test) wants.
+        A `run_id` that does not match the armed run is refused: a stale tab's
+        Stop must not kill the run that replaced it. An empty `run_id` means
+        whatever is armed.
         """
         with self._lock:
             if not self._run_id:
@@ -71,11 +62,7 @@ class RunControl:
             return True
 
     def stopped(self) -> bool:
-        """Whether the armed run has been asked to stop.
-
-        Lock-free on purpose: this is called at the top of every Builder tool
-        turn and before every verified file.
-        """
+        """Whether the armed run has been asked to stop. Lock-free: it is asked often."""
         return self._event.is_set()
 
     def reason(self) -> str:
@@ -87,14 +74,11 @@ class RunControl:
             return self._run_id
 
 
-# The single control for this process. The server runs one graph object and one
-# run at a time, so one control is the whole story.
+# One run at a time, so one control.
 RUN_CONTROL = RunControl()
 
 
-# How many of a run's most recent turns `NodeActivity.turns` hands back. The
-# console asks several times a second and only ever needs the last few; the
-# bound is what stops a run with dozens of supersteps growing every reply.
+# How many of a run's most recent turns `NodeActivity.turns` hands back.
 TURN_RECORD = 16
 
 
@@ -111,27 +95,11 @@ class _Turn:
 class NodeActivity:
     """Which seat is executing *right now*, for the console's seat lights.
 
-    Deliberately separate from `_run_progress["node"]` in `serve.py`, which is
-    fed by `graph.stream` and therefore names the node that has just *finished*
-    -- LangGraph yields an update when a superstep completes, not when one
-    starts. That is the right value for the feed, which lists what happened, and
-    the wrong one for a light meaning "this seat is working": it lights the
-    previous seat for the whole of the next seat's turn, so the slowest node in
-    the run is the one node whose light never comes on. A stalled Architect
-    would show as a busy Builder, which is precisely backwards.
-
-    Set from the graph rather than from inside the node bodies: every node has
-    several return paths (a stop, a deadline fallback, the ordinary one), so a
-    wrapper with a `finally` is the only way a light cannot be left on by an
-    exit nobody thought about.
-
-    The seat working now is not enough on its own, because the console can only
-    sample it: a poll sees the node on the stack at the instant it lands, and a
-    turn that starts and ends between two polls is never seen at all. Measured
-    through the real page with the console polling once a second, a 0.4s
-    Researcher turn never lit. So every turn is also recorded -- numbered, and
-    kept after it ends -- and `turns()` hands the recent ones back, which is
-    what lets the console light a turn it only heard about afterwards.
+    Not `_run_progress["node"]` in `serve.py`: `graph.stream` yields a node when
+    it *finishes*, which would light the previous seat for the whole of the next
+    one's turn. Set by a wrapper with a `finally` (`graph._tracked`), so no exit
+    path leaves a light on. Every turn is also recorded, numbered, so the
+    console can light a turn that began and ended between two of its polls.
     """
 
     def __init__(self) -> None:
@@ -144,9 +112,8 @@ class NodeActivity:
     def begin_run(self) -> None:
         """Forget the previous run's turns, as a new run is claimed.
 
-        The numbering carries on rather than starting again: a console still
-        holding the last number it saw must read every turn of the new run as
-        one it has not shown.
+        The numbering carries on, so a console holding the last number it saw
+        reads every turn of the new run as new.
         """
         with self._lock:
             self._node = ""
@@ -161,12 +128,10 @@ class NodeActivity:
             self._turns.append(_Turn(self._count, node, self._since))
 
     def leave(self, node: str) -> None:
-        """Clear the light, unless someone else already claimed it.
+        """Clear the light, unless another seat already claimed it.
 
-        The name check matters even though the graph runs one node at a time:
-        a node abandoned by `_with_deadline` keeps a worker thread alive, and
-        nothing that finishes late may darken the seat that is working now --
-        or close that seat's turn in the record.
+        A node abandoned by `_with_deadline` can finish late; it must not darken
+        the seat working now.
         """
         with self._lock:
             if self._node == node:
@@ -197,9 +162,8 @@ class NodeActivity:
     def turns(self) -> list[dict[str, object]]:
         """The recent turns, oldest first: `turn`, `node`, `seconds`, `ended_ago`.
 
-        `ended_ago` is None while the turn is still running. Both are spans
-        rather than timestamps because this clock is monotonic, and the
-        console's is a different clock altogether.
+        `ended_ago` is None while the turn runs. Spans, not timestamps: this
+        clock is monotonic and the console's is another clock.
         """
         with self._lock:
             now = time.monotonic()
@@ -214,25 +178,17 @@ class NodeActivity:
             ]
 
 
-# One run at a time, so one activity light, for the same reason as RUN_CONTROL.
+# One run at a time, so one set of lights.
 ACTIVITY = NodeActivity()
 
 
 class EmbedderActivity:
     """Whether the embedding model is working, for the embedder card's light.
 
-    Measured where the work is done rather than inferred from who asked for it:
-    `graphrag_server` marks every encode and every load of the model, which is
-    everything the embedder does -- a run's corpus phase, a fetched page stored,
-    the Planner's project map, the Researcher's search, a search or an upload
-    from the console. A search against no corpus embeds nothing, and must light
-    nothing.
-
-    A count rather than a flag, because the work overlaps: the console can search
-    while a run is indexing, and an encode loads the model on its first call. And
-    like `NodeActivity` it remembers work already finished -- how many pieces
-    have started, and how long ago the last one ended -- because a query embeds
-    in tens of milliseconds, far inside the gap between two polls.
+    Marked where the work is done -- `graphrag_server` wraps every encode and
+    every model load -- and counted, because the work overlaps (a search during a
+    rebuild). It remembers finished work too, since a query embeds in tens of
+    milliseconds, far inside the gap between two polls.
     """
 
     def __init__(self) -> None:
@@ -260,8 +216,7 @@ class EmbedderActivity:
     def snapshot(self) -> dict[str, object]:
         """`busy`, `busy_for`, `started` (a count that only grows), and `ended_ago`.
 
-        `ended_ago` is None until something has finished. Spans rather than
-        timestamps, for the reason `NodeActivity.turns` gives.
+        `ended_ago` is None until something has finished.
         """
         with self._lock:
             now = time.monotonic()
@@ -273,43 +228,24 @@ class EmbedderActivity:
             }
 
 
-# The console shows one embedder, so one meter, a process-global beside
-# ACTIVITY for the same reason.
+# One embedder, so one meter.
 EMBEDDER_ACTIVITY = EmbedderActivity()
 
 
-# How often a waiter re-checks the cards. Only a polling interval: a wait is
-# never cut short, because one that gave up and ran anyway was exactly the
-# overlap this arbiter exists to prevent -- two models on the cards at once.
-# Every holder is bounded on its own (a seat call by LLM_TIMEOUT_SECONDS at the
-# socket, an embed by its request timeout), so a wait always ends.
+# How often a waiter re-checks the cards. A wait is never cut short -- giving
+# up and running anyway is the overlap the arbiter prevents -- and every holder
+# is bounded by its own timeout, so a wait always ends.
 GPU_WAIT_POLL_SECONDS = 1.0
 
 
 class GpuArbiter:
     """One piece of GPU work at a time: a seat's model, or the embedder.
 
-    This machine has two 3 GB cards and every model that matters is larger than
-    one of them. qwen3-embedding is 4.7 GB and a 9B seat is 5.3 GB, so the two
-    together want roughly 10 GB of a 6 GB pool: they cannot both be resident,
-    and the daemon's answer to being asked anyway is not a graceful split but a
-    failure. Measured from the journal on 2026-09-20 at 07:02:10 -- a seat load
-    timed out with `context canceled` after the daemon spent twenty seconds
-    walking `ngl_per_device_high[1].n_layer` down from 48, trying to pack every
-    layer onto card 1 because the embedder held card 0. That walk is what an
-    operator sees as "one of the cards isn't being touched".
-
-    So the work is serialized rather than left to compete. This is deliberately
-    *not* `EMBEDDER_ACTIVITY`, which sits beside it: that is a meter, read by
-    the console to draw a light, and it counts overlapping work precisely
-    because overlapping work is what it was built to display. This one is a
-    lock, and its whole purpose is that the overlap stops happening.
-
-    Reentrant on purpose. Nothing here nests today -- `_gather_research` embeds
-    and *then* invokes a seat, never inside it -- but a plain lock turns a
-    future nesting into a run that hangs for ever with no node on the stack,
-    which is the one failure this code must not add. Reentrancy makes that
-    mistake a no-op instead.
+    The embedder (4.7 GB) and a 9B seat (5.3 GB) cannot both fit 6 GB of cards,
+    and the daemon's answer to being asked is a failed load, not a split. So
+    the work is serialized. Unlike `EMBEDDER_ACTIVITY`, a meter that counts
+    overlap, this is a lock that prevents it. Reentrant, so a nested use is a
+    no-op rather than a run hung with no node on the stack.
     """
 
     def __init__(self) -> None:
@@ -324,11 +260,8 @@ class GpuArbiter:
     def exclusive(self, owner: str) -> Iterator[float]:
         """Hold the cards for `owner` while the block runs, however it exits.
 
-        Waits as long as the holder takes, never less: one model on the cards
-        at a time is a guarantee, not a preference. Yields the seconds spent
-        waiting, which the caller may report: a wait is the whole visible cost
-        of this arbiter, and one nobody can see reads as the model simply
-        being slow.
+        Waits as long as the holder takes: one model on the cards is a
+        guarantee, not a preference. Yields the seconds spent waiting.
         """
         start = time.monotonic()
         if not self._lock.acquire(blocking=False):
@@ -367,6 +300,5 @@ class GpuArbiter:
             }
 
 
-# One pool of cards, so one arbiter, a process-global beside ACTIVITY and
-# EMBEDDER_ACTIVITY for the same reason.
+# One pool of cards, so one arbiter.
 GPU_ARBITER = GpuArbiter()

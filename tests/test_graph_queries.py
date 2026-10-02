@@ -111,20 +111,24 @@ def test_an_empty_query_returns_nothing_rather_than_arbitrary_passages(kb):
     assert kb.search("   \n\t ", 5) == []
 
 
+def _resolved(kb, node_id: str) -> str | None:
+    return kb._match_node(node_id)[0]
+
+
 def test_a_blank_node_id_resolves_to_nothing(kb):
     """`"" in anything` is True, so a blank id matched on the first comparison.
 
     It resolved to whichever node the graph enumerated first and handed back a
     real document's neighbourhood — a hit, to a caller who asked about nothing.
     """
-    assert kb._resolve_node("") is None
-    assert kb._resolve_node("   ") is None
+    assert _resolved(kb, "") is None
+    assert _resolved(kb, "   ") is None
     assert "error" in kb.query_graph("", hops=1)
 
 
 def test_a_loose_but_real_id_still_resolves(kb):
     """The guard must not cost the fuzzy match the console depends on."""
-    assert kb._resolve_node("architect") == "Architect"
+    assert _resolved(kb, "architect") == "Architect"
 
 
 # ---------------------------------------------------------------------------
@@ -138,15 +142,15 @@ def test_the_exact_name_beats_a_longer_one_that_contains_it(kb):
         kb.graph.remove_nodes_from(["Plan", "Planner"])
         for node in order:
             kb.graph.add_node(node, type="entity")
-        assert kb._resolve_node("plan") == "Plan"
+        assert _resolved(kb, "plan") == "Plan"
 
 
 def test_a_document_resolves_by_its_file_name(kb):
     kb.graph.add_node("src/pkg/nodes.py", type="document")
     kb.graph.add_node("NodesThing", type="entity")
 
-    assert kb._resolve_node("nodes.py") == "src/pkg/nodes.py"
-    assert kb._resolve_node("nodes") == "src/pkg/nodes.py"
+    assert _resolved(kb, "nodes.py") == "src/pkg/nodes.py"
+    assert _resolved(kb, "nodes") == "src/pkg/nodes.py"
 
 
 def test_a_substring_match_is_the_shortest_and_the_same_every_time(kb):
@@ -156,7 +160,7 @@ def test_a_substring_match_is_the_shortest_and_the_same_every_time(kb):
         kb.graph.remove_nodes_from(order)
         for node in order:
             kb.graph.add_node(node, type="document" if node.endswith(".py") else "entity")
-        assert kb._resolve_node("lann") == "Planner"
+        assert _resolved(kb, "lann") == "Planner"
 
 
 def test_a_loose_trace_says_what_it_matched_and_what_else_it_could_be(kb):

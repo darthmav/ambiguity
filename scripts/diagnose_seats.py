@@ -59,6 +59,16 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from langgraph_agent.config import (
+    AGENTS,
+    CLAUDE_OPUS,
+    CLAUDE_SONNET,
+    DOLPHIN3_CYBER_8B,
+    DOLPHIN_9B,
+    NEMOTRON_3_ULTRA,
+    QWEN3_8,
+)
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -97,26 +107,22 @@ class Candidate:
 # dialling a configuration in, and a default that bills on every run is a
 # default nobody runs twice.
 CANDIDATES: tuple[Candidate, ...] = (
-    Candidate("dolphin-2.9.1", "ollama",
-              "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M",
+    Candidate("dolphin-2.9.1", "ollama", DOLPHIN_9B,
               "Local, completion-only; holds Architect, Planner and "
               "Researcher by default"),
-    Candidate("dolphin3-cyber", "ollama",
-              "hf.co/RavichandranJ/Dolphin3-Cyber-8B-GGUF:Q5_K_M",
+    Candidate("dolphin3-cyber", "ollama", DOLPHIN3_CYBER_8B,
               "Local, completion-only; a second choice for the three "
               "tool-free seats"),
-    Candidate("qwen", "ollama", "qwen3.8:latest",
+    Candidate("qwen", "ollama", QWEN3_8,
               "Local, the only tag here with tools; holds Builder by default"),
-    Candidate("nemotron", "ollama", "nemotron-3-ultra:cloud",
+    Candidate("nemotron", "ollama", NEMOTRON_3_ULTRA,
               "Ollama Cloud; the cloud model the console's pull list carries"),
-    Candidate("opus", "anthropic", "claude-opus-5", "Paid control", paid=True),
-    Candidate("sonnet", "anthropic", "claude-sonnet-5", "Paid control", paid=True),
+    Candidate("opus", "anthropic", CLAUDE_OPUS, "Paid control", paid=True),
+    Candidate("sonnet", "anthropic", CLAUDE_SONNET, "Paid control", paid=True),
     Candidate("haiku", "anthropic", "claude-haiku-4-5", "Paid control", paid=True),
 )
 
 BY_KEY: dict[str, Candidate] = {c.key: c for c in CANDIDATES}
-
-ROLES: tuple[str, ...] = ("architect", "planner", "researcher", "builder")
 
 
 @dataclass(frozen=True)
@@ -433,25 +439,15 @@ def excerpt(text: Any, limit: int = 240) -> str:
 # with a plan and a report in it demands the model actually respond to what is
 # in front of it.
 def probe_state(role: str) -> dict[str, Any]:
+    from langgraph_agent.state import initial_state
+
     state: dict[str, Any] = {
-        "goal": "Add a retry with backoff to the HTTP client used by the "
-                "indexer, and cover it with a test.",
-        "messages": [],
+        **initial_state(
+            "Add a retry with backoff to the HTTP client used by the "
+            "indexer, and cover it with a test."
+        ),
         "architecture": "Keep the retry inside the client, not at the call "
                         "sites. Bound total attempts; no unbounded loops.",
-        "verdict": "",
-        "plan": "",
-        "research": "",
-        "builder_report": "",
-        "next_agent": "Researcher",
-        "research_status": "",
-        "blockers": "",
-        "files_changed": [],
-        "failed_verification": [],
-        "unverified": [],
-        "builder_cut_off": "",
-        "lint_failed": [],
-        "expect_failures": False,
         "step_count": 1,
     }
     if role in ("researcher", "builder"):
@@ -532,12 +528,12 @@ def _forced_llm_research(nodes: Any) -> Iterator[None]:
     grade the corpus, not the seat. Stubbing retrieval to nothing is what
     makes this a probe of the model.
     """
-    original = nodes._call_mcp_tool_sync
-    nodes._call_mcp_tool_sync = lambda *a, **k: {"results": []}
+    original = nodes._call_tool
+    nodes._call_tool = lambda *a, **k: {"results": []}
     try:
         yield
     finally:
-        nodes._call_mcp_tool_sync = original
+        nodes._call_tool = original
 
 
 def run_probe(candidate: Candidate, role: str, mods: dict[str, Any]) -> ProbeResult:
@@ -713,7 +709,7 @@ def run_probe(candidate: Candidate, role: str, mods: dict[str, Any]) -> ProbeRes
                 result.status = "ok"
                 result.detail = f"Called {', '.join(names)}"
 
-    except Exception as exc:  # noqa: BLE001 -- the failure is the datum
+    except Exception as exc:
         result.status = "error"
         result.detail = f"{type(exc).__name__}: {excerpt(exc, 160)}"
     finally:
@@ -829,7 +825,7 @@ def instrumented_graph(mods: dict[str, Any], sink: list[NodeVisit]) -> Any:
     """
     graph_mod = mods["graph_mod"]
     originals = {}
-    for role in ROLES:
+    for role in AGENTS:
         attr = f"{role}_node"
         originals[attr] = getattr(graph_mod, attr)
 
@@ -846,7 +842,7 @@ def instrumented_graph(mods: dict[str, Any], sink: list[NodeVisit]) -> Any:
         return wrapped
 
     try:
-        for role in ROLES:
+        for role in AGENTS:
             attr = f"{role}_node"
             setattr(graph_mod, attr,
                     wrap_node(attr, originals[attr], role))
@@ -908,15 +904,9 @@ def run_team(
     visits: list[NodeVisit] = []
     graph = instrumented_graph(mods, visits)
 
-    state: dict[str, Any] = {
-        "goal": exercise.goal,
-        "messages": [], "architecture": "", "verdict": "", "plan": "",
-        "research": "", "builder_report": "", "next_agent": "Researcher",
-        "research_status": "", "blockers": "", "files_changed": [],
-        "failed_verification": [], "unverified": [], "builder_cut_off": "",
-        "lint_failed": [],
-        "expect_failures": False, "step_count": 0,
-    }
+    from langgraph_agent.state import initial_state
+
+    state: dict[str, Any] = dict(initial_state(exercise.goal))
 
     run_id = uuid.uuid4().hex
     control.RUN_CONTROL.arm(run_id)
@@ -950,7 +940,7 @@ def run_team(
                         control.RUN_CONTROL.stop(
                             run_id, f"Diagnostic budget of {int(budget)}s reached.")
                         break
-            except Exception as exc:  # noqa: BLE001 -- a config that dies is a result
+            except Exception as exc:
                 res.outcome = "error"
                 res.error = f"{type(exc).__name__}: {excerpt(exc, 300)}"
                 if verbose:
@@ -973,7 +963,7 @@ def run_team(
     res.messages = [str(m) for m in last.get("messages", [])]
     res.seat_failures = dict(config._seat_failures)
 
-    for role in ROLES:
+    for role in AGENTS:
         role_visits = [v for v in visits if v.node == role]
         res.role_calls[role] = len(role_visits)
         res.role_seconds[role] = round(sum(v.seconds for v in role_visits), 1)
@@ -1019,7 +1009,7 @@ def phase_teams(
     results: list[TeamResult] = []
     for cfg in configs:
         for ex in exercises:
-            seat_line = "  ".join(f"{r[:4]}={cfg.seats[r]}" for r in ROLES)
+            seat_line = "  ".join(f"{r[:4]}={cfg.seats[r]}" for r in AGENTS)
             rule(f"{cfg.name} / {ex.name}")
             print(f"    {dim(seat_line)}")
             print(wrap(cfg.rationale, indent="    "))
@@ -1080,7 +1070,7 @@ def recommend(
         notes.append("Phase 1 did not run, so there is no per-seat "
                      "recommendation here -- these are team results only.")
 
-    for role in ROLES:
+    for role in AGENTS:
         if role not in probed_roles:
             continue
         ok = [p for p in probes if p.role == role and p.status == "ok"]
@@ -1195,7 +1185,7 @@ def write_report(
             lines += [
                 f"#### `{t.config}` / {t.exercise} — {t.outcome} "
                 f"(score {t.score})", "",
-                "Seats: " + ", ".join(f"{r}=`{t.seats[r]}`" for r in ROLES), "",
+                "Seats: " + ", ".join(f"{r}=`{t.seats[r]}`" for r in AGENTS), "",
                 f"- Verdict: `{t.verdict or '(none)'}`, steps {t.steps}, "
                 f"gate cycles {t.gate_passes}, {t.seconds:.1f}s",
                 "- Field sizes: " + ", ".join(
@@ -1267,7 +1257,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--models", default="",
                    help="Comma-separated candidate keys for phase 1 "
                         "(default: every free candidate)")
-    p.add_argument("--roles", default=",".join(ROLES),
+    p.add_argument("--roles", default=",".join(AGENTS),
                    help="Comma-separated roles to probe")
     p.add_argument("--configs", default="",
                    help="Comma-separated team config names "
@@ -1310,7 +1300,7 @@ def show_catalogue() -> None:
     for cfg in TEAM_CONFIGS:
         tag = red(" paid") if cfg.paid else ""
         print(f"  {bold(cfg.name)}{tag}")
-        print(f"    {dim('  '.join(f'{r}={cfg.seats[r]}' for r in ROLES))}")
+        print(f"    {dim('  '.join(f'{r}={cfg.seats[r]}' for r in AGENTS))}")
         print(wrap(cfg.rationale, indent="    "))
     print()
     rule("exercises")
@@ -1401,7 +1391,7 @@ def main(argv: list[str]) -> int:
         candidates = [BY_KEY[m] for m in wanted]
 
     roles = [r.strip() for r in args.roles.split(",") if r.strip()]
-    bad_roles = [r for r in roles if r not in ROLES]
+    bad_roles = [r for r in roles if r not in AGENTS]
     if bad_roles:
         print(red(f"Unknown roles: {bad_roles}"))
         return 2
@@ -1507,7 +1497,7 @@ def main(argv: list[str]) -> int:
             else:
                 print(dim(f"{corpus_documents} documents, "
                           f"{time.monotonic() - warm_started:.1f}s"))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             print(yellow(f"failed: {excerpt(exc, 120)}"))
             print(wrap(yellow(
                 "Team runs will continue, but the Researcher will fall back to "

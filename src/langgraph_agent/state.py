@@ -100,3 +100,39 @@ class AgentState(TypedDict):
     output_dir: str  # "" | "projects/<name>"
     expect_failures: bool
     step_count: int
+
+
+def initial_state(
+    goal: str,
+    *,
+    expect_failures: bool = False,
+    discuss_only: bool = False,
+    output_dir: str = "",
+) -> AgentState:
+    """The state every run starts from: the goal, the caller's three per-run
+    flags, and every field an agent writes empty.
+
+    `research_status` starts empty because it is what marks the Researcher as
+    having run, so the opening cycle retrieves before the Builder acts.
+    """
+    return AgentState(
+        goal=goal,
+        messages=[],
+        architecture="",
+        verdict="",
+        plan="",
+        research="",
+        builder_report="",
+        next_agent="Researcher",
+        research_status="",
+        blockers="",
+        files_changed=[],
+        failed_verification=[],
+        unverified=[],
+        builder_cut_off="",
+        lint_failed=[],
+        discuss_only=discuss_only,
+        output_dir=output_dir,
+        expect_failures=expect_failures,
+        step_count=0,
+    )

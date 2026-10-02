@@ -1,12 +1,7 @@
-"""
-Laplacian matrix constructions for spectral graph theory.
+"""Laplacian constructions: L = D - A, and L_norm = I - D^(-1/2) A D^(-1/2).
 
-Provides functions to compute:
-- Unnormalized Laplacian: L = D - A
-- Normalized Laplacian: L_norm = I - D^(-1/2) A D^(-1/2)
-- Random walk Laplacian: L_rw = I - D^(-1) A
-
-All functions accept NetworkX graphs and return scipy sparse matrices.
+Every function takes an undirected NetworkX graph and returns a scipy sparse
+CSR matrix.
 """
 
 import networkx as nx
@@ -15,21 +10,14 @@ from scipy import sparse
 
 
 def _require_undirected(G: nx.Graph) -> None:
-    """Refuse a directed graph, loudly, naming the conversion.
+    """Refuse a directed graph, naming the conversion.
 
-    Every construction in this package assumes a symmetric adjacency matrix.
-    A directed graph does not raise on its way through: `nx.adjacency_matrix`
-    returns a non-symmetric A, `L = D - A` inherits that, and the symmetric
-    eigensolvers (`eigvalsh`, `eigsh`) read a single triangle of it -- so the
-    call returns a perfectly plausible number computed from a matrix nobody
-    passed. Measured on this project's own 928-node knowledge graph, feeding
-    the DiGraph straight in gave an algebraic connectivity of 0.865 where the
-    true value is 0.267: a 224% error, with no warning and no exception.
-
-    The conversion is deliberately not done for the caller. `to_undirected()`
-    changes the answer -- it is a modelling decision about what a reversed
-    edge means in that graph -- and a package that quietly makes it for you
-    is the same silent-wrong-answer failure wearing a friendlier face.
+    Every construction here assumes a symmetric adjacency matrix. A directed
+    graph does not fail on its own: the symmetric eigensolvers read a single
+    triangle of a non-symmetric L and return a plausible number for a matrix
+    nobody passed (0.865 against a true 0.267 on this project's knowledge
+    graph). The conversion is the caller's modelling decision, so it is not
+    made here.
     """
     if G.is_directed():
         raise ValueError(
@@ -44,23 +32,11 @@ def _require_undirected(G: nx.Graph) -> None:
 def _degree_vector(G: nx.Graph, A: sparse.csr_matrix | None = None) -> np.ndarray:
     """Weighted degrees, as the row sums of the adjacency matrix.
 
-    Row sums rather than `G.degree(weight="weight")`, and the difference is
-    self-loops: NetworkX's `degree` counts a self-loop twice, while
-    `nx.adjacency_matrix` puts a single w on the diagonal. Subtracting one
-    from the other left +1 per self-loop on L's diagonal and broke the
-    defining property of a Laplacian -- `L @ 1 == 0` came back as [0, 1, 0]
-    on a three-node graph with one self-loop, which also makes L not PSD and
-    quietly corrupts every eigenvalue downstream.
-
-    Taking degrees from A is what makes `D - A` sum to zero by construction,
-    for any weights and any self-loops, and it is what NetworkX's own
-    `laplacian_matrix` does. Every Laplacian here goes through this, so the
-    three constructions cannot drift apart again.
-
-    `A` is accepted so a caller that has already built the adjacency does not
-    build it twice. Reading degrees off A rather than off `G.degree()` would
-    otherwise have doubled the adjacency construction in every Laplacian here
-    -- a correctness fix is not worth paying for with a silent 2x.
+    Row sums rather than `G.degree()`, which counts a self-loop twice against
+    the single w `nx.adjacency_matrix` puts on the diagonal: taking degrees
+    from A is what makes `D - A` annihilate the constant vector for any weights
+    and self-loops. `A` is accepted so a caller that built it already does not
+    build it twice.
     """
     _require_undirected(G)
     if A is None:
@@ -69,95 +45,16 @@ def _degree_vector(G: nx.Graph, A: sparse.csr_matrix | None = None) -> np.ndarra
 
 
 def adjacency_matrix(G: nx.Graph) -> sparse.csr_matrix:
-    """
-    Compute the adjacency matrix of a graph.
-
-    Parameters
-    ----------
-    G : networkx.Graph
-        Input graph (can be weighted or unweighted)
-
-    Returns
-    -------
-    scipy.sparse.csr_matrix
-        Adjacency matrix as a sparse CSR matrix
-
-    Examples
-    --------
-    >>> import networkx as nx
-    >>> from spectral_graph import adjacency_matrix
-    >>> G = nx.path_graph(5)
-    >>> A = adjacency_matrix(G)
-    >>> A.shape
-    (5, 5)
-    """
+    """The (weighted) adjacency matrix, as float64."""
     _require_undirected(G)
     return nx.adjacency_matrix(G).astype(np.float64)
 
 
-def degree_matrix(G: nx.Graph) -> sparse.csr_matrix:
-    """
-    Compute the degree matrix of a graph.
-
-    Parameters
-    ----------
-    G : networkx.Graph
-        Input graph
-
-    Returns
-    -------
-    scipy.sparse.csr_matrix
-        Diagonal degree matrix as a sparse CSR matrix
-
-    Examples
-    --------
-    >>> import networkx as nx
-    >>> from spectral_graph import degree_matrix
-    >>> G = nx.path_graph(5)
-    >>> D = degree_matrix(G)
-    >>> D.diagonal()
-    array([1., 2., 2., 2., 1.])
-    """
-    # Weight-aware to match adjacency_matrix, which honours edge weights by
-    # default. Mixing a weighted A with unweighted degrees makes L = D - A
-    # non-PSD on any weighted graph (nx.karate_club_graph() is one).
-    # Taken from A's row sums rather than G.degree(), which counts a self-loop
-    # twice against the single w that A carries on the diagonal -- see
-    # `_degree_vector`.
-    return sparse.diags(_degree_vector(G), format="csr")
-
-
 def laplacian_matrix(G: nx.Graph) -> sparse.csr_matrix:
-    """
-    Compute the unnormalized Laplacian matrix L = D - A.
+    """The unnormalized Laplacian L = D - A.
 
-    The Laplacian is positive semi-definite with eigenvalues
-    0 = λ₁ ≤ λ₂ ≤ ... ≤ λₙ. The multiplicity of eigenvalue 0
-    equals the number of connected components.
-
-    Parameters
-    ----------
-    G : networkx.Graph
-        Input graph
-
-    Returns
-    -------
-    scipy.sparse.csr_matrix
-        Unnormalized Laplacian matrix
-
-    Examples
-    --------
-    >>> import networkx as nx
-    >>> from spectral_graph import laplacian_matrix
-    >>> G = nx.path_graph(5)
-    >>> L = laplacian_matrix(G)
-    >>> L.shape
-    (5, 5)
-    >>> # Verify L @ [1,1,1,1,1] = 0 (constant vector is in null space)
-    >>> import numpy as np
-    >>> ones = np.ones(5)
-    >>> np.allclose(L @ ones, 0)
-    True
+    Positive semi-definite, with 0 as an eigenvalue whose multiplicity is the
+    number of connected components.
     """
     A = adjacency_matrix(G)
     D = sparse.diags(_degree_vector(G, A), format="csr")
@@ -165,143 +62,15 @@ def laplacian_matrix(G: nx.Graph) -> sparse.csr_matrix:
 
 
 def normalized_laplacian_matrix(G: nx.Graph) -> sparse.csr_matrix:
+    """The symmetric normalized Laplacian I - D^(-1/2) A D^(-1/2).
+
+    Its eigenvalues lie in [0, 2]. An isolated node's row is left as the
+    identity's.
     """
-    Compute the normalized Laplacian L_norm = I - D^(-1/2) A D^(-1/2).
-
-    Also known as the symmetric normalized Laplacian. Eigenvalues lie
-    in the interval [0, 2]. Better suited for graphs with heterogeneous
-    degree distributions.
-
-    Parameters
-    ----------
-    G : networkx.Graph
-        Input graph
-
-    Returns
-    -------
-    scipy.sparse.csr_matrix
-        Normalized Laplacian matrix
-
-    Examples
-    --------
-    >>> import networkx as nx
-    >>> from spectral_graph import normalized_laplacian_matrix
-    >>> G = nx.path_graph(5)
-    >>> L_norm = normalized_laplacian_matrix(G)
-    >>> L_norm.shape
-    (5, 5)
-    """
-    n = G.number_of_nodes()
     A = adjacency_matrix(G)
-    degrees = _degree_vector(G, A)
-
-    # Handle isolated nodes (degree 0)
     with np.errstate(divide="ignore", invalid="ignore"):
-        d_inv_sqrt = 1.0 / np.sqrt(degrees)
+        d_inv_sqrt = 1.0 / np.sqrt(_degree_vector(G, A))
     d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.0
-
     D_inv_sqrt = sparse.diags(d_inv_sqrt, format="csr")
-    I = sparse.eye(n, format="csr")
-
-    # L_norm = I - D^(-1/2) A D^(-1/2)
-    return I - D_inv_sqrt @ A @ D_inv_sqrt
-
-
-def random_walk_laplacian_matrix(G: nx.Graph) -> sparse.csr_matrix:
-    """
-    Compute the random walk Laplacian L_rw = I - D^(-1) A.
-
-    Also known as the asymmetric normalized Laplacian. Shares eigenvalues
-    with the symmetric normalized Laplacian but is not symmetric.
-    Used in random walk analysis and PageRank.
-
-    Parameters
-    ----------
-    G : networkx.Graph
-        Input graph
-
-    Returns
-    -------
-    scipy.sparse.csr_matrix
-        Random walk Laplacian matrix
-
-    Examples
-    --------
-    >>> import networkx as nx
-    >>> from spectral_graph import random_walk_laplacian_matrix
-    >>> G = nx.path_graph(5)
-    >>> L_rw = random_walk_laplacian_matrix(G)
-    >>> L_rw.shape
-    (5, 5)
-    """
-    n = G.number_of_nodes()
-    A = adjacency_matrix(G)
-    degrees = _degree_vector(G, A)
-
-    # Handle isolated nodes (degree 0)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        d_inv = 1.0 / degrees
-    d_inv[np.isinf(d_inv)] = 0.0
-
-    D_inv = sparse.diags(d_inv, format="csr")
-    I = sparse.eye(n, format="csr")
-
-    # L_rw = I - D^(-1) A
-    return I - D_inv @ A
-
-
-if __name__ == "__main__":
-    # Run simple validation
-    import networkx as nx
-
-    print("Testing laplacian.py...")
-
-    # Test on path graph
-    G = nx.path_graph(5)
-
-    A = adjacency_matrix(G)
-    print(f"Adjacency matrix shape: {A.shape}")
-
-    D = degree_matrix(G)
-    print(f"Degree matrix diagonal: {D.diagonal()}")
-
-    L = laplacian_matrix(G)
-    print(f"Laplacian matrix shape: {L.shape}")
-
-    # Verify L @ 1 = 0
-    ones = np.ones(G.number_of_nodes())
-    assert np.allclose(L @ ones, 0), "Laplacian should annihilate constant vector"
-    print("✓ L @ 1 = 0 verified")
-
-    L_norm = normalized_laplacian_matrix(G)
-    print(f"Normalized Laplacian shape: {L_norm.shape}")
-
-    L_rw = random_walk_laplacian_matrix(G)
-    print(f"Random walk Laplacian shape: {L_rw.shape}")
-
-    # Cross-check with NetworkX
-    L_nx = nx.laplacian_matrix(G).toarray()
-    assert np.allclose(L.toarray(), L_nx), "Laplacian mismatch with NetworkX"
-    print("✓ Laplacian matches NetworkX")
-
-    L_norm_nx = nx.normalized_laplacian_matrix(G).toarray()
-    assert np.allclose(L_norm.toarray(), L_norm_nx), "Normalized Laplacian mismatch"
-    print("✓ Normalized Laplacian matches NetworkX")
-
-    # Weighted graph: A is weight-aware, so the degrees must be too, or the
-    # normalized Laplacian stops being positive semi-definite.
-    G_w = nx.karate_club_graph()  # carries edge weights
-    L_w = laplacian_matrix(G_w)
-    assert np.allclose(L_w.toarray(), nx.laplacian_matrix(G_w).toarray()), (
-        "Weighted Laplacian mismatch with NetworkX"
-    )
-    L_w_norm = normalized_laplacian_matrix(G_w).toarray()
-    assert np.allclose(L_w_norm, nx.normalized_laplacian_matrix(G_w).toarray()), (
-        "Weighted normalized Laplacian mismatch with NetworkX"
-    )
-    assert np.linalg.eigvalsh(L_w_norm)[0] > -1e-9, (
-        "Normalized Laplacian is not positive semi-definite"
-    )
-    print("✓ Weighted graph matches NetworkX and stays PSD")
-
-    print("\nAll laplacian.py tests passed!")
+    identity = sparse.eye(G.number_of_nodes(), format="csr")
+    return identity - D_inv_sqrt @ A @ D_inv_sqrt

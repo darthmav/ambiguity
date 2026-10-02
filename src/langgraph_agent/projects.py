@@ -1,24 +1,15 @@
 """Generated projects: where a run's files land, and whether the corpus reads them.
 
-A run the operator points at a project writes under `projects/<name>/` instead
-of into this checkout, and that directory is **held out of the corpus walk**
-until the operator opts it in. The walk used to take whatever a run wrote:
-`iter_project_files` is a glob, so a snake game a Builder wrote on 2026-09-18
-was embedded by the next rebuild and its docstrings took a sentence-opener over
-the entity guard in `tests/test_claims.py` -- the project's knowledge base
-voting on what a pygame demo is about. Whether a finished project belongs in
-the corpus is a decision about what the Researcher should know, and only the
-operator can make it.
+A run pointed at a project writes under `projects/<name>/` instead of into the
+checkout, and that directory stays out of the corpus until the operator opts it
+in: whether a finished project is knowledge the Researcher should have is the
+operator's decision.
 
-The opt-in is a file on disk (`EMBEDDED_PROJECTS_FILE`) rather than a write
-straight into the store, for the reason uploads are files first: the corpus is
-a function of what the walk finds, and `index_project_files` prunes every row
-whose document is not in the walk. A project embedded any other way would be
-deleted by the next rebuild, silently. It is JSON because the walk never
-indexes JSON, and it sits beside the project directories rather than inside
-one, so a Builder confined to `projects/<name>/` cannot write itself into the
-corpus through `filesystem_write` -- the choice is the caller's, never an
-agent's, like `expect_failures` and `discuss_only`.
+The opt-in is a file on disk (`EMBEDDED_PROJECTS_FILE`), not a write into the
+store, because the corpus is a function of what the walk finds and a rebuild
+prunes everything else. It is JSON, which the walk never indexes, and it sits
+beside the project directories, so a Builder confined to one cannot opt itself
+in through `filesystem_write`.
 
 This module imports nothing from the rest of the package, because
 `graphrag_server` imports it for the walk.
@@ -62,8 +53,7 @@ def embedded_projects(root: str | Path = ".") -> set[str]:
     """Names the operator has opted into the corpus.
 
     A missing or unreadable record means none, never an error: the walk runs on
-    every status poll, and a corrupt file must not take the corpus down with it.
-    It holds the corpus to the safe side instead -- nothing generated is read.
+    every status poll, and a corrupt file errs on the safe side.
     """
     try:
         data = json.loads((Path(root) / EMBEDDED_PROJECTS_FILE).read_text(encoding="utf-8"))
@@ -98,9 +88,7 @@ def set_project_embedded(name: str, embedded: bool, root: str | Path = ".") -> s
 def held_out_of_corpus(relative: str | Path, embedded: set[str]) -> bool:
     """True for a walked file under `projects/` that the operator has not opted in.
 
-    Matched on the first path component, not as a substring the way
-    `PROJECT_INDEX_EXCLUDES` is: `projects/` as a substring also matches
-    `subprojects/` anywhere in the tree.
+    Matched on the first path component, so `docs/subprojects/` is not held out.
     """
     parts = PurePosixPath(str(relative).replace("\\", "/")).parts
     if not parts or parts[0] != PROJECTS_DIR:

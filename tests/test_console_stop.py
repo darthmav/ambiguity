@@ -77,7 +77,7 @@ def test_a_run_needs_a_goal(monkeypatch):
     indexed = []
     monkeypatch.setattr(
         serve,
-        "_index_the_project_before_the_run",
+        "_rebuild_the_corpus_before_the_run",
         lambda: indexed.append(True) or {"source": "disabled"},
     )
 

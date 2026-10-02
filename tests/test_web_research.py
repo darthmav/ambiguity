@@ -29,9 +29,8 @@ import pytest
 from langgraph_agent import web_research
 from langgraph_agent.graphrag_server import (
     MAX_INDEXABLE_BYTES,
-    PROJECT_INDEX_EXCLUDES,
     _document_metadata,
-    iter_project_files,
+    iter_corpus_files,
 )
 from langgraph_agent.web_research import (
     WEB_RESEARCH_DIR,
@@ -103,7 +102,7 @@ _REAL_CLIENT = httpx.Client
 def _serve(monkeypatch, handler):
     """Answer every request through MockTransport, with no socket involved."""
 
-    def client(*args, **kwargs):  # noqa: ANN002, ANN003
+    def client(*args, **kwargs):
         kwargs["transport"] = httpx.MockTransport(handler)
         return _REAL_CLIENT(*args, **kwargs)
 
@@ -315,24 +314,16 @@ def test_a_fetched_page_is_written_before_it_is_embedded(kb, tmp_path):
 
 
 def test_the_research_directory_is_inside_the_walk(kb, tmp_path, monkeypatch):
-    """Asserted through `iter_project_files`, never by reading the exclude list.
-
-    The excludes are plain substrings, so the way this breaks is someone adding
-    an entry that happens to match `research/web` — and only running the walk
-    catches that. If it ever does break, online research keeps working and
-    stops surviving reindexes, in silence.
+    """Asserted through `iter_corpus_files`: if the walk ever stops reading
+    `research/web`, online research keeps working and stops surviving
+    reindexes, in silence.
     """
     store_web_document(kb, _result("https://example.com/guide"), GOAL, str(tmp_path))
 
     monkeypatch.chdir(tmp_path)
-    walked = {str(path) for path in iter_project_files(".")}
+    walked = {str(path) for path in iter_corpus_files(".")}
 
     assert any(path.startswith(WEB_RESEARCH_DIR) for path in walked), walked
-
-
-def test_the_research_directory_is_not_excluded_from_the_walk():
-    """Stated separately because the exclude list is edited by hand."""
-    assert not any(excluded in f"{WEB_RESEARCH_DIR}/page.md" for excluded in PROJECT_INDEX_EXCLUDES)
 
 
 def test_a_stored_page_carries_the_same_metadata_as_any_other_document(kb, tmp_path):

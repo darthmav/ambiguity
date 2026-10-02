@@ -21,7 +21,7 @@ import pytest
 import serve
 from langgraph_agent.graphrag_server import (
     GraphRAGKnowledgeBase,
-    index_project_files,
+    index_corpus_files,
     relevance_floor,
 )
 
@@ -32,7 +32,7 @@ pytestmark = pytest.mark.usefixtures("whole_root_walk")
 class _FakeCollection:
     """The slice of the Chroma collection API these two methods use.
 
-    `get(include=[])` returning ids is the idiom `index_project_files` already
+    `get(include=[])` returning ids is the idiom `index_corpus_files` already
     relies on, so the fake has to honour it: ids always come back, `documents`
     and `metadatas` only when asked for.
     """
@@ -123,7 +123,7 @@ def test_clear_survives_a_restart(kb, tmp_path):
     """The clear has to reach disk, not just memory.
 
     Otherwise the corpus comes back at the next process start, which reloads
-    the graph from `knowledge_graph.json`. `index_project_files` had exactly
+    the graph from `knowledge_graph.json`. `index_corpus_files` had exactly
     this hole -- its `graph.clear()` was persisted only as a side effect of
     indexing something afterwards -- and it is pinned next door now that it
     does not.
@@ -138,7 +138,7 @@ def test_clear_survives_a_restart(kb, tmp_path):
 def test_a_reindex_that_matches_nothing_still_reaches_disk(kb, tmp_path):
     """The other half of `test_clear_survives_a_restart`, one door along.
 
-    `index_project_files` prunes Chroma and clears the graph before it indexes
+    `index_corpus_files` prunes Chroma and clears the graph before it indexes
     anything, but both were persisted only as a side effect of `add_document`.
     A reindex matching no files therefore emptied the graph in memory, wrote
     nothing, and left the old `knowledge_graph.json` for the next process start
@@ -152,7 +152,7 @@ def test_a_reindex_that_matches_nothing_still_reaches_disk(kb, tmp_path):
     empty_root.mkdir()
     kb._lexical_index = object()  # stands in for one built before the prune
 
-    report = index_project_files(kb, str(empty_root))
+    report = index_corpus_files(kb, str(empty_root))
 
     assert report["indexed"] == 0
     assert kb.collection.count() == 0  # the prune ran
@@ -189,7 +189,7 @@ def test_a_reindex_that_indexes_something_persists_what_it_built(kb, tmp_path):
     kb.add_document = fake_add
     kb._lexical_index = object()
 
-    report = index_project_files(kb, str(root))
+    report = index_corpus_files(kb, str(root))
 
     assert report["indexed"] == 1
     reloaded = json.loads((tmp_path / "knowledge_graph.json").read_text())
@@ -393,7 +393,7 @@ def test_there_is_no_way_to_ask_the_console_for_a_rebuild(console_kb):
     one at a time, so a search landing partway through is answered from a
     corpus that is neither the old one nor the new one, and is *answered*, not
     failed. That refusal is no longer needed because the request cannot be
-    made: `_index_the_project_before_the_run` rebuilds on every run, before
+    made: `_rebuild_the_corpus_before_the_run` rebuilds on every run, before
     the Architect opens and while nothing is searching.
 
     Pinned as an absence because an RPC method is one line to add back, and
@@ -1210,44 +1210,6 @@ def test_rpc_surface_for_the_split_and_the_duplicate_scan(kb, monkeypatch):
 # What a reindex is allowed to see
 # --------------------------------------------------------------------------
 
-def test_the_excludes_are_substrings_that_actually_match_what_they_name():
-    """Both directions of the same defect, and neither one raises.
-
-    `PROJECT_INDEX_EXCLUDES` is matched with `in`, never as globs. A pattern
-    written glob-style therefore matches nothing at all, and a bare directory
-    name matches every path that merely contains it. Two scripts kept their own
-    drifted copy of this list and had both bugs at once: `"*.egg-info"`
-    excluded nothing, so four build artifacts were indexed, while a bare
-    `"build"` matched `prompts/builder.txt` and kept the Builder's own system
-    prompt out of the corpus. The file count was simply wrong, in both
-    directions, with nothing raised and no counter to show it.
-    """
-    from langgraph_agent.graphrag_server import PROJECT_INDEX_EXCLUDES
-
-    assert not any("*" in pattern for pattern in PROJECT_INDEX_EXCLUDES), (
-        "a glob-shaped pattern is matched as a literal substring, so it "
-        "excludes nothing"
-    )
-
-    def excluded(path: str) -> bool:
-        return any(pattern in path for pattern in PROJECT_INDEX_EXCLUDES)
-
-    assert excluded("src/langgraph_agent.egg-info/SOURCES.txt")
-    assert excluded("build/lib/thing.py")
-    # The original test verified that "build/" (with trailing slash) doesn't
-    # accidentally match "prompts/builder.txt". That's still true.
-    # But now "prompts/" (with trailing slash) IS in the excludes, so
-    # "prompts/builder.txt" IS intentionally excluded.
-    for path in (
-        "prompts/builder.txt",
-        "src/langgraph_agent/graphrag_server.py",
-        "tests/test_corpus_admin.py",
-        "frontend/index.html",
-        "spectral_graph/laplacian.py",
-    ):
-        assert excluded(path), f"{path} is now intentionally excluded"
-
-
 def test_nothing_but_a_run_and_an_upload_builds_a_corpus():
     """Two acts index, and the guard is that no third one exists.
 
@@ -1260,12 +1222,12 @@ def test_nothing_but_a_run_and_an_upload_builds_a_corpus():
     run, and for a document being embedded into the corpus.
 
     Recomputed from the tree rather than listed, so a script added next month
-    is caught by the same test. `iter_project_files` is fine anywhere: reading
+    is caught by the same test. `iter_corpus_files` is fine anywhere: reading
     the walk is not indexing.
     """
     from pathlib import Path
 
-    builders = ("get_knowledge_base", "index_project_files", "GraphRAGKnowledgeBase(")
+    builders = ("get_knowledge_base", "index_corpus_files", "GraphRAGKnowledgeBase(")
     offenders = []
     for path in [*Path("scripts").glob("*.py"), Path("install.sh"),
                  Path("launch_console.sh"), Path("example_usage.py")]:

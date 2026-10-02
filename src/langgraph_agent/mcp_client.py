@@ -1,17 +1,11 @@
-"""MCP client integration for GraphRAG and filesystem tools.
+"""The agents' tool belts, served in-process under MCP-style tool names.
 
-This module provides a unified interface to MCP (Model Context Protocol) servers.
-For GraphRAG, can use the local knowledge base directly or connect to an MCP server.
+Every tool takes a dict of arguments and returns a JSON-serialisable dict. The
+Researcher's node calls the two read-only GraphRAG tools; the Builder is bound
+to the filesystem, git, terminal and test tools (`BUILDER_TOOLS` in nodes.py).
 
 Usage:
-    from langgraph_agent.mcp_client import MCPClient
-
-    async with MCPClient() as client:
-        # List available tools
-        tools = await client.list_tools()
-
-        # Call GraphRAG search
-        result = await client.call_tool("search_knowledge_graph", {"query": "Planner agent"})
+    result = MCPClient().call_tool("search_knowledge_graph", {"query": "Planner"})
 """
 
 from __future__ import annotations
@@ -22,52 +16,38 @@ import re
 import shlex
 import subprocess
 import sys
-from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from langgraph_agent.self_healing import call_with_retry
 
 if TYPE_CHECKING:
     from langgraph_agent.graphrag_server import GraphRAGKnowledgeBase
 
 
-
-# How long one `terminal_execute` command may run before it is killed. It was
-# 30, which is under what this project's own scripts take: `verify_and_test.py`
-# finishes clean in ~33s and was reported FAILED for the 3s difference. That is
-# the failure `MIN_VERIFY_SLICE_SECONDS` describes, one level up -- a working
-# command comes back labelled broken, and the Builder spends its next turns
-# repairing code that was never wrong. 60 matches `VERIFY_TIMEOUT_SECONDS`, the
-# closest sibling: both bound a single command the Builder is waiting on, and
-# the Builder's whole node budget (`BUILDER_DEADLINE_SECONDS`, 240) has to
-# cover several of them plus the verification reserve.
+# How long one `terminal_execute` command may run before it is killed. Above
+# what this project's own scripts take, or working code comes back labelled
+# broken; the Builder's deadline has to cover several such commands.
 TERMINAL_TIMEOUT_SECONDS = float(os.getenv("TERMINAL_TIMEOUT_SECONDS", "60"))
 
-# The ceiling on a *requested* timeout. A tool call is never abandoned -- the
-# Builder's deadline may interrupt the model's turn but never a running tool --
-# so a seat that asks for 99999 seconds does not overrun a deadline, it hangs
-# the pass past every deadline there is. The ceiling is what stops an exposed
-# knob from becoming that. 600 matches `_run_tests`, the longest thing the
-# tool belt legitimately does.
+# The ceiling on a *requested* timeout. A tool call is never abandoned, so an
+# unbounded request would hang the pass past every deadline. 600 is the longest
+# thing the tool belt legitimately does, a test suite.
 TERMINAL_TIMEOUT_MAX_SECONDS = float(os.getenv("TERMINAL_TIMEOUT_MAX_SECONDS", "600"))
 
 
-# The largest file `filesystem_read` returns whole: fifty times what reaches the
-# model (`MAX_TOOL_RESULT_CHARS`, 20,000), so any source file or document a
-# Builder works on is read in one piece, and only a log or a dump is turned away.
+# The largest file `filesystem_read` returns whole: fifty times what reaches
+# the model, so only a log or a dump is turned away.
 FILESYSTEM_READ_MAX_BYTES = 1_000_000
 
 
 def _resolve_timeout(requested: Any, default: float | None = None) -> float:
-    """Clamp a requested command timeout to [1, TERMINAL_TIMEOUT_MAX_SECONDS].
+    """Clamp a requested command timeout to (0, TERMINAL_TIMEOUT_MAX_SECONDS].
 
-    A missing or malformed value falls back to `default` --
-    `TERMINAL_TIMEOUT_SECONDS` unless the caller names another -- instead of
-    raising. The number arrives as JSON from a model, and refusing the call to
-    complain about it costs a whole tool turn to say what a clamp says for
-    nothing. Non-finite is rejected here rather than left to `min`:
-    `min(nan, 600)` is `nan`, which reaches `subprocess.run` as no timeout at
-    all.
+    A missing, malformed or non-finite value falls back to `default`
+    (`TERMINAL_TIMEOUT_SECONDS` unless named): the number comes from a model, and
+    `min(nan, 600)` is `nan`, which `subprocess.run` reads as no timeout at all.
     """
     if default is None:
         default = TERMINAL_TIMEOUT_SECONDS
@@ -82,46 +62,28 @@ def _resolve_timeout(requested: Any, default: float | None = None) -> float:
     return min(seconds, TERMINAL_TIMEOUT_MAX_SECONDS)
 
 
-# A shell builtin reaches `subprocess` as a missing executable, so
-# `Command not found: 'cd'` is what the Builder gets -- true, and useless: it
-# names what failed and not one of the things that would work. Measured on the
-# rerun of the leviathan goal after `cwd` shipped, the Builder spent three
-# turns on `cd there && ...` before finding the argument that replaces it. The
-# schema says so already; an error is read at the moment the mistake is made,
-# which a description consulted before the turn is not.
-#
-# Only the first group has a replacement to point at. The rest get the fact
-# that ends the retry rather than an alternative that does not exist: `export`
-# cannot set a variable for a later call here, and no wording makes it able to.
+# A shell builtin reaches `subprocess` as a missing executable. The error names
+# what replaces it -- `cwd` for the first group -- since an error is read at
+# the moment of the mistake, which a schema description is not. The rest have
+# no replacement: `export` cannot set a variable for a later call here.
 _CWD_BUILTINS = frozenset({"cd", "pushd", "popd"})
 _OTHER_BUILTINS = frozenset(
     {"source", ".", "export", "set", "unset", "alias", "eval", "exec"}
 )
 
 
-# Shell operators, recognised only as *whole argv tokens*. That precision is
-# what separates this from the character whitelist the shell removal replaced:
-# the old filter scanned the raw string and so refused
-# `python -c "import x; print(y)"` for a `;` that was never syntax. After
-# `shlex.split` the same one-liner is three tokens with the `;` inside the
-# quoted one, and only an operator the caller wrote unquoted stands alone.
-#
-# Redirection gets a different sentence from chaining because a replacement
-# exists for it and not for them -- the same reason `cd` is answered with `cwd`
-# and `export` is not answered with anything.
+# Shell operators, recognised only as *whole argv tokens* after `shlex.split`,
+# so a `;` inside a quoted `python -c "..."` is never mistaken for syntax.
+# Redirection gets its own wording because it has a replacement and chaining
+# does not.
 _REDIRECTS = frozenset({">", ">>", "<", "<<", "2>", "2>>", "1>", "&>", ">&"})
 _CHAINS = frozenset({"&&", "||", ";", "&", "|"})
 SHELL_OPERATORS = _REDIRECTS | _CHAINS
 
-# A redirect written the way it is usually written: glued to its target.
-# `shlex` keeps `2>/dev/null` as one token, so the whole-token check never saw
-# an operator in it and the program was handed the literal string -- `find`
-# answered `paths must precede expression: '2>/dev/null'` on the run of
-# 2026-09-10, whose Builder wrote that suffix nine times in one pass. Output
-# redirection only: an input redirect glued to its target cannot be told from
-# a real argument (`grep "<div>"`), and `=` may not follow the `>`, so a
-# version bound like `>=1.0` passes. The cost is the one `&&` already pays: an
-# argument that really does begin with `>` cannot be passed, quoted or not.
+# A redirect glued to its target (`2>/dev/null`), which `shlex` keeps as one
+# token. Output redirection only: a glued input redirect cannot be told from an
+# argument (`grep "<div>"`), and `=` may not follow `>`, so `>=1.0` passes. An
+# argument that really begins with `>` cannot be passed, as `&&` cannot.
 _GLUED_REDIRECT = re.compile(r"^[0-9&]?>>?(?:&[0-9]+|[^\s=>&]\S*)$")
 
 
@@ -132,24 +94,13 @@ def _is_shell_operator(token: str) -> bool:
 def _shell_operator_error(token: str) -> str:
     """Explain a shell operator that reached argv, and name what replaces it.
 
-    There is no shell, so the operator is inert either way; refusing it is
-    about the *diagnosis*, not about safety. Left to run, the command fails
-    somewhere unrelated and blames the wrong thing: `wc -l notes.md && tail
-    -50 notes.md` hands `wc` the arguments `&&`, `tail` and `-50`, and comes
-    back `wc: invalid option -- '5'` having never counted the file it was
-    given. Nothing in that names the chain.
-
-    That a description is not enough here is measured rather than assumed. The
-    schema already said shell syntax is not interpreted, and on the rerun of
-    2026-09-08 the Builder still reached for `cd there && ...` three times
-    before using the `cwd` argument that replaces it. A description is
-    consulted before the turn; an error is read at the moment the mistake is
-    made.
+    There is no shell, so the operator is inert either way; refusing it is about
+    the diagnosis. Left to run, the command fails somewhere unrelated -- `wc -l
+    notes.md && tail -50 notes.md` comes back `wc: invalid option -- '5'`.
     """
     if token in _REDIRECTS or _GLUED_REDIRECT.match(token):
-        # Discarding or merging a stream is the commonest redirect by far, and
-        # it has no replacement because it needs none: nothing is printed to a
-        # terminal here, both streams come back as separate fields.
+        # Discarding or merging a stream needs no replacement: both streams
+        # come back as separate fields.
         if token.endswith("/dev/null") or re.search(r">&[0-9]+$", token):
             return (
                 f"{token!r} is shell redirection, and there is no shell here. "
@@ -175,11 +126,7 @@ def _shell_operator_error(token: str) -> str:
 
 
 def _missing_program_error(program: str) -> str:
-    """Say a program is missing, and say what to do when it is a builtin instead.
-
-    Kept apart from the `FileNotFoundError` handler so the wording can be
-    tested without spawning anything.
-    """
+    """Say a program is missing, and what to do when it is a shell builtin instead."""
     if program in _CWD_BUILTINS:
         return (
             f"Command not found: {program!r}. It is a shell builtin, not a "
@@ -201,13 +148,9 @@ _GLOB_CHARS = frozenset("*?[")
 def _unexpanded_hint(argv: list[str], stderr: str) -> str | None:
     """Name a glob or `~` that reached the program literally and tripped it.
 
-    With no shell, `cat dir/*` hands `cat` a file named `dir/*`, and `cat`
-    answers "No such file or directory" about a directory that exists -- true
-    of the name it got, and false of what was meant. Only raised when the
-    program quoted the token back in its own error: `find . -name "*.py"`
-    wants the literal and succeeds, and a regex such as `[` that fails to
-    compile is reported unquoted, so neither is mistaken for an unexpanded
-    glob.
+    With no shell, `cat dir/*` hands `cat` a file named `dir/*`. Raised only when
+    the program quoted the token back in its error, so `find . -name "*.py"`,
+    which wants the literal, is never flagged.
     """
     for token in argv[1:]:
         if not (_GLOB_CHARS & set(token) or token.startswith("~")):
@@ -221,45 +164,42 @@ def _unexpanded_hint(argv: list[str], stderr: str) -> str | None:
     return None
 
 
-# The base every filesystem tool resolves a relative path against: the server's
-# working directory, which is the project root. Named here so `_resolve_cwd`,
-# `filesystem_read` and `filesystem_write` cannot drift into three bases -- one
-# relative path has to mean one place across the whole tool belt.
+# The base every tool resolves a relative path against -- the server's working
+# directory, the project root -- so one relative path means one place.
 def _project_root() -> Path:
     return Path.cwd().resolve()
 
 
-# Stages of the `git_dwell` pipeline, in the only order they work in. Named
-# here so the tool can report which one it reached: a pipeline that fails
-# somewhere has to say where, or the caller retries the whole thing and re-runs
-# the parts that already succeeded.
+# Stages of the `git_dwell` pipeline, in the only order they work in, named so
+# a failure can say which stage it reached.
 DWELL_STAGES = ("survey", "branch", "stage", "commit", "push", "pr", "merge")
 
-# What `git_dwell` runs when the caller names no stages: the whole pipeline,
-# merge included. `merge` sat outside this tuple until 2026-09-12, on the
-# argument that a pull request the same agent opens and immediately merges is
-# not a review -- which is true, and was the wrong thing for the default to
-# decide. The tool is one call because the flow is one act; a default that
-# stopped one stage short meant the common case was a branch pushed, a PR
-# opened and nothing on the default branch, with the last stage left to a
-# caller that had no way to know it was missing. A caller who wants the review
-# point still has it, and now has to say so: `stages` without `merge` stops at
-# `pr`, which is the same opt-out the old default was, spelled by whoever
-# actually wants it.
+# What `git_dwell` runs when the caller names no stages: all of them, merge
+# included. A caller who wants the review point names stages without `merge`.
 DWELL_DEFAULT_STAGES = DWELL_STAGES
+
+# What git says when a push failed on the way to the remote rather than at it.
+# Pushing the same commit again is harmless -- the remote either has it or does
+# not -- so these are retried, briefly; a rejected push is the remote answering
+# and is not, and neither is a timeout, which already spent what a retry would.
+_PUSH_FAILED_IN_TRANSIT = (
+    "could not resolve host", "connection reset", "connection refused",
+    "failed to connect", "the remote end hung up unexpectedly", "early eof", "rpc failed",
+)
+PUSH_ATTEMPTS = 3
+
+
+class _PushFailedInTransit(Exception):
+    """A push that never reached the remote, carrying git's own words."""
 
 
 def _branch_name_from(message: str) -> str:
-    """Derive a branch name from a commit message's first line.
+    """A branch name from a commit message's first line, for a caller that named none.
 
-    Only used when the caller did not name one. Conservative on purpose: the
-    name reaches a remote, so it is reduced to the characters git is happy with
-    rather than cleverly abbreviated.
+    Reduced to characters git accepts, since it reaches a remote.
     """
     head = (message.splitlines() or [""])[0].lower()
-    # Drop a conventional-commit prefix: `fix: contain writes` is a better
-    # branch as `contain-writes` than as `fix-contain-writes`, and the type is
-    # already carried by the commit itself.
+    # Drop a conventional-commit prefix: the commit carries the type.
     head = re.sub(r"^(feat|fix|docs|test|chore|refactor|ci|perf)(\([^)]*\))?:\s*", "", head)
     slug = re.sub(r"[^a-z0-9]+", "-", head).strip("-")[:48].strip("-")
     return f"agent/{slug or 'change'}"
@@ -268,43 +208,20 @@ def _branch_name_from(message: str) -> str:
 def _resolve_write_path(requested: Any) -> tuple[Path | None, str | None]:
     """Resolve a requested write path to `(path, error)`, refusing to escape the project.
 
-    An error is returned *instead of* a path, never alongside one, the same
-    shape `_resolve_cwd` uses and for the same reason: the caller must not be
-    able to act on half an answer.
+    An error is returned *instead of* a path, never beside one. A write outside
+    the project is invisible to the corpus and to git, and makes the run's
+    `files_changed` name a path nobody can find from the project.
 
-    This is containment, not safety theatre. `filesystem_write` took its
-    argument raw and called `Path(path).write_text()` behind a
-    `parent.mkdir(parents=True)`, so an absolute path, a `..` or a symlink put
-    the Builder's writes anywhere the account could reach -- and it did: the
-    run of 2026-09-11 wrote `/tmp/gen_doc.py` and `/tmp/gen_overview.py` while
-    working on a goal about this checkout. Two costs, and the second is the one
-    that bites. The obvious cost is a file left outside the project that no
-    reindex, no `corpus_staleness` and no `git status` will ever mention. The
-    quiet one is that `files_changed` feeds the console's "changed this
-    machine" notice, so a write outside the root makes that notice name a path
-    the operator cannot find from the project -- the same false account as a
-    Builder claiming a file it never wrote, which this project already guards
-    in `_report_path_key`, pointing the other way.
-
-    The path is resolved *before* the write rather than checked after, and
-    `resolve()` is what does it: a check on the literal string would pass
-    `project/link/x` where `link` points at `/etc`, because only resolution
-    knows where a symlink lands. The whole path is resolved, leaf included:
-    a leaf that already exists as a symlink out of the project is refused,
-    which a check of the parent alone would miss -- `write_text` follows it.
-    A leaf that does not exist yet is fine, since `strict=False` resolution
-    resolves the part of the path that exists and keeps the rest as written.
-
-    `~` is not expanded, for the reason `_resolve_cwd` gives: there is no shell
-    here, and a path that quietly expanded what an argument on the same line
-    would not is a worse surprise than a refusal naming the path.
+    The whole path is resolved before the write, leaf included, because only
+    resolution knows where a symlink lands: `project/link/x` with `link` pointing
+    at `/etc`, or a leaf that is itself a symlink out, would pass a check of the
+    literal string. A leaf that does not exist yet is fine. `~` is not expanded:
+    there is no shell here.
     """
     if not isinstance(requested, str) or not requested.strip():
         return None, f"Invalid path: {requested!r}. Pass a file path inside the project."
     root = _project_root()
     candidate = Path(requested)
-    # The whole path, leaf included -- see the docstring for why the leaf
-    # matters as much as the parent.
     resolved = (root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
     try:
         resolved.relative_to(root)
@@ -322,25 +239,11 @@ def _resolve_write_path(requested: Any) -> tuple[Path | None, str | None]:
 def _resolve_cwd(requested: Any) -> tuple[str | None, str | None]:
     """Resolve a requested working directory to `(cwd, error)`.
 
-    An error is returned *instead of* a directory, never alongside one; both
-    are None when nothing was requested and the command inherits ours.
-
-    The check is here rather than left to `subprocess.run` because of what
-    that raises: a missing `cwd` comes back as `FileNotFoundError`, which is
-    the same exception a missing *program* raises and lands in the handler
-    that answers `Command not found: 'python'` -- naming the one thing that
-    was fine. A `cwd` that exists but is a file raises `NotADirectoryError`,
-    which is not a `FileNotFoundError` at all and falls through to a bare
-    errno string. Both are the false accusation this module keeps having to
-    design against, so the directory is checked while we still know it is the
-    directory being complained about.
-
-    A relative path resolves against the server's working directory, which is
-    the project root -- the same base `filesystem_read` and `filesystem_write`
-    use, so one relative path means one place across the whole tool belt.
-    `~` is not expanded, for the reason no other shell syntax is: there is no
-    shell here, and a `cwd` that quietly expanded what an argument on the same
-    line would not is a worse surprise than a refusal naming the path.
+    An error comes back *instead of* a directory; both are None when nothing was
+    requested. Checked here because `subprocess.run` reports a missing `cwd` as
+    `FileNotFoundError` -- the same exception as a missing program, so the error
+    would name the wrong thing. Relative to the project root, like every other
+    tool; `~` is not expanded.
     """
     if requested is None:
         return None, None
@@ -353,126 +256,52 @@ def _resolve_cwd(requested: Any) -> tuple[str | None, str | None]:
     return str(path), None
 
 
+_Tool = Callable[[dict[str, Any]], dict[str, Any]]
+
+
 class MCPClient:
-    """Client for MCP servers (GraphRAG, Filesystem, Git).
+    """Every tool either seat can be handed, by name."""
 
-    Uses local GraphRAG knowledge base when available, falls back to stubs.
-    """
-
-    def __init__(self, server_urls: list[str] | None = None):
-        """Initialize MCP client.
-
-        Args:
-            server_urls: List of MCP server URLs (default from env vars)
-        """
-        self.server_urls = server_urls or self._default_servers()
-        self._connected = False
-        self._tools: dict[str, Any] = {}
-        self._kb: GraphRAGKnowledgeBase | None = None
-
-    def _default_servers(self) -> list[str]:
-        """Get default MCP server URLs from environment."""
-        servers: list[str] = []
-        if url := os.getenv("MCP_GRAPHRAG_URL"):
-            servers.append(url)
-        if url := os.getenv("MCP_FILESYSTEM_URL"):
-            servers.append(url)
-        if url := os.getenv("MCP_GIT_URL"):
-            servers.append(url)
-        return servers
-
-    async def connect(self) -> None:
-        """Connect to MCP servers and initialize local GraphRAG (lazy)."""
-        # Lazy init GraphRAG - only when actually needed for search
-        self._kb = None
-        self._connected = True
+    def __init__(self) -> None:
         self._tools = self._discover_tools()
 
-    async def disconnect(self) -> None:
-        """Disconnect from MCP servers."""
-        self._connected = False
-        self._tools = {}
-        self._kb = None
+    def _discover_tools(self) -> dict[str, _Tool]:
+        """The tool map. A Builder tool must also have a schema in `BUILDER_TOOLS`."""
+        return {
+            # Read-only: the Researcher never adds to the corpus.
+            "search_knowledge_graph": self._graphrag_search,
+            "query_knowledge_graph": self._graphrag_query_graph,
+            "filesystem_read": self._filesystem_read,
+            "filesystem_write": self._filesystem_write,
+            "git_status": self._git_status,
+            "git_diff": self._git_diff,
+            "git_dwell": self._git_dwell,
+            "terminal_execute": self._terminal_execute,
+            "run_tests": self._run_tests,
+        }
 
-    def _discover_tools(self) -> dict[str, Any]:
-        """Discover available tools from connected servers.
-
-        Returns:
-            Dict mapping tool names to tool callables
-        """
-        tools = {}
-
-        # Always provide GraphRAG read-only tools (local or stub).
-        # GraphRAG is read-only per the 4-Agent System specification; adding
-        # documents is done through indexing scripts, not the Researcher tool belt.
-        tools["search_knowledge_graph"] = self._graphrag_search
-        tools["query_knowledge_graph"] = self._graphrag_query_graph
-
-        # Real filesystem, git, terminal, and test tools
-        tools["filesystem_read"] = self._filesystem_read
-        tools["filesystem_write"] = self._filesystem_write
-        tools["git_status"] = self._git_status
-        tools["git_diff"] = self._git_diff
-        tools["git_dwell"] = self._git_dwell
-        tools["terminal_execute"] = self._terminal_execute
-        tools["run_tests"] = self._run_tests
-
-        return tools
-
-    async def list_tools(self) -> list[str]:
-        """List all available tools."""
-        if not self._connected:
-            await self.connect()
-        return list(self._tools.keys())
-
-    async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
-        """Call a tool by name.
-
-        Args:
-            tool_name: Name of the tool to call
-            arguments: Tool arguments
-
-        Returns:
-            Tool result
-        """
-        if not self._connected:
-            await self.connect()
-
-        if tool_name not in self._tools:
+    def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
+        """Run one tool. Raises ValueError for a name no tool has."""
+        tool = self._tools.get(tool_name)
+        if tool is None:
             raise ValueError(f"Unknown tool: {tool_name}")
-
-        tool_fn = self._tools[tool_name]
-        return await tool_fn(arguments)
-
-    # GraphRAG implementations (use local knowledge base when available)
+        return tool(arguments)
 
     def _open_kb(self) -> GraphRAGKnowledgeBase | None:
         """The corpus if one has been built, `None` otherwise.
 
-        `open_knowledge_base`, never `get_knowledge_base`: the second one
-        creates the store, and a Researcher's query is not a request for a
-        knowledge base. Cached on the client so repeated calls in one run do
-        not reopen Chroma. The cache is only ever filled with a real corpus,
-        so a search that happens before the operator indexes does not pin
-        `None` for the rest of the process.
+        `open_knowledge_base`, never `get_knowledge_base`: a Researcher's query is not
+        a request for a knowledge base to be created.
         """
-        if self._kb is None:
-            try:
-                from langgraph_agent.graphrag_server import open_knowledge_base
+        try:
+            from langgraph_agent.graphrag_server import open_knowledge_base
 
-                self._kb = open_knowledge_base()
-            except Exception:
-                self._kb = None
-        return self._kb
+            return open_knowledge_base()
+        except Exception:
+            return None
 
-    async def _graphrag_search(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Search the knowledge base (cached singleton).
-
-        With no corpus this returns *no* results. It used to return one
-        fabricated row -- `[GraphRAG not indexed]`, score 0.0 -- which is a
-        made-up retrieval hit sitting in the same field real ones arrive in,
-        and the Builder reads that field.
-        """
+    def _graphrag_search(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Search the knowledge base. With no corpus: no results, and a note saying why."""
         query = args.get("query", "")
         top_k = args.get("top_k", 5)
 
@@ -484,8 +313,8 @@ class MCPClient:
 
         return {"results": kb.search(query, top_k), "source": "local_graphrag"}
 
-    async def _graphrag_query_graph(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Query the knowledge graph."""
+    def _graphrag_query_graph(self, args: dict[str, Any]) -> dict[str, Any]:
+        """One entity's neighbourhood in the knowledge graph."""
         entity = args.get("entity", "")
         hops = args.get("hops", 2)
 
@@ -506,24 +335,14 @@ class MCPClient:
         result["source"] = "local_graphrag"
         return result
 
-    # Real filesystem implementations
+    def _filesystem_read(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Read a file's contents.
 
-    async def _filesystem_read(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Read file contents.
-
-        Not confined to the project the way `filesystem_write` is, and on
-        purpose. `terminal_execute` runs any program with this server's
-        permissions -- `cat` reads whatever this tool would -- so a fence here
-        would be a safety claim the tool belt cannot keep. Writes are confined
-        for what they feed, `files_changed` and the corpus, which are about the
-        project; they are not a sandbox either. What bounds a run is where its
-        seats run (local by default, so nothing read leaves this machine) and
-        the console listening only on loopback.
-
-        A file over `FILESYSTEM_READ_MAX_BYTES` is refused unread rather than
-        loaded whole to be cut at `MAX_TOOL_RESULT_CHARS` on its way to the
-        model -- a log or a data dump that size is memory and time for text
-        nobody sees -- and the refusal says how to read part of it.
+        Not confined to the project the way `filesystem_write` is: `terminal_execute`
+        runs any program, so a fence here would be a safety claim the tool belt cannot
+        keep. Writes are confined for what they feed (`files_changed`, the corpus).
+        A file over `FILESYSTEM_READ_MAX_BYTES` is refused unread, with how to read
+        part of it.
         """
         path = args.get("path", "")
         try:
@@ -543,12 +362,9 @@ class MCPClient:
         except Exception as e:
             return {"success": False, "error": str(e), "path": path}
 
-    async def _filesystem_write(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Write file contents inside the project, creating parent directories if needed.
-
-        The path goes through `_resolve_write_path` first, which refuses
-        anything landing outside the project root -- see it for why a raw
-        `Path(path).write_text()` here was worth closing.
+    def _filesystem_write(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Write a file inside the project, creating parent directories as needed (see
+        `_resolve_write_path`).
         """
         path = args.get("path", "")
         content = args.get("content", "")
@@ -562,15 +378,9 @@ class MCPClient:
         except Exception as e:
             return {"success": False, "error": str(e), "path": path}
 
-    # Real git implementations
-
-    async def _git_status(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Git status.
-
-        git's exit status is read before its output is. A command that failed
-        prints nothing on stdout, and "nothing" is exactly what a clean tree
-        prints too -- so a directory that is not a repository came back as
-        `success` with "Working tree clean".
+    def _git_status(self, args: dict[str, Any]) -> dict[str, Any]:
+        """`git status --porcelain`. The exit status is read first: a failed command and
+        a clean tree both print nothing.
         """
         try:
             result = subprocess.run(
@@ -587,16 +397,11 @@ class MCPClient:
                     or f"git status exited {result.returncode}"}
         return {"success": True, "status": result.stdout or "Working tree clean"}
 
-    async def _git_diff(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Git diff, of the whole tree or of one path.
+    def _git_diff(self, args: dict[str, Any]) -> dict[str, Any]:
+        """`git diff`, of the whole tree or of one path.
 
-        The path goes after `--`, and only when there is one. With no path this
-        used to run `git diff ""`, which git refuses outright (an empty string
-        is not a pathspec) -- and because the exit status went unread, the
-        refusal's empty stdout came back as `success` with "No changes". So
-        the Builder's plain `git_diff()` reported a clean tree on every call,
-        however much it had changed. Without `--`, a path that also names a
-        branch or a commit is read as a revision.
+        The path goes after `--`, only when there is one, so a path that also names a
+        branch is not read as a revision.
         """
         path = str(args.get("path") or "").strip()
         command = ["git", "diff"] + (["--", path] if path else [])
@@ -615,16 +420,11 @@ class MCPClient:
                     or f"git diff exited {result.returncode}"}
         return {"success": True, "diff": result.stdout or "No changes"}
 
-    # The ordered git pipeline (`git_dwell`)
-
     def _run_vcs(self, *argv: str, timeout: float = 60.0) -> tuple[bool, str]:
         """One git/gh invocation. Returns `(ok, output)` with stderr folded in.
 
-        stderr is kept because git says the useful part there -- "nothing to
-        commit", "no upstream branch", a rejected push -- and a stage that
-        failed with an empty message is a stage nobody can act on. No shell,
-        for the reason `_terminal_execute` has none: the arguments are argv
-        entries, so a commit message containing `;` or `&&` is a message.
+        stderr says the useful part -- "nothing to commit", a rejected push. No shell:
+        a commit message containing `;` is a message.
         """
         try:
             done = subprocess.run(
@@ -638,10 +438,10 @@ class MCPClient:
         return done.returncode == 0, ((done.stdout or "") + (done.stderr or "")).strip()
 
     def _default_branch(self) -> str:
-        """The branch a PR targets. `origin/HEAD` first, then the usual names.
+        """The branch a PR targets: `origin/HEAD` first, then the usual names.
 
-        The remote's prefix is removed rather than everything up to the last
-        slash, which cut a default branch named `release/2.0` down to `2.0`.
+        The remote's prefix is removed, not everything up to the last slash, so
+        `release/2.0` survives.
         """
         ok, out = self._run_vcs("git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
         if ok and out.startswith("refs/remotes/origin/"):
@@ -652,34 +452,19 @@ class MCPClient:
                 return name
         return "main"
 
-    async def _git_dwell(self, args: dict[str, Any]) -> dict[str, Any]:
+    def _git_dwell(self, args: dict[str, Any]) -> dict[str, Any]:
         """Run the git pipeline in order, stopping at the first stage that fails.
 
-        Every stage is a real command whose output is recorded, so the result
-        is an account of what happened rather than a claim that it did -- the
-        rule `files_changed` already follows, one level up. A stage that fails
-        leaves the ones after it unrun and names itself in `stopped_at`, since
-        a pipeline that reports only "failed" gets retried whole and re-runs
-        the parts that already worked.
+        Every stage is a real command with its output recorded, so the result is an
+        account of what happened; a failure names itself in `stopped_at`, so a retry
+        need not re-run what worked.
 
-        *It will not commit onto the default branch.* Committing straight onto
-        `main` is exactly what the branch-then-PR flow exists to prevent, and
-        an agent doing it has removed the review point before anyone could use
-        it. So `branch` creates one when HEAD is the default, naming it from
-        the message when the caller did not. This is the refusal that survives,
-        and it is the one that matters: the work still arrives on a branch,
-        through a pull request, with the diff and the checks attached.
-
-        *It does merge by default*, and that changed on 2026-09-12. The
-        argument for stopping at `pr` was that a pull request the same agent
-        opens and immediately merges is not a review. That remains true -- it
-        is simply not something a default can decide. A caller who wants the
-        review point names its stages and stops at `pr`; what the old default
-        produced instead was the opposite of a considered choice, a pipeline
-        that did six sevenths of a job every time and left the seventh to
-        somebody who had not been told it was outstanding. `merge` is
-        `--squash --delete-branch`, so what lands on the default branch is one
-        commit carrying the pull request's title and body.
+        *It will not commit onto the default branch*: `branch` creates one when HEAD
+        is the default, named from the message when the caller named none, so the work
+        always arrives through a pull request. *It merges by default*
+        (`--squash --delete-branch`); a caller wanting the review point names stages
+        without `merge`. A push that never reached the remote is retried briefly --
+        pushing a commit again is harmless; nothing else here is retried.
         """
         message = str(args.get("message") or "").strip()
         requested = [str(x) for x in (args.get("stages") or DWELL_DEFAULT_STAGES)]
@@ -688,9 +473,8 @@ class MCPClient:
             return {"success": False, "error":
                     f"Unknown stage(s): {', '.join(unknown)}. "
                     f"Valid stages, in order: {', '.join(DWELL_STAGES)}."}
-        # Run in the canonical order whatever order they arrived in: these are
-        # pipeline phases, not a script, so "push then commit" is a typo rather
-        # than an instruction to do it backwards.
+        # Canonical order whatever the request's: "push then commit" is a typo,
+        # not an instruction.
         stages = [x for x in DWELL_STAGES if x in requested]
 
         log: list[dict[str, Any]] = []
@@ -741,11 +525,8 @@ class MCPClient:
                 return stop("commit", "no message given; pass `message`")
             ok, staged = self._run_vcs("git", "diff", "--cached", "--name-only")
             if ok and not staged.strip():
-                # Not a failure. A pass with nothing to commit is an ordinary
-                # outcome, and failing here would send the Builder off
-                # repairing a repository that is simply already clean -- the
-                # false accusation this module keeps having to design against.
-                # The stages that only make sense after a commit are dropped.
+                # Nothing to commit is an ordinary outcome, not a failure; the
+                # stages that need a commit are dropped.
                 record("commit", True, "nothing staged to commit")
                 stages = [x for x in stages if x not in ("push", "pr", "merge")]
             else:
@@ -755,16 +536,33 @@ class MCPClient:
                 record("commit", True, out.splitlines()[0] if out else "committed")
 
         if "push" in stages:
-            ok, out = self._run_vcs("git", "push", "-u", "origin", branch, timeout=120)
-            if not ok:
-                return stop("push", out)
+
+            def push() -> str:
+                ok, out = self._run_vcs("git", "push", "-u", "origin", branch, timeout=120)
+                if not ok:
+                    if any(mark in out.lower() for mark in _PUSH_FAILED_IN_TRANSIT):
+                        raise _PushFailedInTransit(out)
+                    raise RuntimeError(out)
+                return out
+
+            try:
+                call_with_retry(
+                    push,
+                    max_attempts=PUSH_ATTEMPTS,
+                    min_wait=2.0,
+                    max_wait=4.0,
+                    exceptions=(_PushFailedInTransit,),
+                    name="git push",
+                )
+            except Exception as exc:
+                return stop("push", str(exc))
             record("push", True, f"pushed {branch} to origin")
 
         if "pr" in stages:
             ok, existing = self._run_vcs("gh", "pr", "view", "--json", "url", "-q", ".url")
             if ok and existing.strip().startswith("http"):
-                # A branch already carrying a PR is the ordinary case on the
-                # second pass of a run; opening a second one would fail anyway.
+                # A branch already carrying a PR is the ordinary case on a
+                # second pass.
                 record("pr", True, f"already open: {existing.strip()}")
             else:
                 title = (message.splitlines() or ["Automated change"])[0]
@@ -789,56 +587,27 @@ class MCPClient:
                 "stages": log,
                 "summary": "; ".join(f"{e['stage']}: {e['detail']}" for e in log)}
 
-    # Terminal / test tools
+    def _terminal_execute(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Run one program in the project workspace.
 
-    async def _terminal_execute(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Run a command in the project workspace.
+        There is no shell: the command is `shlex.split` and run as argv, so `;`, `|`,
+        `>`, `&&`, `$(...)` and globs are inert data -- `echo hi; rm -rf /` runs `echo`
+        with four arguments. An operator written on purpose is refused by name before
+        anything runs (`_is_shell_operator`); a glob or `~` cannot be refused, since
+        `find -name "*.py"` needs the literal, so a failure it causes is named in
+        `hint`.
 
-        There is no shell. The command is split with `shlex` and handed to
-        `subprocess` as an argv list, so `;`, `|`, `>`, `&&`, `$(...)` and
-        globs are inert *data* rather than syntax -- `echo hi; rm -rf /` runs
-        `echo` with four literal arguments and deletes nothing.
-
-        This replaced a whitelist of permitted characters guarding
-        `shell=True`. That filter refused the ordinary way to write a
-        one-liner (`python -c "import x; print(y)"` trips on `;` `(` `)`) and
-        any path containing parentheses, while still admitting a bare
-        `rm -rf /` -- it never guarded against a destructive command, only
-        against chaining one onto another. Removing the shell removes the
-        thing the chaining needed, so the characters no longer have to be
-        refused to be harmless.
-
-        The trade is that shell *features* are gone. An operator written on
-        purpose -- a pipe, a chain, a redirect spaced or glued -- is refused by
-        name before anything runs (`_is_shell_operator`), because a silently
-        meaningless pipe is worse than a refused one. A glob or `~` cannot be
-        refused, since `find -name "*.py"` needs the literal, so it reaches the
-        program as written and a failure it causes is named in `hint`.
-
-        `cwd` runs the command somewhere other than the project root, and is
-        offered to the Builder because without it there is no way to express
-        it at all: `cd` is a shell builtin, so `cd somewhere && python x.py`
-        does not run in the wrong directory, it fails with
-        `Command not found: 'cd'` -- and the Builder, having no other spelling
-        to try, spends turns rediscovering absolute paths. It is the same gap
-        `timeout` was: a thing the tool can do that the schema never offered.
-
-        `env` overlays the current environment for this one command; a key
-        mapped to None is removed rather than set. It is not offered to the
-        Builder in BUILDER_TOOLS -- only callers inside the process set it,
-        which today means the verification pass asking for a headless run.
-
-        `timeout` is offered to the Builder, and is clamped rather than
-        trusted (`_resolve_timeout`). The verification pass always passes one
-        computed from its remaining deadline, so it never sees the default.
+        `cwd` replaces `cd`, a builtin with no meaning here. `env` overlays the
+        environment for this command (None removes a key) and is set only from inside
+        the process, for headless verification. `timeout` is clamped by
+        `_resolve_timeout`.
         """
         command = args.get("command", "")
         try:
             argv = shlex.split(command)
         except ValueError as exc:
-            # Unbalanced quotes. Say so plainly: the caller cannot see the
-            # parse, and "No closing quotation" alone reads like the program
-            # failed rather than like the command was never built.
+            # Unbalanced quotes: say so, or "No closing quotation" reads like
+            # the program failed.
             return {
                 "success": False,
                 "error": f"Could not parse command ({exc}). Check the quoting.",
@@ -851,14 +620,9 @@ class MCPClient:
                 "command": command,
             }
 
-        # Refused before the spawn, like `_resolve_cwd`, and for the same
-        # reason: the complaint has to be made while we still know what is
-        # being complained about. Note the limit -- an operator is caught when
-        # it is its own token, or a redirect glued to its target
-        # (`2>/dev/null`). `echo hi; rm -rf /` splits to `['echo', 'hi;', ...]`,
-        # so the `;` rides on `hi` and stays inert data, which is what the
-        # canary test pins. This catches the shapes a caller writes on purpose,
-        # not every shape that exists.
+        # Refused before the spawn. Only an operator that is its own token, or
+        # a redirect glued to its target, is caught: in `echo hi; rm -rf /` the
+        # `;` rides on `hi` and stays inert data.
         operator = next((token for token in argv if _is_shell_operator(token)), None)
         if operator is not None:
             return {
@@ -879,9 +643,8 @@ class MCPClient:
                 timeout=_resolve_timeout(args.get("timeout")),
                 env=_child_env(args.get("env")),
                 cwd=cwd,
-                # No human is at the keyboard behind a Builder tool call, so a
-                # command that reads stdin must get EOF and fail, never block
-                # until its timeout and report as a hang.
+                # No one is at the keyboard: a command that reads stdin gets
+                # EOF rather than blocking until its timeout.
                 stdin=subprocess.DEVNULL,
             )
             outcome: dict[str, Any] = {
@@ -897,11 +660,8 @@ class MCPClient:
                     outcome["hint"] = hint
             return outcome
         except subprocess.TimeoutExpired as e:
-            # Keep what the command managed to print. `str(e)` alone says only
-            # that it timed out, and a caller with no output to look at cannot
-            # tell a command that hung immediately from one that did all its
-            # work and then blocked at the end -- so it guesses, and pays the
-            # full timeout again on a retry that was never going to differ.
+            # Keep what the command printed, so a hang at the start can be told
+            # from one at the end.
             return {
                 "success": False,
                 "error": _timeout_error(e),
@@ -911,11 +671,7 @@ class MCPClient:
                 "command": command,
             }
         except FileNotFoundError:
-            # With a shell this came back as rc=127 and a message on stderr.
-            # Without one it raises, and a bare OSError repr does not say which
-            # of the words was the program -- so name it, or the caller reads
-            # "not found" as its file argument being missing. A builtin is
-            # named along with what to do instead (`_missing_program_error`).
+            # Name the program that was missing, and what replaces a builtin.
             return {
                 "success": False,
                 "error": _missing_program_error(argv[0]),
@@ -924,19 +680,12 @@ class MCPClient:
         except Exception as e:
             return {"success": False, "error": str(e), "command": command}
 
-    async def _run_tests(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Run the pytest test suite.
+    def _run_tests(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Run pytest.
 
-        `cwd` runs it in another directory -- a generated project under
-        `projects/`, whose Builder is told to pass it (`OUTPUT_DIR_NOTE`). It
-        was told that while this tool took no `cwd` at all, so every such call
-        silently ran *this checkout's* suite instead. With a `cwd` and no
-        `path`, pytest collects from that directory; with neither, `tests/`.
-
-        `timeout` is clamped like `terminal_execute`'s, for its reason: a tool
-        call is never abandoned, so an unclamped request hangs the pass past
-        every deadline. The default is the ceiling, the longest a suite is
-        allowed.
+        With a `cwd` -- a generated project under `projects/` -- and no `path`, pytest
+        collects from that directory; with neither, `tests/`. `timeout` is clamped
+        like `terminal_execute`'s and defaults to the ceiling.
         """
         cwd, cwd_error = _resolve_cwd(args.get("cwd"))
         if cwd_error is not None:
@@ -950,8 +699,6 @@ class MCPClient:
                 text=True,
                 timeout=timeout,
                 cwd=cwd,
-                # Same reason as _terminal_execute: a suite that stops to ask
-                # something would otherwise hang until its timeout.
                 stdin=subprocess.DEVNULL,
             )
             return {
@@ -973,26 +720,16 @@ class MCPClient:
 
 
 def _timeout_error(exc: subprocess.TimeoutExpired) -> str:
-    """Say that a command timed out, and after how long, and nothing else.
+    """Say that a command timed out, and after how long -- nothing else.
 
-    `str(TimeoutExpired)` is `Command '[...argv...]' timed out after N
-    seconds`: the fact comes last, behind a repr of the whole argv. The report
-    line already names the command and cuts its reason at
-    MAX_FAILURE_REASON_CHARS, so on the run of 2026-09-10 a `pip3 install`
-    carrying an index URL read `-> failed: Command '['pip3', 'install', ...]'...`
-    -- the timeout cut off, the Builder retrying the identical command blind.
-    No advice about raising `timeout` either: verification calls this tool
-    with a limit it chose itself, and the Builder cannot raise that one.
+    `str(TimeoutExpired)` puts the fact behind a repr of the whole argv, where the
+    report line's length cut removes it.
     """
     return f"timed out after {exc.timeout:g} seconds"
 
 
 def _as_captured_text(captured: str | bytes | None) -> str:
-    """Normalise output hung off a TimeoutExpired to text.
-
-    `capture_output=True` with `text=True` gives str, but the attribute is
-    typed to allow bytes and is None when nothing was read before the kill.
-    """
+    """Output hung off a TimeoutExpired, as text ("" when nothing was read)."""
     if captured is None:
         return ""
     if isinstance(captured, bytes):
@@ -1015,20 +752,3 @@ def _child_env(overrides: dict[str, str | None] | None) -> dict[str, str] | None
         else:
             env[key] = value
     return env
-
-
-@asynccontextmanager
-async def mcp_client(server_urls: list[str] | None = None) -> AsyncGenerator[MCPClient, None]:
-    """Async context manager for MCP client.
-
-    Usage:
-        async with mcp_client() as client:
-            tools = await client.list_tools()
-            result = await client.call_tool("search_knowledge_graph", {"query": "Planner"})
-    """
-    client = MCPClient(server_urls)
-    try:
-        await client.connect()
-        yield client
-    finally:
-        await client.disconnect()

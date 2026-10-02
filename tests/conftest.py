@@ -27,12 +27,21 @@ import langgraph_agent.nodes as _nodes
 import langgraph_agent.web_research as _web_research
 from langgraph_agent.config import StubLLM
 from langgraph_agent.control import RUN_CONTROL
+from langgraph_agent.self_healing import reset_circuit
 
 # Patch the LLM lookup used by agent nodes so every test gets deterministic,
 # parser-friendly responses without making network calls. This has to be
 # `get_agent_llm`: it is what the nodes import, and patching `get_llm` here
 # only set an unused attribute on the module.
 _nodes.get_agent_llm = lambda agent, temperature=0.1: StubLLM()
+
+
+@pytest.fixture(autouse=True)
+def _closed_circuits():
+    """Every test starts with every circuit closed, whatever the last one tripped."""
+    reset_circuit()
+    yield
+    reset_circuit()
 
 
 @pytest.fixture(autouse=True)
@@ -100,7 +109,7 @@ def _no_corpus_bootstrap(monkeypatch):
     and hand it fakes.
     """
     import serve
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", False)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", False)
 
 
 def _no_daemon() -> list:
@@ -121,7 +130,7 @@ def _no_developer_corpus(monkeypatch, tmp_path_factory):
     embedder's `free_the_cards_for` unloaded whatever model the operator's own
     console had resident at that moment, a run in flight included. Results
     then depended on what that corpus held, which is the reason the Planner's
-    project map is switched off below. CI has no `knowledge/`, so the suite
+    corpus map is switched off below. CI has no `knowledge/`, so the suite
     already has to pass without one; this makes every checkout run it that way.
 
     Only *this checkout's* store is hidden: a request that resolves to it is
@@ -153,7 +162,7 @@ def _no_developer_corpus(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
-def _no_planner_project_map(monkeypatch):
+def _no_planner_corpus_map(monkeypatch):
     """No planning test searches the developer's corpus.
 
     `_make_plan` shows the Planner the files the corpus ranks closest to the
@@ -162,7 +171,7 @@ def _no_planner_project_map(monkeypatch):
     would pass or fail by what the checkout it ran in had indexed. The tests
     that exercise the map turn it back on and answer the search themselves.
     """
-    monkeypatch.setattr(_nodes, "PLANNER_PROJECT_MAP", False)
+    monkeypatch.setattr(_nodes, "PLANNER_CORPUS_MAP", False)
 
 
 @pytest.fixture

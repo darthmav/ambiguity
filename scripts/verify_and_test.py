@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
-"""Automated verification and testing for the 4-Agent System.
+"""Verification for the 4-Agent System: dependencies, seats, search, the suite.
 
 Usage:
     python scripts/verify_and_test.py                # read-only checks
-    python scripts/verify_and_test.py --all          # including the ones that write
+    python scripts/verify_and_test.py --all          # plus a live example run
 
-With no flags this runs only the steps that leave the project alone: the
-dependency and seat checks, a GraphRAG search, and the test suite.
-
-One step is held back from that default because it is not read-only:
-`--run-example` is a live agent run that writes files into the repository, so
-plain `verify_and_test.py` used to leave several new files behind, which is not
-what "verify" reads as. Ask for it by name, or with `--all`. Nothing here
-rebuilds the corpus any more -- that is a run's job and an upload's, and it was
-a third writer this script had no business being.
+With no flags this runs only the steps that leave the machine alone. The
+example run is a live agent run that writes a generated project under
+`projects/`, so it is asked for by name or with `--all`. Nothing here rebuilds
+the corpus: the console does that.
 """
 
 import argparse
 import os
+import re
 import subprocess
 import sys
+import tomllib
+from importlib import metadata
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 def print_header(text: str) -> None:
@@ -36,39 +36,22 @@ def print_step(text: str) -> None:
 
 
 def check_dependencies() -> bool:
-    """Verify all required dependencies are installed."""
+    """Every dependency `pyproject.toml` declares is installed.
+
+    Read from the declaration itself rather than a list kept here, which
+    drifted: it went on requiring a package the project had dropped.
+    """
     print_header("STEP 1: Checking Dependencies")
 
-    required = {
-        "langgraph": "LangGraph",
-        "langchain_core": "LangChain Core",
-        "mcp": "MCP",
-        "chromadb": "ChromaDB",
-        "transformers": "Transformers (the chunker's tokenizer)",
-        "networkx": "NetworkX",
-        "dotenv": "python-dotenv",
-    }
-
-    optional = {
-        "langchain_openai": "LangChain OpenAI",
-        "langchain_anthropic": "LangChain Anthropic",
-    }
-
+    declared = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     missing = []
-    for module, name in required.items():
+    for requirement in declared["project"]["dependencies"]:
+        name = re.split(r"[\s<>=!~;\[(]", requirement, maxsplit=1)[0]
         try:
-            __import__(module)
-            print(f"  ✓ {name}")
-        except ImportError:
-            print(f"  ✗ {name} (module: {module})")
+            print(f"  ✓ {name} {metadata.version(name)}")
+        except metadata.PackageNotFoundError:
+            print(f"  ✗ {name}")
             missing.append(name)
-
-    for module, name in optional.items():
-        try:
-            __import__(module)
-            print(f"  ✓ {name} (optional)")
-        except ImportError:
-            print(f"  ○ {name} (optional, not installed)")
 
     if missing:
         print(f"\n✗ Missing dependencies: {', '.join(missing)}")
@@ -82,23 +65,15 @@ def check_dependencies() -> bool:
 def check_seats() -> bool:
     """Report what each seat will actually run.
 
-    This used to look for ANTHROPIC_API_KEY / OPENAI_API_KEY and warn when it
-    found neither -- a question nobody here asked. No seat uses either provider
-    by default, so a correctly configured machine was told live agent runs were
-    impossible while all four seats sat live on Ollama cloud.
-
-    `get_agent_status` is what it reads instead, because key presence is not
-    liveness: a key can authenticate and the seat still be unusable, and a seat
-    with no key at all silently becomes StubLLM while every static check keeps
-    reporting the configured model. It is also the only place `stubbed` and
-    `live` are kept apart, and they are different failures -- a stubbed seat
-    completes the run with canned text, a failing seat kills it.
+    Read from `get_agent_status`, because key presence is not liveness: a seat
+    with no key silently becomes StubLLM while every static check still reports
+    the configured model, and a stubbed seat (canned text) and a failing one
+    (a dead run) are different failures.
     """
     print_step("Checking seats")
 
-    # Imported here, not at module scope: step 1 is what reports a missing
-    # dependency in readable form, and a top-level import would crash ahead of
-    # it with a traceback instead.
+    # Imported here, so a missing dependency is reported by step 1 rather than
+    # by a traceback at import.
     try:
         from langgraph_agent.config import AGENTS, get_agent_status
     except Exception as e:  # pragma: no cover - step 1 already reports this
@@ -129,13 +104,6 @@ def check_seats() -> bool:
     return all_live
 
 
-# There is no indexing step here any more. Two things build a corpus -- a run,
-# which rebuilds before the Architect opens, and embedding a document into the
-# corpus from the console -- and a verification script is neither. It checks
-# that search works against whatever this machine holds, and says plainly when
-# that is nothing.
-
-
 def test_graphrag_search() -> bool:
     """Test GraphRAG search functionality."""
     print_header("STEP 2: Testing GraphRAG Search")
@@ -144,14 +112,12 @@ def test_graphrag_search() -> bool:
         from langgraph_agent.graphrag_server import open_knowledge_base
 
         print_step("Loading knowledge base")
-        # Opened, not created. Checking that search works must not leave a
-        # corpus behind on a machine that had none -- an empty store then
-        # reports itself as a knowledge base to everything that looks.
+        # Opened, never created: checking search must not leave a corpus behind.
         kb = open_knowledge_base()
         if kb is None:
             print("  \u2717 No corpus has been indexed; nothing to search.")
-            print("    Start one run from the console: it indexes this")
-            print("    directory before the Architect opens.")
+            print("    The corpus is the research archive: upload a document,")
+            print("    research a goal online, or embed a generated project.")
             return False
 
         print_step("Testing search queries")
@@ -186,7 +152,7 @@ def run_example_usage() -> bool:
     """Run the example usage script."""
     print_header("STEP 3: Running Example Usage")
 
-    example_path = Path(__file__).parent.parent / "example_usage.py"
+    example_path = ROOT / "example_usage.py"
     if not example_path.exists():
         print(f"  ✗ Example script not found: {example_path}")
         return False
@@ -194,7 +160,7 @@ def run_example_usage() -> bool:
     try:
         result = subprocess.run(
             [sys.executable, str(example_path)],
-            cwd=Path(__file__).parent.parent,
+            cwd=ROOT,
             capture_output=True,
             text=True,
             timeout=300,
@@ -221,26 +187,10 @@ def run_tests() -> bool:
     try:
         import pytest
 
-        # `serve` and `spectral_graph` sit at the project root and are not part
-        # of the installed distribution, so three test modules import them by
-        # name. `python -m pytest` works because it puts the working directory
-        # on sys.path first; pytest.main() from here does not -- sys.path[0] is
-        # scripts/ -- so those three failed to collect and this step reported
-        # "Some tests failed" against a tree where all 394 pass. A false failure
-        # from the verification runner is worse than none: it is the reading
-        # someone acts on.
-        root = str(Path(__file__).parent.parent)
-        if root not in sys.path:
-            sys.path.insert(0, root)
-
+        # pyproject's `pythonpath` puts the root on the path for the tests that
+        # import `serve` and `spectral_graph`, from here as from anywhere.
         print_step("Running pytest")
-        exit_code = pytest.main(
-            [
-                "-v",
-                "--tb=short",
-                "tests/",
-            ]
-        )
+        exit_code = pytest.main(["-v", "--tb=short", str(ROOT / "tests")])
 
         return exit_code == 0
     except Exception as e:
@@ -276,18 +226,14 @@ def main():
 
     args = parser.parse_args()
 
-    # No flags runs the read-only steps. The one that writes is reached only by
-    # naming it or by --all: a verification script that commits a live agent run
-    # to the working tree on a bare invocation is a trap, and the caller has no
-    # way to find out before it happens.
+    # No flags runs the read-only steps; the one that writes is asked for by
+    # name or by --all.
     read_only = args.all or not any(
         [args.test_graphrag, args.run_example, args.run_tests]
     )
 
-    # Every step runs even after one fails -- one broken step should not hide
-    # the state of the rest -- but the exit code has to carry the result. It
-    # was 0 unconditionally, so a caller reading only the status got "verified"
-    # from a run that had just printed four warnings.
+    # Every step runs even after one fails, so one broken step does not hide the
+    # rest, and the exit code carries the result.
     failed: list[str] = []
 
     print_header("4-AGENT SYSTEM VERIFICATION")
@@ -296,8 +242,7 @@ def main():
     if not check_dependencies():
         sys.exit(1)
 
-    # Non-blocking, as before: a stubbed seat still completes a run, and the
-    # steps below are worth reading either way. It reports; it does not judge.
+    # Reported, not judged: a stubbed seat still completes a run.
     check_seats()
 
     # Step 2: Test GraphRAG
@@ -326,8 +271,9 @@ def main():
 
     print("\nNext steps:")
     print("  - Review output above for any issues")
-    print("  - Any seat not live above: start Ollama and `ollama signin` for")
-    print("    a :cloud tag, or set that provider's key for an Anthropic/OpenAI seat")
+    print("  - Any seat not live above: start the Ollama daemon and pull its tag;")
+    print("    a :cloud tag also needs `ollama signin`, and an Anthropic or OpenAI")
+    print("    seat that provider's key in .env")
     print("  - Run: python example_usage.py")
 
 

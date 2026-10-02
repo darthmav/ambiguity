@@ -97,8 +97,7 @@ reports/diagnostics/
 
 # An agent run's own write-ups — a machine inspection, an integration sketch, a
 # brainstorm nobody finished. Per-run notes about one afternoon, not history,
-# and out of the corpus for the same reason (PROJECT_INDEX_EXCLUDES): the walk
-# is a glob and not git, so keeping one of these out takes both halves.
+# and never in the corpus, which reads only its archive roots.
 experimental/
 
 # Projects a run generated when the operator pointed it at one (the console's

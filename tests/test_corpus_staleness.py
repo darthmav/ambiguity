@@ -10,7 +10,7 @@ discarded, the Researcher's seat answered from memory on every run — and
 
 So the assertions here are mostly about *not crying wolf*. A signal the
 operator learns to ignore is worse than no signal, and the size limit is where
-that would happen: `index_project_files` measures characters while `stat`
+that would happen: `index_corpus_files` measures characters while `stat`
 counts bytes, and guessing in either direction invents an accusation.
 """
 
@@ -19,12 +19,11 @@ from __future__ import annotations
 import pytest
 
 from langgraph_agent.corpus_health import (
+    _walk,
     corpus_staleness,
-    expected_documents,
-    forget_expected_documents,
-    oversized_documents,
+    forget_cached_walk,
 )
-from langgraph_agent.graphrag_server import MAX_INDEXABLE_BYTES, iter_project_files
+from langgraph_agent.graphrag_server import MAX_INDEXABLE_BYTES
 
 # The walk's mechanics, laid out at the top of a scratch tree.
 pytestmark = pytest.mark.usefixtures("whole_root_walk")
@@ -32,9 +31,9 @@ pytestmark = pytest.mark.usefixtures("whole_root_walk")
 
 @pytest.fixture(autouse=True)
 def _no_cached_walk():
-    forget_expected_documents()
+    forget_cached_walk()
     yield
-    forget_expected_documents()
+    forget_cached_walk()
 
 
 def _project(tmp_path, **files: str):
@@ -48,7 +47,7 @@ def _project(tmp_path, **files: str):
 def test_a_corpus_matching_the_walk_is_not_stale(tmp_path):
     root = _project(tmp_path, **{"a.md": "alpha", "src__b.py": "beta"})
 
-    report = corpus_staleness(expected_documents(root, use_cache=False), root, use_cache=False)
+    report = corpus_staleness(_walk(root, False)[0], root, use_cache=False)
 
     assert not report["stale"]
     assert report["missing_count"] == 0 and report["extra_count"] == 0
@@ -118,13 +117,13 @@ def test_a_multibyte_file_under_the_limit_is_not_called_extra(tmp_path):
 def test_the_walk_is_cached_and_the_cache_can_be_dropped(tmp_path):
     """The console polls this every five seconds; the walk is not free."""
     root = _project(tmp_path, **{"a.md": "alpha"})
-    first = expected_documents(root)
+    first = _walk(root, True)[0]
 
     (tmp_path / "b.md").write_text("beta", encoding="utf-8")
-    assert expected_documents(root) == first          # served from the cache
+    assert _walk(root, True)[0] == first          # served from the cache
 
-    forget_expected_documents()
-    assert len(expected_documents(root)) == 2
+    forget_cached_walk()
+    assert len(_walk(root, True)[0]) == 2
 
 
 def test_an_oversized_file_is_reported_apart_from_staleness(tmp_path):
@@ -144,7 +143,6 @@ def test_an_oversized_file_is_reported_apart_from_staleness(tmp_path):
     assert not report["stale"]
     assert report["oversized_count"] == 1
     assert report["oversized"] == [str(tmp_path / "huge.md")]
-    assert oversized_documents(root, use_cache=False) == (str(tmp_path / "huge.md"),)
 
 
 def test_a_file_the_indexer_cannot_read_is_not_stale(tmp_path):
@@ -164,7 +162,7 @@ def test_a_file_the_indexer_cannot_read_is_not_stale(tmp_path):
 
     # A readable file that is absent is still exactly what stale means.
     (tmp_path / "new.md").write_text("new", encoding="utf-8")
-    forget_expected_documents()
+    forget_cached_walk()
     fresh = corpus_staleness([str(tmp_path / "a.md")], root, use_cache=False)
     assert fresh["stale"] and fresh["missing"] == [str(tmp_path / "new.md")]
 
@@ -189,6 +187,7 @@ def test_the_stale_verdict_is_withheld_while_a_run_is_in_flight(monkeypatch, tmp
 
     class _KB:
         graph = __import__("networkx").DiGraph()
+
         def stats(self):
             return {"total_documents": 1, "total_chunks": 1, "total_nodes": 1, "total_edges": 0}
     kb = _KB()
@@ -227,15 +226,17 @@ def test_an_emptied_corpus_is_not_accused_of_drifting(monkeypatch, tmp_path):
 
     class _KB:
         graph = __import__("networkx").DiGraph()
+
         def __init__(self, chunks):
             self._chunks = chunks
+
         def stats(self):
             return {"total_documents": 0, "total_chunks": self._chunks,
                     "total_nodes": 0, "total_edges": 0}
 
     monkeypatch.setattr(serve, "corpus_staleness", lambda docs: corpus_staleness(docs, root, use_cache=False))
     monkeypatch.setitem(serve._run_progress, "running", False)
-    monkeypatch.setitem(serve._startup_index, "running", False)
+    monkeypatch.setitem(serve._background_rebuild, "running", False)
 
     monkeypatch.setattr(serve, "_open_kb", lambda: _KB(0))
     emptied = serve.rpc_rag_stats({})
@@ -251,27 +252,3 @@ def test_an_emptied_corpus_is_not_accused_of_drifting(monkeypatch, tmp_path):
     drifted = serve.rpc_rag_stats({})
     assert drifted["corpus"] == "indexed"
     assert drifted["staleness"]["stale"] is True
-
-
-def test_seat_diagnostic_sweeps_are_not_indexed(tmp_path, monkeypatch):
-    """Gitignored is not the same as unindexed: the walk is a glob, not git.
-
-    `scripts/diagnose_seats.py` writes one timestamped directory per sweep, and
-    `.gitignore` calls them "per-run measurements against non-deterministic
-    models, not history". They were still being embedded — five sweeps from one
-    afternoon sat in the corpus answering questions with a week-old measurement
-    of a seating nobody runs any more.
-
-    Asserted through the walk rather than by reading the exclude list, because
-    the deliberate `reports/*.md` next door must keep being indexed and only
-    running it proves both halves.
-    """
-    (tmp_path / "reports" / "diagnostics" / "20260902-101142").mkdir(parents=True)
-    (tmp_path / "reports" / "diagnostics" / "20260902-101142" / "report.md").write_text("sweep", encoding="utf-8")
-    (tmp_path / "reports" / "spectral_conclusion.md").write_text("deliberate", encoding="utf-8")
-
-    monkeypatch.chdir(tmp_path)
-    walked = {str(path) for path in iter_project_files(".")}
-
-    assert "reports/spectral_conclusion.md" in walked
-    assert not any("diagnostics" in path for path in walked), walked

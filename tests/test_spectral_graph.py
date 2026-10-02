@@ -14,35 +14,24 @@ plus a cross-check of every unnormalized spectrum against NetworkX's
 
 from __future__ import annotations
 
-import os
-import sys
-
 import networkx as nx
 import numpy as np
 import pytest
 
-# The package is not installed; import it from the project root.
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
-
-from spectral_graph import (  # noqa: E402
+# Not installed: pyproject's `pythonpath` puts the project root on the path.
+from spectral_graph import (
     adjacency_matrix,
-    algebraic_connectivity,
     cheeger_bounds,
-    compute_eigenpairs,
     compute_spectrum,
     conductance,
-    degree_matrix,
     fiedler_vector,
     laplacian_matrix,
     normalized_laplacian_matrix,
-    random_walk_laplacian_matrix,
     spectral_clustering,
     spectral_embedding,
     sweep_cut,
 )
-from spectral_graph.spectrum import smallest_eigsh  # noqa: E402
+from spectral_graph.spectrum import smallest_eigsh
 
 TOL = 1e-9
 
@@ -57,6 +46,11 @@ def cycle_spectrum(n: int) -> np.ndarray:
     return np.sort([2 - 2 * np.cos(2 * np.pi * k / n) for k in range(n)])
 
 
+def lambda_2(G: nx.Graph) -> float:
+    """The algebraic connectivity, read off the package's own spectrum."""
+    return float(compute_spectrum(G, k=2, which="SM")[1])
+
+
 # ---------------------------------------------------------------------------
 # Laplacian construction
 # ---------------------------------------------------------------------------
@@ -66,8 +60,8 @@ def cycle_spectrum(n: int) -> np.ndarray:
 def test_laplacian_equals_degree_minus_adjacency(n: int) -> None:
     G = nx.path_graph(n)
     L = laplacian_matrix(G).toarray()
-    expected = degree_matrix(G).toarray() - adjacency_matrix(G).toarray()
-    assert np.allclose(L, expected, atol=TOL)
+    A = adjacency_matrix(G).toarray()
+    assert np.allclose(L, np.diag(A.sum(axis=1)) - A, atol=TOL)
 
 
 @pytest.mark.parametrize("n", [3, 7, 15])
@@ -99,14 +93,6 @@ def test_weighted_graph_uses_weighted_degrees() -> None:
         L_norm, nx.normalized_laplacian_matrix(G).toarray(), atol=TOL
     )
     assert np.linalg.eigvalsh(L_norm).min() > -TOL
-
-
-def test_random_walk_laplacian_shares_normalized_spectrum() -> None:
-    """L_rw = I - D^-1 A is similar to L_sym, so the spectra coincide."""
-    G = nx.cycle_graph(10)
-    rw = np.sort(np.linalg.eigvals(random_walk_laplacian_matrix(G).toarray()).real)
-    sym = np.sort(np.linalg.eigvalsh(normalized_laplacian_matrix(G).toarray()))
-    assert np.allclose(rw, sym, atol=1e-8)
 
 
 # ---------------------------------------------------------------------------
@@ -191,26 +177,18 @@ def test_path_graph_fiedler_value_closed_form(n: int) -> None:
     """The Fiedler value of P_n is 2 - 2*cos(pi/n)."""
     G = nx.path_graph(n)
     expected = 2 - 2 * np.cos(np.pi / n)
-    assert abs(algebraic_connectivity(G) - expected) == pytest.approx(0.0, abs=1e-10)
+    assert abs(lambda_2(G) - expected) == pytest.approx(0.0, abs=1e-10)
 
 
 @pytest.mark.parametrize("n", [3, 6, 10])
 def test_complete_graph_fiedler_value_is_n(n: int) -> None:
     G = nx.complete_graph(n)
-    assert algebraic_connectivity(G) == pytest.approx(float(n), abs=1e-10)
+    assert lambda_2(G) == pytest.approx(float(n), abs=1e-10)
 
 
 def test_algebraic_connectivity_matches_networkx() -> None:
     for G in (nx.path_graph(11), nx.cycle_graph(11), nx.barbell_graph(5, 1)):
-        assert algebraic_connectivity(G) == pytest.approx(
-            nx.algebraic_connectivity(G), abs=1e-7
-        )
-
-
-def test_algebraic_connectivity_rejects_disconnected_graph() -> None:
-    G = nx.disjoint_union(nx.path_graph(3), nx.path_graph(3))
-    with pytest.raises(ValueError, match="disconnected"):
-        algebraic_connectivity(G)
+        assert lambda_2(G) == pytest.approx(nx.algebraic_connectivity(G), abs=1e-7)
 
 
 def test_fiedler_vector_is_an_eigenvector_of_lambda_two() -> None:
@@ -218,7 +196,7 @@ def test_fiedler_vector_is_an_eigenvector_of_lambda_two() -> None:
     G = nx.path_graph(9)
     v = fiedler_vector(G)
     L = laplacian_matrix(G)
-    lambda2 = algebraic_connectivity(G)
+    lambda2 = lambda_2(G)
 
     assert np.allclose(L @ v, lambda2 * v, atol=1e-9)
     assert abs(float(np.sum(v))) < 1e-9
@@ -238,19 +216,6 @@ def test_fiedler_vector_of_path_is_monotone() -> None:
     expected = np.cos(np.pi * (np.arange(n) + 0.5) / n)
     expected /= np.linalg.norm(expected)
     assert np.allclose(v, expected, atol=1e-9)
-
-
-def test_compute_eigenpairs_shapes_and_residuals() -> None:
-    G = nx.cycle_graph(12)
-    k = 4
-    values, vectors = compute_eigenpairs(G, k=k)
-    L = laplacian_matrix(G)
-
-    assert values.shape == (k,)
-    assert vectors.shape == (12, k)
-    assert np.all(np.diff(values) >= -1e-12)  # ascending
-    for i in range(k):
-        assert np.allclose(L @ vectors[:, i], values[i] * vectors[:, i], atol=1e-9)
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +366,7 @@ def test_the_undirected_projection_is_accepted_and_is_the_real_answer() -> None:
     stop, just moved somewhere less visible.
     """
     D = nx.DiGraph([(0, 1), (1, 2), (2, 0), (0, 3)])
-    lambda2 = algebraic_connectivity(D.to_undirected())
+    lambda2 = lambda_2(D.to_undirected())
     assert lambda2 == pytest.approx(nx.algebraic_connectivity(D.to_undirected()), abs=1e-9)
 
 
@@ -442,15 +407,6 @@ def test_a_self_loop_keeps_the_normalized_spectrum_in_range() -> None:
     assert np.allclose(
         L_norm, nx.normalized_laplacian_matrix(G).toarray().astype(float), atol=1e-9
     )
-
-
-def test_degree_matrix_agrees_with_the_adjacency_it_is_paired_with() -> None:
-    """D is only meaningful next to the A it will be subtracted from."""
-    G = nx.Graph()
-    G.add_edge(0, 1, weight=2.0)
-    G.add_edge(0, 0, weight=5.0)
-    A = adjacency_matrix(G).toarray()
-    assert np.allclose(degree_matrix(G).diagonal(), A.sum(axis=1), atol=TOL)
 
 
 def test_conductance_uses_one_volume_convention_on_both_sides() -> None:
@@ -527,16 +483,17 @@ def test_sparse_path_matches_the_dense_answer(G: nx.Graph) -> None:
     whatever it produced last.
     """
     dense = np.sort(np.linalg.eigvalsh(nx.laplacian_matrix(G).toarray().astype(float)))
-    assert algebraic_connectivity(G) == pytest.approx(dense[1], rel=1e-8)
+    assert lambda_2(G) == pytest.approx(dense[1], rel=1e-8)
 
-    evals, evecs = compute_eigenpairs(G, k=3)
+    L = laplacian_matrix(G)
+    evals, evecs = smallest_eigsh(L, k=3)
     assert np.allclose(evals, dense[:3], atol=1e-8)
     assert evecs.shape == (G.number_of_nodes(), 3)
+    assert np.allclose(L @ evecs, evecs * evals, atol=1e-6)
 
     # The Fiedler vector is an eigenvector of L for lambda_2, whichever solver
     # produced it. Sign and scale are free, so check the residual, not entries.
     v = fiedler_vector(G)
-    L = laplacian_matrix(G)
     assert np.linalg.norm(L @ v - dense[1] * v) < 1e-6
 
 
@@ -573,15 +530,3 @@ def test_the_dense_path_returns_the_k_eigenvalues_asked_for():
     assert low.shape == (5,) and np.allclose(low, everything[:5])
     assert high.shape == (3,) and np.allclose(high, everything[-3:])
     assert compute_spectrum(G).shape == (34,)
-
-
-def test_dense_eigenpairs_honour_which():
-    """The dense path took the first k whatever `which` asked for."""
-    G = nx.karate_club_graph()
-
-    values, vectors = compute_eigenpairs(G, k=2, which="LA")
-    L = laplacian_matrix(G).toarray()
-
-    assert np.allclose(values, np.sort(np.linalg.eigvalsh(L))[-2:])
-    assert vectors.shape == (34, 2)
-    assert np.allclose(L @ vectors, vectors * values, atol=1e-8)

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import serve
-from langgraph_agent.graphrag_server import iter_project_files
+from langgraph_agent.graphrag_server import iter_corpus_files
 from langgraph_agent.nodes import _Deadline, _outside_output_dir, _run_builder_tools
 from langgraph_agent.projects import (
     embedded_projects,
@@ -26,7 +26,7 @@ def _tree(root):
 
 
 def _walked(root):
-    return sorted(str(p.relative_to(root)) for p in iter_project_files(str(root)))
+    return sorted(str(p.relative_to(root)) for p in iter_corpus_files(str(root)))
 
 
 def test_a_generated_project_stays_out_of_the_walk_until_embedded(tmp_path):
@@ -110,7 +110,7 @@ def test_run_goal_refuses_a_bad_project_before_claiming_the_run():
 def test_embed_project_records_the_choice(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _tree(tmp_path)
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", False)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", False)
     r = serve.rpc_embed_project({"name": "snake"})
     assert r["embedded"] is True and r["rebuilding"] is False
     assert embedded_projects(tmp_path) == {"snake"}

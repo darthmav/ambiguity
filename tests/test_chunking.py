@@ -34,7 +34,7 @@ from langgraph_agent.graphrag_server import (
     _chunk_windows,
     _content_sha,
     _document_id_of,
-    index_project_files,
+    index_corpus_files,
 )
 
 # The walk's mechanics, laid out at the top of a scratch tree.
@@ -382,7 +382,7 @@ def test_a_document_is_stored_as_several_rows_but_one_graph_node(kb):
 def test_a_shrunken_document_leaves_no_leftover_chunks(kb):
     """`upsert` overwrites 0..2 and leaves 3..9 answering searches.
 
-    Same rule as `index_project_files` follows for whole documents -- a reindex
+    Same rule as `index_corpus_files` follows for whole documents -- a reindex
     rebuilds rather than accumulates -- applied one level down. Without it a
     file that lost a section keeps matching queries with text it no longer
     contains, and nothing raises.
@@ -475,7 +475,7 @@ def test_a_reindex_prunes_by_document_not_by_chunk_id(kb, tmp_path, monkeypatch)
 
     monkeypatch.chdir(tmp_path)
     kb.persist_dir = tmp_path
-    report = index_project_files(kb, str(tmp_path))
+    report = index_corpus_files(kb, str(tmp_path))
 
     stored = set(kb.collection.rows)
     assert not any(cid.startswith("gone.md") for cid in stored), "stale rows go"
@@ -612,24 +612,24 @@ def test_a_rebuild_re_embeds_only_what_changed(counting_kb, tmp_path):
                     a_md="The Planner interprets goals and routes onward.",
                     b_md="The Architect rules on the plan it was given.")
 
-    first = index_project_files(counting_kb, str(root))
+    first = index_corpus_files(counting_kb, str(root))
     assert (first["indexed"], first["embedded"], first["reused"]) == (2, 2, 0)
     after_first = counting_kb._embedder.batches
     assert after_first  # it really did embed
 
-    second = index_project_files(counting_kb, str(root))
+    second = index_corpus_files(counting_kb, str(root))
     assert (second["indexed"], second["embedded"], second["reused"]) == (2, 0, 2)
     assert counting_kb._embedder.batches == after_first  # not one batch more
 
     (root / "a.md").write_text("The Planner now routes to the Researcher.",
                                encoding="utf-8")
-    third = index_project_files(counting_kb, str(root))
+    third = index_corpus_files(counting_kb, str(root))
     assert (third["indexed"], third["embedded"], third["reused"]) == (2, 1, 1)
     assert counting_kb._embedder.batches == after_first + 1
 
 
 def test_a_document_whose_vectors_were_reused_is_still_in_the_graph(counting_kb, tmp_path):
-    """`index_project_files` clears the graph up front, so the cheap half has
+    """`index_corpus_files` clears the graph up front, so the cheap half has
     to run for a reused document too.
 
     Skipping it entirely would leave a corpus that answers searches perfectly
@@ -637,9 +637,9 @@ def test_a_document_whose_vectors_were_reused_is_still_in_the_graph(counting_kb,
     `query_graph`, `topics` and every spectral diagnostic read.
     """
     root = _project(tmp_path, a_md="The Planner interprets goals.")
-    index_project_files(counting_kb, str(root))
+    index_corpus_files(counting_kb, str(root))
 
-    report = index_project_files(counting_kb, str(root))
+    report = index_corpus_files(counting_kb, str(root))
 
     assert report["reused"] == 1
     path = str(root / "a.md")
@@ -659,12 +659,12 @@ def test_a_document_that_left_the_project_is_dropped_and_counted_once(
     root = _project(tmp_path,
                     a_md="The Planner interprets goals. " * 40,
                     b_md="The Architect rules on the plan.")
-    first = index_project_files(counting_kb, str(root))
+    first = index_corpus_files(counting_kb, str(root))
     assert first["dropped"] == 0
     assert len([i for i in counting_kb.collection.rows if "a.md" in i]) > 1
 
     (root / "a.md").unlink()
-    report = index_project_files(counting_kb, str(root))
+    report = index_corpus_files(counting_kb, str(root))
 
     assert report["dropped"] == 1
     assert report["indexed"] == 1
@@ -796,10 +796,3 @@ def test_the_tokenizer_is_loaded_from_the_cache_before_the_network(monkeypatch):
     cached["present"] = False
     assert isinstance(OllamaEmbedder(EMBEDDING_TOKENIZER_NAME).tokenizer, _FakeTokenizer)
     assert calls == [True, False]
-
-
-def test_importing_the_corpus_does_not_switch_every_library_to_info():
-    """The MCP SDK runs `logging.basicConfig` at the level its server is built with."""
-    from langgraph_agent.graphrag_server import server
-
-    assert server.settings.log_level == "WARNING"

@@ -1,23 +1,12 @@
 """The corpus is brought up to date when the console comes up, not only by a run.
 
-Rebuilding it was a run's job alone, and a run is something the operator asks
-for -- so between runs the header reported drift it had no way to fix, and
-restarting the server did not clear it, because starting up only *opens* the
-store. There is no Reindex button either: it was removed on the argument that a
-run does this, which was right and left the case where a run is not what the
-operator wants unattended.
-
-Observed on 2026-09-18: a commit added `ollama_client.py` and put
-`experimental/` into `PROJECT_INDEX_EXCLUDES`, the store was two days older
-than both, and the header read `stale: 1 not indexed, 1 not in the walk` across
-every restart -- correctly, permanently, and with nothing the operator could
-press. What is pinned here is the phase that fixes it and the four things it
-must not break: the creating door stays the only way a corpus comes into being,
-the two phases never rebuild at once, a run always wins, and nothing may change
-the corpus underneath either of them.
+Pinned here: the background rebuild, and the four things it must not break --
+the creating door stays the only way a corpus comes into being, two rebuilds
+never run at once, a run always wins, and nothing may change the corpus
+underneath either of them.
 
 No test here loads the embedding model or indexes anything real; every one of
-them stands in for `index_project_files`.
+them stands in for `index_corpus_files`.
 """
 
 from __future__ import annotations
@@ -41,11 +30,11 @@ pytestmark = pytest.mark.usefixtures("whole_root_walk")
 def idle(monkeypatch):
     """A server with no rebuild and no run in flight, and its own state dict.
 
-    `_startup_index` is a module global that outlives a test, exactly as
+    `_background_rebuild` is a module global that outlives a test, exactly as
     `_run_progress` is: a phase left `running` in one test refuses every upload
     in the next.
     """
-    monkeypatch.setattr(serve, "_startup_index", {"running": False, "message": "", "report": {}})
+    monkeypatch.setattr(serve, "_background_rebuild", {"running": False, "message": "", "report": {}})
     monkeypatch.setattr(serve, "_index_lock", threading.Lock())
     monkeypatch.setitem(serve._run_progress, "running", False)
     monkeypatch.setitem(serve._run_progress, "goal", "")
@@ -61,7 +50,7 @@ def nowhere(tmp_path, monkeypatch):
 
 
 def _fake_index(calls, report=None, watch=None):
-    """Stand in for `index_project_files`, recording the corpus it was handed.
+    """Stand in for `index_corpus_files`, recording the corpus it was handed.
 
     `watch(kwargs)` is called while the phase is inside the rebuild, which is
     where the lock is held and where `should_stop` means anything.
@@ -92,14 +81,14 @@ def test_starting_the_console_brings_the_corpus_up_to_date(nowhere, monkeypatch,
     (nowhere / "notes.md").write_text("the planner interprets goals", encoding="utf-8")
     built = object()
     indexed: list[object] = []
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", True)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
     monkeypatch.setattr(serve, "get_knowledge_base", lambda: built)
-    monkeypatch.setattr(serve, "index_project_files", _fake_index(indexed))
+    monkeypatch.setattr(serve, "index_corpus_files", _fake_index(indexed))
 
-    serve._index_the_project_at_startup()
+    serve._rebuild_the_corpus_in_background()
 
     assert indexed == [built]  # through the creating door, once
-    assert serve._startup_index_status() == {"running": False, "message": "", "source": "built"}
+    assert serve._background_rebuild_status() == {"running": False, "message": "", "source": "built"}
     logged = capsys.readouterr().out
     assert "indexed at startup" in logged
     assert "before the run" not in logged
@@ -115,22 +104,22 @@ def test_the_phase_is_started_by_main_and_never_at_import(monkeypatch):
     # The target and not merely the name: the comment beside the thread start
     # mentions the phase too, so a guard reading for the name alone passed with
     # the start deleted.
-    assert "target=_index_the_project_at_startup" in inspect.getsource(serve.main)
-    assert [t for t in threading.enumerate() if t.name == "startup-index"] == []
+    assert "target=_rebuild_the_corpus_in_background" in inspect.getsource(serve.main)
+    assert [t for t in threading.enumerate() if t.name == "corpus-rebuild"] == []
 
 
 def test_switching_indexing_off_switches_this_off_too(nowhere, monkeypatch):
     """One switch, because there is one question: may this machine rebuild?"""
     (nowhere / "notes.md").write_text("x", encoding="utf-8")
     indexed: list[object] = []
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", False)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", False)
     monkeypatch.setattr(serve, "get_knowledge_base", lambda: object())
-    monkeypatch.setattr(serve, "index_project_files", _fake_index(indexed))
+    monkeypatch.setattr(serve, "index_corpus_files", _fake_index(indexed))
 
-    serve._index_the_project_at_startup()
+    serve._rebuild_the_corpus_in_background()
 
     assert indexed == []
-    assert serve._startup_index_status()["source"] == ""
+    assert serve._background_rebuild_status()["source"] == ""
 
 
 def test_nothing_to_index_leaves_no_corpus_behind(nowhere, monkeypatch):
@@ -140,12 +129,12 @@ def test_nothing_to_index_leaves_no_corpus_behind(nowhere, monkeypatch):
     would report `empty` from then on where the truth is `absent` -- and only
     one of those two means nothing has ever been built here.
     """
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", True)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
 
-    serve._index_the_project_at_startup()
+    serve._rebuild_the_corpus_in_background()
 
     assert sorted(p.name for p in nowhere.iterdir()) == []
-    assert serve._startup_index_status()["source"] == "nothing_to_index"
+    assert serve._background_rebuild_status()["source"] == "nothing_to_index"
 
 
 def test_the_feed_line_says_it_ran_at_startup_not_before_the_run():
@@ -160,16 +149,16 @@ def test_the_feed_line_says_it_ran_at_startup_not_before_the_run():
 def test_an_index_that_failed_is_reported_rather_than_raised(nowhere, monkeypatch):
     """A corpus that could not be built makes for a worse run, not a crash."""
     (nowhere / "notes.md").write_text("x", encoding="utf-8")
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", True)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
     monkeypatch.setattr(serve, "get_knowledge_base", lambda: object())
 
     def boom(kb, **kwargs):
         raise RuntimeError("chroma is unhappy")
-    monkeypatch.setattr(serve, "index_project_files", boom)
+    monkeypatch.setattr(serve, "index_corpus_files", boom)
 
-    serve._index_the_project_at_startup()  # never raises
+    serve._rebuild_the_corpus_in_background()  # never raises
 
-    status = serve._startup_index_status()
+    status = serve._background_rebuild_status()
     assert status["running"] is False
     assert status["source"] == "error"
 
@@ -184,16 +173,16 @@ def test_a_phase_that_raised_does_not_leave_the_flag_set(nowhere, monkeypatch):
     somebody can read.
     """
     (nowhere / "notes.md").write_text("x", encoding="utf-8")
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", True)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
 
     def boom(**kwargs):
         raise RuntimeError("nothing expected this")
     monkeypatch.setattr(serve, "_rebuild_the_corpus", boom)
 
     with pytest.raises(RuntimeError):
-        serve._index_the_project_at_startup()
+        serve._rebuild_the_corpus_in_background()
 
-    assert serve._startup_index_status()["running"] is False
+    assert serve._background_rebuild_status()["running"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -218,11 +207,11 @@ def test_a_run_claiming_the_flag_stops_the_build(nowhere, monkeypatch):
         serve._run_progress["running"] = True
         seen.append(should_stop())
 
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", True)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
     monkeypatch.setattr(serve, "get_knowledge_base", lambda: object())
-    monkeypatch.setattr(serve, "index_project_files", _fake_index([], watch=watch))
+    monkeypatch.setattr(serve, "index_corpus_files", _fake_index([], watch=watch))
 
-    serve._index_the_project_at_startup()
+    serve._rebuild_the_corpus_in_background()
 
     assert seen == [False, True]
 
@@ -237,11 +226,11 @@ def test_the_console_exiting_stops_the_build(nowhere, monkeypatch):
         serve._shutdown_requested.set()
         seen.append(kwargs["should_stop"]())
 
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", True)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
     monkeypatch.setattr(serve, "get_knowledge_base", lambda: object())
-    monkeypatch.setattr(serve, "index_project_files", _fake_index([], watch=watch))
+    monkeypatch.setattr(serve, "index_corpus_files", _fake_index([], watch=watch))
     try:
-        serve._index_the_project_at_startup()
+        serve._rebuild_the_corpus_in_background()
     finally:
         serve._shutdown_requested.clear()
 
@@ -249,20 +238,20 @@ def test_the_console_exiting_stops_the_build(nowhere, monkeypatch):
 
 
 def test_both_phases_rebuild_under_one_lock(nowhere, monkeypatch):
-    """`index_project_files` prunes and clears before it re-adds anything, so
+    """`index_corpus_files` prunes and clears before it re-adds anything, so
     two rebuilds interleaved produce neither caller's result: the second clear
     lands on the first's half-built graph and both report success."""
     (nowhere / "notes.md").write_text("x", encoding="utf-8")
     held: list[bool] = []
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", True)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
     monkeypatch.setattr(serve, "get_knowledge_base", lambda: object())
     monkeypatch.setattr(
-        serve, "index_project_files",
+        serve, "index_corpus_files",
         _fake_index([], watch=lambda _: held.append(serve._index_lock.locked())),
     )
 
-    serve._index_the_project_at_startup()
-    serve._index_the_project_before_the_run()
+    serve._rebuild_the_corpus_in_background()
+    serve._rebuild_the_corpus_before_the_run()
 
     assert held == [True, True]  # both phases, the same lock, held over the work
 
@@ -275,7 +264,7 @@ def test_both_phases_rebuild_under_one_lock(nowhere, monkeypatch):
 def test_a_clear_is_refused_while_the_corpus_is_being_rebuilt():
     """The run's hazard without the run: a clear empties a store that is being
     re-added to, and nothing raises where the seats can see it."""
-    serve._startup_index["running"] = True
+    serve._background_rebuild["running"] = True
 
     with pytest.raises(ValueError, match="being rebuilt"):
         serve._refuse_while_a_run_is_in_flight("cleared")
@@ -285,7 +274,7 @@ def test_a_run_in_flight_is_the_wording_when_both_are_true():
     """A run started into a rebuild sets both flags, and only one of the two is
     something the operator can end. A refusal offering to stop a run that does
     not exist is the wrong instruction, not a vague one."""
-    serve._startup_index["running"] = True
+    serve._background_rebuild["running"] = True
     serve._run_progress["running"] = True
     serve._run_progress["goal"] = "Do a thing"
 
@@ -311,6 +300,7 @@ def test_the_stale_verdict_is_withheld_while_the_corpus_is_being_rebuilt(monkeyp
 
     class _KB:
         graph = nx.DiGraph()
+
         def stats(self):
             return {"total_documents": 1, "total_chunks": 1, "total_nodes": 1, "total_edges": 0}
     kb = _KB()
@@ -324,7 +314,7 @@ def test_the_stale_verdict_is_withheld_while_the_corpus_is_being_rebuilt(monkeyp
     idle = serve.rpc_rag_stats({})["staleness"]
     assert idle["stale"] and idle["missing_count"] == 1
 
-    serve._startup_index["running"] = True
+    serve._background_rebuild["running"] = True
     during = serve.rpc_rag_stats({})["staleness"]
     assert not during["stale"]
     assert during["settling"] is True
@@ -335,7 +325,7 @@ def test_the_header_is_told_what_the_rebuild_is_doing(monkeypatch):
     """A first build is tens of seconds during which the corpus reads `absent`
     and the verdict is withheld: without this the console shows a server that
     has decided to do nothing about either."""
-    serve._startup_index.update(running=True, message="indexing: 3 of 77 file(s) checked")
+    serve._background_rebuild.update(running=True, message="indexing: 3 of 77 file(s) checked")
 
     status = serve.rpc_status({})
 
@@ -367,20 +357,20 @@ def _another_process_is_rebuilding(root):
 
 def test_a_corpus_another_process_is_rebuilding_is_left_alone(nowhere, monkeypatch):
     """Two consoles in one checkout used to be two rebuilds with nothing
-    between them: `index_project_files` prunes and clears before it re-adds, so
+    between them: `index_corpus_files` prunes and clears before it re-adds, so
     the second clear lands on the first's half-built graph and both report
     success. The port stops that on one port and stops nothing on another."""
     (nowhere / "notes.md").write_text("x", encoding="utf-8")
     indexed: list[object] = []
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", True)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
     monkeypatch.setattr(serve, "get_knowledge_base", lambda: object())
-    monkeypatch.setattr(serve, "index_project_files", _fake_index(indexed))
+    monkeypatch.setattr(serve, "index_corpus_files", _fake_index(indexed))
 
     with _another_process_is_rebuilding(nowhere):
-        serve._index_the_project_at_startup()
+        serve._rebuild_the_corpus_in_background()
 
     assert indexed == []  # the store was not touched at all
-    assert serve._startup_index_status()["source"] == "busy_elsewhere"
+    assert serve._background_rebuild_status()["source"] == "busy_elsewhere"
 
 
 def test_the_claim_is_released_when_the_rebuild_ends(nowhere, monkeypatch):
@@ -394,24 +384,39 @@ def test_the_claim_is_released_when_the_rebuild_ends(nowhere, monkeypatch):
     """
     (nowhere / "notes.md").write_text("x", encoding="utf-8")
     indexed: list[object] = []
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", True)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
     monkeypatch.setattr(serve, "get_knowledge_base", lambda: object())
-    monkeypatch.setattr(serve, "index_project_files", _fake_index(indexed))
+    monkeypatch.setattr(serve, "index_corpus_files", _fake_index(indexed))
 
-    serve._index_the_project_at_startup()
-    serve._index_the_project_at_startup()
+    serve._rebuild_the_corpus_in_background()
+    serve._rebuild_the_corpus_in_background()
 
     assert len(indexed) == 2
     with _another_process_is_rebuilding(nowhere):
         pass  # takes it without waiting, or this raises
 
 
+def test_a_rebuild_already_under_way_is_left_to_finish(nowhere, monkeypatch):
+    """Two background rebuilds at once would both report on one walk; the second
+    caller -- the monitor, a project opted in -- finds the first and leaves."""
+    (nowhere / "notes.md").write_text("x", encoding="utf-8")
+    indexed: list[object] = []
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
+    monkeypatch.setattr(serve, "get_knowledge_base", lambda: object())
+    monkeypatch.setattr(serve, "index_corpus_files", _fake_index(indexed))
+    serve._background_rebuild["running"] = True
+
+    assert serve._rebuild_the_corpus_in_background() is None
+    assert indexed == []
+    assert serve._background_rebuild["running"] is True  # still the first one's
+
+
 def test_the_lock_file_is_not_created_when_there_is_nothing_to_index(nowhere, monkeypatch):
     """The claim is taken after the walk, for the reason the creating door is
     opened after it: no work, no trace left on a machine that had none to do."""
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", True)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
 
-    serve._index_the_project_at_startup()
+    serve._rebuild_the_corpus_in_background()
 
     assert sorted(p.name for p in nowhere.iterdir()) == []
 
@@ -422,12 +427,12 @@ def test_a_machine_without_flock_still_rebuilds(nowhere, monkeypatch):
     -- the failure this whole phase exists to end."""
     (nowhere / "notes.md").write_text("x", encoding="utf-8")
     indexed: list[object] = []
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", True)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
     monkeypatch.setattr(serve, "fcntl", None)
     monkeypatch.setattr(serve, "get_knowledge_base", lambda: object())
-    monkeypatch.setattr(serve, "index_project_files", _fake_index(indexed))
+    monkeypatch.setattr(serve, "index_corpus_files", _fake_index(indexed))
 
-    serve._index_the_project_at_startup()
+    serve._rebuild_the_corpus_in_background()
 
     assert len(indexed) == 1
     assert sorted(p.name for p in nowhere.iterdir()) == ["notes.md"]
@@ -442,14 +447,14 @@ def test_a_run_waits_for_a_foreign_rebuild_rather_than_searching_a_fraction(
     nothing to say. So this one waits where the startup index does not, and says
     it is waiting rather than going quiet."""
     (nowhere / "notes.md").write_text("x", encoding="utf-8")
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", True)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
     monkeypatch.setattr(serve, "CORPUS_LOCK_WAIT_SECONDS", 0.2)
     monkeypatch.setattr(serve, "CORPUS_LOCK_POLL_SECONDS", 0.02)
     monkeypatch.setattr(serve, "get_knowledge_base", lambda: object())
-    monkeypatch.setattr(serve, "index_project_files", _fake_index([]))
+    monkeypatch.setattr(serve, "index_corpus_files", _fake_index([]))
 
     with _another_process_is_rebuilding(nowhere):
-        report = serve._index_the_project_before_the_run()
+        report = serve._rebuild_the_corpus_before_the_run()
 
     assert report["source"] == "busy_elsewhere"
     assert any("waiting up to" in m for m in serve._run_progress["messages"])
@@ -460,11 +465,11 @@ def test_a_waiting_run_gets_the_corpus_when_the_other_process_finishes(nowhere, 
     """A wait that only ever times out is a delay, not a wait."""
     (nowhere / "notes.md").write_text("x", encoding="utf-8")
     indexed: list[object] = []
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", True)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
     monkeypatch.setattr(serve, "CORPUS_LOCK_WAIT_SECONDS", 10.0)
     monkeypatch.setattr(serve, "CORPUS_LOCK_POLL_SECONDS", 0.02)
     monkeypatch.setattr(serve, "get_knowledge_base", lambda: object())
-    monkeypatch.setattr(serve, "index_project_files", _fake_index(indexed))
+    monkeypatch.setattr(serve, "index_corpus_files", _fake_index(indexed))
 
     released = threading.Event()
     holder = (nowhere / "knowledge.lock").open("a+")
@@ -476,7 +481,7 @@ def test_a_waiting_run_gets_the_corpus_when_the_other_process_finishes(nowhere, 
         released.set()
     threading.Thread(target=release, daemon=True).start()
 
-    report = serve._index_the_project_before_the_run()
+    report = serve._rebuild_the_corpus_before_the_run()
 
     assert released.is_set()
     assert report["source"] in ("built", "updated", "current")
@@ -489,18 +494,18 @@ def test_the_stop_interrupts_a_wait(nowhere, monkeypatch):
     `RUN_BUDGET_SECONDS` cannot end it -- that is checked between supersteps and
     this phase runs before the first one."""
     (nowhere / "notes.md").write_text("x", encoding="utf-8")
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", True)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
     monkeypatch.setattr(serve, "CORPUS_LOCK_WAIT_SECONDS", 30.0)
     monkeypatch.setattr(serve, "CORPUS_LOCK_POLL_SECONDS", 0.02)
     monkeypatch.setattr(serve, "get_knowledge_base", lambda: object())
-    monkeypatch.setattr(serve, "index_project_files", _fake_index([]))
+    monkeypatch.setattr(serve, "index_corpus_files", _fake_index([]))
 
     stopped = iter([False, True, True, True])
     monkeypatch.setattr(serve.RUN_CONTROL, "stopped", lambda: next(stopped, True))
 
     started = time.monotonic()
     with _another_process_is_rebuilding(nowhere):
-        report = serve._index_the_project_before_the_run()
+        report = serve._rebuild_the_corpus_before_the_run()
 
     assert report["source"] == "busy_elsewhere"
     assert time.monotonic() - started < 5.0  # not the 30s it was told to wait

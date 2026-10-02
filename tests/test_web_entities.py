@@ -33,7 +33,7 @@ from langgraph_agent.graphrag_server import (
     WEB_RESEARCH_DIR,
     _is_web_document,
     _mints_entities,
-    iter_project_files,
+    iter_corpus_files,
 )
 
 PROSE = (
@@ -112,7 +112,7 @@ def test_a_web_page_is_still_a_retrievable_document(kb):
 def test_a_reindex_makes_the_same_decision(kb):
     """The trap this is designed against: a rebuild re-reads it as plain markdown.
 
-    `index_project_files` calls `add_document` with nothing but the path and the
+    `index_corpus_files` calls `add_document` with nothing but the path and the
     text, so a rule that lived at the storing call site would be undone here —
     silently, in a pass reporting success.
     """
@@ -204,7 +204,7 @@ def test_the_git_exclude_keeps_github_in_the_walk(tmp_path, monkeypatch, whole_r
         path.write_text("x\n")
     monkeypatch.chdir(tmp_path)
 
-    walked = {str(path) for path in iter_project_files(".")}
+    walked = {str(path) for path in iter_corpus_files(".")}
 
     assert ".github/workflows/ci.yml" in walked
     assert not any(path.startswith(".git/") for path in walked)

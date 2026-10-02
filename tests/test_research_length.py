@@ -94,7 +94,7 @@ def test_every_retrieved_result_is_forwarded(monkeypatch):
     # A floor, pinned: unmeasured (`None`) would route to the seat instead,
     # and none of the results above would be forwarded at all.
     monkeypatch.setattr("langgraph_agent.graphrag_server.relevance_floor", lambda: 0.37)
-    monkeypatch.setattr(nodes, "_call_mcp_tool_sync", fake_tool)
+    monkeypatch.setattr(nodes, "_call_tool", fake_tool)
     findings, status = nodes._gather_research(
         {"plan": "study bm25", "goal": "g", "research": "", "messages": []}  # type: ignore[arg-type]
     )
@@ -117,7 +117,7 @@ def test_each_finding_names_the_file_and_line_it_came_from(monkeypatch):
         }
 
     monkeypatch.setattr("langgraph_agent.graphrag_server.relevance_floor", lambda: 0.37)
-    monkeypatch.setattr(nodes, "_call_mcp_tool_sync", fake_tool)
+    monkeypatch.setattr(nodes, "_call_tool", fake_tool)
     findings, _ = nodes._gather_research(
         {"plan": "p", "goal": "g", "research": "", "messages": []}  # type: ignore[arg-type]
     )

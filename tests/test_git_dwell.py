@@ -71,8 +71,8 @@ def client() -> MCPClient:
     return MCPClient()
 
 
-async def _dwell(client: MCPClient, **args) -> dict:
-    return await client.call_tool("git_dwell", args)
+def _dwell(client: MCPClient, **args) -> dict:
+    return client.call_tool("git_dwell", args)
 
 
 # ---------------------------------------------------------------------------
@@ -80,12 +80,11 @@ async def _dwell(client: MCPClient, **args) -> dict:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_it_branches_rather_than_committing_onto_the_default(repo, client):
+def test_it_branches_rather_than_committing_onto_the_default(repo, client):
     """Committing onto main removes the review point before anyone can use it."""
     (repo / "new.txt").write_text("work\n", encoding="utf-8")
 
-    result = await _dwell(
+    result = _dwell(
         client, message="feat: add a thing", stages=["survey", "branch", "stage", "commit"]
     )
 
@@ -104,8 +103,7 @@ async def test_it_branches_rather_than_committing_onto_the_default(repo, client)
     assert subject == "seed"
 
 
-@pytest.mark.asyncio
-async def test_it_refuses_to_commit_on_the_default_when_branch_is_skipped(repo, client):
+def test_it_refuses_to_commit_on_the_default_when_branch_is_skipped(repo, client):
     """Dropping the branch stage must not become a way onto main.
 
     The guarantee cannot be "we branch for you unless you ask us not to" -- an
@@ -113,7 +111,7 @@ async def test_it_refuses_to_commit_on_the_default_when_branch_is_skipped(repo, 
     """
     (repo / "new.txt").write_text("work\n", encoding="utf-8")
 
-    result = await _dwell(client, message="feat: sneak", stages=["stage", "commit"])
+    result = _dwell(client, message="feat: sneak", stages=["stage", "commit"])
 
     assert not result["success"]
     assert result["stopped_at"] == "branch"
@@ -125,8 +123,7 @@ async def test_it_refuses_to_commit_on_the_default_when_branch_is_skipped(repo, 
     assert subject == "seed"
 
 
-@pytest.mark.asyncio
-async def test_merge_is_in_the_default_pipeline(repo, client, gh):
+def test_merge_is_in_the_default_pipeline(repo, client, gh):
     """The default runs the flow to the end, merge included.
 
     This asserted the opposite until 2026-09-12, on the argument that a pull
@@ -141,7 +138,7 @@ async def test_merge_is_in_the_default_pipeline(repo, client, gh):
     (repo / "new.txt").write_text("work\n", encoding="utf-8")
 
     # Everything the default runs, minus the push that needs a real remote.
-    await _dwell(
+    _dwell(
         client, message="feat: a thing",
         stages=["survey", "branch", "stage", "commit", "pr", "merge"],
     )
@@ -151,8 +148,7 @@ async def test_merge_is_in_the_default_pipeline(repo, client, gh):
     assert "pr merge" in calls
 
 
-@pytest.mark.asyncio
-async def test_a_caller_can_still_stop_at_the_pull_request(repo, client, gh):
+def test_a_caller_can_still_stop_at_the_pull_request(repo, client, gh):
     """Naming stages without `merge` leaves the PR open for someone to read.
 
     This is the opt-out that replaced the old default, and it is the half worth
@@ -161,7 +157,7 @@ async def test_a_caller_can_still_stop_at_the_pull_request(repo, client, gh):
     """
     (repo / "new.txt").write_text("work\n", encoding="utf-8")
 
-    await _dwell(
+    _dwell(
         client, message="feat: a thing",
         stages=["survey", "branch", "stage", "commit", "pr"],
     )
@@ -171,12 +167,11 @@ async def test_a_caller_can_still_stop_at_the_pull_request(repo, client, gh):
     assert "pr merge" not in calls, "a stage list that omits merge must not merge"
 
 
-@pytest.mark.asyncio
-async def test_merge_runs_only_when_named(repo, client, gh):
+def test_merge_runs_only_when_named(repo, client, gh):
     """The opt-in has to actually opt in, or the stage is merely deleted."""
     (repo / "new.txt").write_text("work\n", encoding="utf-8")
 
-    await _dwell(
+    _dwell(
         client,
         message="feat: a thing",
         stages=["survey", "branch", "stage", "commit", "pr", "merge"],
@@ -190,12 +185,11 @@ async def test_merge_runs_only_when_named(repo, client, gh):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_stages_run_in_pipeline_order_however_they_are_given(repo, client):
+def test_stages_run_in_pipeline_order_however_they_are_given(repo, client):
     """"push then commit" is a typo, not an instruction to do it backwards."""
     (repo / "new.txt").write_text("work\n", encoding="utf-8")
 
-    result = await _dwell(
+    result = _dwell(
         client, message="feat: ordered", stages=["commit", "stage", "branch", "survey"]
     )
 
@@ -203,25 +197,23 @@ async def test_stages_run_in_pipeline_order_however_they_are_given(repo, client)
     assert [e["stage"] for e in result["stages"]] == ["survey", "branch", "stage", "commit"]
 
 
-@pytest.mark.asyncio
-async def test_an_unknown_stage_is_refused_by_name(repo, client):
+def test_an_unknown_stage_is_refused_by_name(repo, client):
     """A typo must not silently run a shorter pipeline than the caller meant."""
-    result = await _dwell(client, message="m", stages=["survey", "rebase"])
+    result = _dwell(client, message="m", stages=["survey", "rebase"])
 
     assert not result["success"]
     assert "rebase" in result["error"]
     assert ", ".join(DWELL_STAGES) in result["error"]
 
 
-@pytest.mark.asyncio
-async def test_nothing_to_commit_is_not_a_failure(repo, client):
+def test_nothing_to_commit_is_not_a_failure(repo, client):
     """A clean tree is an ordinary outcome, not a repository to repair.
 
     Failing here would send the Builder off fixing something that was never
     broken -- the false accusation this tool belt keeps having to design
     against.
     """
-    result = await _dwell(
+    result = _dwell(
         client, message="feat: nothing", stages=["survey", "branch", "stage", "commit", "push"]
     )
 
@@ -232,13 +224,12 @@ async def test_nothing_to_commit_is_not_a_failure(repo, client):
     assert not any(e["stage"] == "push" for e in result["stages"])
 
 
-@pytest.mark.asyncio
-async def test_a_failing_stage_names_itself_and_stops_the_rest(repo, client):
+def test_a_failing_stage_names_itself_and_stops_the_rest(repo, client):
     """A pipeline reporting only "failed" gets retried whole."""
     (repo / "new.txt").write_text("work\n", encoding="utf-8")
 
     # No remote is configured, so push cannot succeed.
-    result = await _dwell(
+    result = _dwell(
         client,
         message="feat: a thing",
         stages=["survey", "branch", "stage", "commit", "push", "pr"],
@@ -252,24 +243,22 @@ async def test_a_failing_stage_names_itself_and_stops_the_rest(repo, client):
     )
 
 
-@pytest.mark.asyncio
-async def test_commit_without_a_message_is_refused(repo, client):
+def test_commit_without_a_message_is_refused(repo, client):
     (repo / "new.txt").write_text("work\n", encoding="utf-8")
 
-    result = await _dwell(client, stages=["survey", "branch", "stage", "commit"])
+    result = _dwell(client, stages=["survey", "branch", "stage", "commit"])
 
     assert not result["success"]
     assert result["stopped_at"] == "commit"
     assert "message" in result["error"]
 
 
-@pytest.mark.asyncio
-async def test_only_the_named_paths_are_committed(repo, client):
+def test_only_the_named_paths_are_committed(repo, client):
     """A Builder sharing a tree with the operator must not sweep up their work."""
     (repo / "mine.txt").write_text("mine\n", encoding="utf-8")
     (repo / "theirs.txt").write_text("theirs\n", encoding="utf-8")
 
-    await _dwell(
+    _dwell(
         client,
         message="feat: just mine",
         paths=["mine.txt"],

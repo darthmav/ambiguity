@@ -1,15 +1,11 @@
-"""GraphRAG MCP Server.
+"""GraphRAG: the knowledge base -- a chunked vector store beside an entity graph.
 
-Provides knowledge base search with entity/relation graph + vector store.
-
-Usage:
-    python -m src.langgraph_agent.graphrag_server
-
-Or with stdio transport for MCP:
-    mcp dev src/langgraph_agent/graphrag_server.py
+Search is hybrid (dense retrieval re-ranked with BM25, see `lexical`), and the
+graph links each document to the entities it mentions. The corpus is built
+only by indexing (`get_knowledge_base`); every read goes through
+`open_knowledge_base`, which never creates one.
 """
 
-import asyncio
 import functools
 import hashlib
 import json
@@ -21,7 +17,6 @@ from typing import Any, ParamSpec, TypeVar
 
 import chromadb
 import networkx as nx
-from mcp.server import MCPServer
 
 from langgraph_agent.control import EMBEDDER_ACTIVITY
 from langgraph_agent.corpus_spectral import (
@@ -39,75 +34,53 @@ from langgraph_agent.lexical import (
     reciprocal_rank_fusion,
 )
 from langgraph_agent.projects import PROJECTS_DIR, embedded_projects, held_out_of_corpus
+from langgraph_agent.self_healing import CircuitOpenError, call_with_retry
 
-# The embedding model that builds and searches the corpus: an Ollama tag the
-# local daemon runs. Named once because three places have to agree on it: the
-# embedder the store is built with, the status check that reports it without
-# loading it, and the export that records which model produced the corpus it
-# is dumping. There is exactly one: vectors from two models share no space
-# (this one's are 4,096 numbers), and a corpus is only ever built and searched
-# by the model it was built with. GPU placement is the daemon's business --
-# OLLAMA_EMBED_OPTIONS below has the measurements -- so nothing in this
-# process touches torch or a card, and there is no EMBEDDING_DEVICE.
+# The embedding model that builds and searches the corpus, served by the local
+# daemon. There is exactly one: vectors from two models share no space, so a
+# corpus is only ever built and searched by the model it was built with.
+# Placement is the daemon's; nothing here touches a card.
 EMBEDDING_MODEL_NAME = "qwen3-embedding:latest"
 
-# The tokenizer the chunker cuts passages with: the embedding model's own,
-# loaded in-process from the Hugging Face cache -- the daemon's tokenizer is
-# not reachable from here. `transformers` loads the tokenizer files alone, a
-# few MB, and never a weight: it embeds nothing.
+# The embedding model's own tokenizer, loaded in-process (a few MB, no weights)
+# because the chunker needs one here and the daemon's is not reachable.
 EMBEDDING_TOKENIZER_NAME = "Qwen/Qwen3-Embedding-8B"
 
-# Passages per `/api/embed` request. 8 is the batch the OLLAMA_EMBED_OPTIONS
-# measurements were taken at: on 2026-09-16 a batch of 8 full 254-token
-# passages went through in 6.5s with the model wholly on two 3 GB cards.
+# Passages per `/api/embed` request: the batch `OLLAMA_EMBED_OPTIONS` was
+# measured at, 6.5s for 8 full passages wholly on the cards.
 EMBEDDING_BATCH_SIZE = 8
 
 
-# Seconds one batch of passages may take through Ollama. Measured for
-# qwen3-embedding (7.6B) on two 3 GB cards on 2026-09-16: a batch of 8 took
-# 23.4s with 30% of the model left on the CPU and 6.5s wholly on the cards
-# (`OLLAMA_EMBED_OPTIONS`) -- and the first batch of a run waits for the load too.
+# Seconds one batch may take: 23.4s for 8 passages with 30% of the model on the
+# CPU, and the first batch of a run also waits for the load.
 OLLAMA_EMBED_TIMEOUT_SECONDS = 600.0
 
-# How often, and how far apart, a batch the daemon answered with a 5xx is sent
-# again. A 5xx here is nearly always the model *load* failing, and a load that
-# fails is not a fact about the passages: `num_gpu` forces every layer onto the
-# cards, so a load that meets a card still held by something else errors rather
-# than splitting. Measured at console startup on 2026-09-18: the first three
-# embeds came back 500 (`cudaMalloc failed: out of memory` on card 1, card 0
-# with ~1 GB held by whatever else had just started) and the fourth, 12s later,
-# loaded and every batch after it went through. Each of those three was a whole
-# document lost to the rebuild. A 4xx is the daemon refusing the request --
-# a missing tag -- and is never retried.
+# How often a batch the daemon answered with a 5xx is sent again, and the first
+# wait (doubling after it). A 5xx here is nearly always the model *load*
+# failing -- `num_gpu` forces every layer onto the cards, so a load that meets a
+# card something else still holds errors rather than splitting -- and the load
+# succeeds once that is gone: three 500s then a clean load, 12s apart, at one
+# startup. A 4xx is the daemon refusing the request -- a missing tag -- and is
+# never retried; a daemon that cannot be reached is `retry_unreachable`'s.
 OLLAMA_EMBED_LOAD_RETRIES = 4
 OLLAMA_EMBED_RETRY_SECONDS = 5.0
 
-# The window and batch the embedding model is loaded with, sent on every call.
-# Ollama loads one at a 4,096-token window with a 2,048-token batch by default,
-# and on two 3 GB cards qwen3-embedding then asked for 7,463 MiB
-# against 6,217 free -- 4,453 of weights, 576 of KV cache and 2,433 of compute
-# buffers sized for that batch -- so the daemon ran 25 of its 37 layers on the
-# cards and the rest on the CPU, at 0.24 passages/s. At 512 it takes 4,987 MiB,
-# 37 of 37 on the cards, at 0.48 passages/s, and the vectors do not move:
-# cosine 1.000000 against the default load on the corpus's eight longest
-# passages, which peaked at 362 of its tokens. A longer input -- a query that
-# is a whole plan -- is cut at 511 tokens rather than refused, which is still
-# twice the chunker's 254-token passages. 1,024 fits as well (5,403 MiB) at
-# the same speed with half the room to spare. Every call sends the same options because the
-# daemon reloads a model whose options changed, so a search at another window
-# would evict the runner an index is using.
-#
-# num_gpu puts every layer on the cards, and the window alone no longer did.
-# Measured 2026-09-16 on Ollama 0.33.3's CUDA 12 build (cuda-embed-ollama.sh):
-# with 5.6 GiB free across the two cards, the daemon's own estimate offloaded
-# 24 of 37 layers -- 70% on the GPU, a batch of 8 in 23.4s -- and left 1.1 GB
-# unused on each card. Forced, all 37 load (4,995 MiB, 100% on the GPU), a batch
-# of 8 takes 6.5s, a 511-token input still runs, and the cards sit at 2,424 and
-# 2,947 of 3,072 MiB. The cost is the failure mode: where the model does not
-# fit, the load errors instead of spilling onto the CPU, which is what "wholly
-# on the GPU" asks for. Vectors from a split load differ slightly (cosine
-# 0.9986 at worst on eight passages), so a corpus is built on the placement it
-# is searched on.
+
+def _failed_model_load(exc: BaseException) -> bool:
+    import urllib.error
+
+    return isinstance(exc, urllib.error.HTTPError) and exc.code >= 500
+
+
+# The window and batch the embedder is loaded with, sent on every call -- the
+# daemon reloads a model whose options change, so a search at another window
+# would evict the runner an index is using. At the default 4,096/2,048 the
+# model asked for more than the cards hold and ran a third of its layers on the
+# CPU; at 512 it fits wholly, twice as fast, with identical vectors (cosine
+# 1.000000) -- and 512 is still twice the chunker's passages. `num_gpu: 999`
+# forces every layer onto the cards: where the model does not fit the load
+# errors rather than spilling, and a corpus is built on the placement it is
+# searched on (a split load's vectors differ slightly).
 OLLAMA_EMBED_OPTIONS: dict[str, int] = {"num_ctx": 512, "num_batch": 512, "num_gpu": 999}
 
 
@@ -118,16 +91,10 @@ class EmbeddingStopped(RuntimeError):
 class OllamaEmbedder:
     """An Ollama embedding model behind the two things the corpus asks of one.
 
-    `encode` sends passages to `/api/embed` in batches of
-    `EMBEDDING_BATCH_SIZE` and returns one numpy vector per passage, which is
-    all `add_document` and `search` ask of it.
-
-    `tokenizer` is the embedding model's own (`EMBEDDING_TOKENIZER_NAME`),
-    loaded in-process. The chunker needs a tokenizer in this process and the
-    daemon's is not reachable from here; it loads from the local Hugging Face
-    cache first, so a machine offline after install still chunks. 254 of its
-    tokens sit far inside the window the daemon is loaded with
-    (`OLLAMA_EMBED_OPTIONS`), so a passage is never cut twice.
+    `encode` sends passages to `/api/embed` in batches and returns one vector per
+    passage. `tokenizer` is the model's own, loaded from the local Hugging Face
+    cache first so an offline machine still chunks; its 254-token passages sit
+    well inside the daemon's window, so nothing is cut twice.
     """
 
     def __init__(self, model: str) -> None:
@@ -172,16 +139,17 @@ class OllamaEmbedder:
     ) -> Any:
         """One vector per passage, or a single vector for a single string.
 
-        `should_stop` is asked before each batch, so a stopped run waits for at
-        most one batch rather than for the rest of a document.
+        Each batch goes through the daemon's circuit. An unreachable daemon is retried
+        briefly (`retry_unreachable`); a failed model load (5xx) is retried on the
+        slower load schedule; a 4xx is the daemon refusing and raises at once.
+        `should_stop` is asked before each batch and through every wait, so a stopped
+        run waits for at most one batch.
         """
-        import time
         import urllib.error
-        import urllib.request
 
         import numpy as np
 
-        from langgraph_agent.config import _ollama_base_url, ollama_cpu_share
+        from langgraph_agent.config import daemon_request, ollama_cpu_share, retry_unreachable
 
         single = isinstance(texts, str)
         items = [texts] if single else list(texts)
@@ -190,44 +158,48 @@ class OllamaEmbedder:
         for start in range(0, len(items), step):
             if should_stop is not None and should_stop():
                 raise EmbeddingStopped(f"stopped after {start} of {len(items)} passages")
-            batch = items[start : start + step]
-            request = urllib.request.Request(
-                f"{_ollama_base_url()}/api/embed",
-                data=json.dumps(
-                    {"model": self.model, "input": batch, "options": OLLAMA_EMBED_OPTIONS}
-                ).encode(),
-                headers={"Content-Type": "application/json"},
-            )
-            attempt = 0
-            while True:
-                try:
-                    with urllib.request.urlopen(
-                        request, timeout=OLLAMA_EMBED_TIMEOUT_SECONDS
-                    ) as response:
-                        payload = json.loads(response.read())
-                    break
-                except urllib.error.HTTPError as exc:
-                    detail = exc.read().decode("utf-8", "replace").strip()
-                    if exc.code >= 500 and attempt < OLLAMA_EMBED_LOAD_RETRIES:
-                        attempt += 1
-                        # Waited in slices, so a stop reaches a retrying
-                        # build as quickly as it reaches a working one.
-                        deadline = time.monotonic() + OLLAMA_EMBED_RETRY_SECONDS * attempt
-                        while time.monotonic() < deadline:
-                            if should_stop is not None and should_stop():
-                                raise EmbeddingStopped(
-                                    f"stopped after {start} of {len(items)} passages"
-                                ) from exc
-                            time.sleep(0.25)
-                        continue
-                    tried = f" (after {attempt + 1} attempts)" if attempt else ""
-                    raise RuntimeError(
-                        f"Ollama could not embed with {self.model}{tried}: {detail or exc}"
+            body = {"model": self.model, "input": items[start : start + step],
+                    "options": OLLAMA_EMBED_OPTIONS}
+            attempts = 0
+
+            def embed(body: dict[str, Any] = body) -> Any:
+                nonlocal attempts
+                attempts += 1
+                return retry_unreachable(
+                    lambda: daemon_request(
+                        "/api/embed", body, timeout=OLLAMA_EMBED_TIMEOUT_SECONDS
+                    ),
+                    name=f"embed:{self.model}",
+                    give_up=should_stop,
+                )
+
+            try:
+                payload = call_with_retry(
+                    embed,
+                    max_attempts=OLLAMA_EMBED_LOAD_RETRIES + 1,
+                    min_wait=OLLAMA_EMBED_RETRY_SECONDS,
+                    max_wait=OLLAMA_EMBED_RETRY_SECONDS * 4,
+                    retry_if=_failed_model_load,
+                    give_up=should_stop,
+                    name=f"embed:{self.model}",
+                )
+            except CircuitOpenError:
+                # Not this batch's failure: every caller stands down together.
+                raise
+            except Exception as exc:
+                if should_stop is not None and should_stop():
+                    raise EmbeddingStopped(
+                        f"stopped after {start} of {len(items)} passages"
                     ) from exc
-                except OSError as exc:
-                    raise RuntimeError(
-                        f"Ollama could not embed with {self.model}: {exc}"
-                    ) from exc
+                tried = f" (after {attempts} attempts)" if attempts > 1 else ""
+                detail = (
+                    exc.read().decode("utf-8", "replace").strip()
+                    if isinstance(exc, urllib.error.HTTPError) else ""
+                )
+                raise RuntimeError(
+                    f"Ollama could not embed with {self.model}{tried}: {detail or exc}"
+                ) from exc
+            batch = body["input"]
             embeddings = payload.get("embeddings") or []
             if len(embeddings) != len(batch):
                 raise RuntimeError(
@@ -236,19 +208,14 @@ class OllamaEmbedder:
                 )
             vectors.extend(embeddings)
             if start == 0:
-                # Asked on every call, once its first batch has loaded the
-                # model: the daemon reloads a model something else evicted, and
-                # fits the reload around whatever holds the cards by then.
+                # Asked once the first batch has loaded the model: the daemon
+                # fits a reload around whatever holds the cards by then.
                 self.cpu_share = ollama_cpu_share(self.model)
         array = np.asarray(vectors, dtype=np.float32)
         return array[0] if single else array
 
 
-# Where a corpus lives when nobody says otherwise. One constant because four
-# doors resolved it by spelling the same default inline, which makes the
-# project's own directory a magic string with no source of truth -- and a
-# fifth door added later copies the expression rather than noticing there was
-# a pattern to reuse.
+# Where a corpus lives when nobody says otherwise.
 DEFAULT_PERSIST_DIR = "knowledge"
 
 
@@ -257,22 +224,16 @@ def resolve_persist_dir(persist_dir: str | Path | None = None) -> Path:
     return Path(persist_dir or DEFAULT_PERSIST_DIR)
 
 
-# The questions the corpus's relevance floor is measured with, in a JSON file
-# for one reason: the walk does not index JSON. Written anywhere the corpus
-# reads, the unanswerable questions would be answered by their own text, score
-# near 1.0, and leave no gap to put a floor in.
+# The questions the relevance floor is measured with, in JSON because the walk
+# never indexes JSON: indexed, the unanswerable ones would answer themselves.
 FLOOR_CALIBRATION_QUESTIONS = Path(__file__).with_name("embedding_calibration.json")
 FLOOR_CALIBRATION_FILE = "floor_calibration.json"
 
 
 def _floor_calibration_path(persist_dir: str | Path | None = None) -> Path:
-    """Where a corpus's floor record lives: beside the store, never elsewhere.
+    """Where a corpus's floor record lives: beside the store, always.
 
-    One function because the reader and the writer disagreeing is silent --
-    a floor written under an alternate `persist_dir` and read from the default
-    one leaves `relevance_floor()` None for good, which reads exactly like a
-    corpus nobody has measured. The default matches every other door here
-    (`corpus_exists`, `corpus_state`, `GraphRAGKnowledgeBase.__init__`).
+    One function, so the reader and the writer cannot disagree about it.
     """
     return resolve_persist_dir(persist_dir) / FLOOR_CALIBRATION_FILE
 
@@ -288,14 +249,7 @@ def floor_calibration(persist_dir: str | Path | None = None) -> dict[str, Any] |
 
 
 def floor_from_calibration(record: dict[str, Any] | None) -> float | None:
-    """The floor a stored record carries, or None when it carries none.
-
-    Split out of `relevance_floor` so a caller already holding the record reads
-    the file once rather than twice: `_embedding_choice` needs both the record
-    and the floor, to tell "the measurement found no gap" from "nobody has
-    measured", and the console asks it on every five-second poll. One function
-    because the coercion spelled twice is two answers to one question.
-    """
+    """The floor a stored record carries, or None when it carries none."""
     floor = record.get("floor") if record else None
     return float(floor) if isinstance(floor, (int, float)) else None
 
@@ -303,12 +257,10 @@ def floor_from_calibration(record: dict[str, Any] | None) -> float | None:
 def relevance_floor(persist_dir: str | Path | None = None) -> float | None:
     """The score over which a search counts as the corpus having answered.
 
-    It is what `calibrate_relevance_floor` measured on this corpus with
-    `EMBEDDING_MODEL_NAME` -- None until a run finishes a corpus and takes it,
-    and None for good if the measurement found no gap between the two
-    populations. None means retrieval cannot tell an answer from noise, and a
-    caller must treat every search as unanswered rather than borrow a number
-    measured on a different model: a cosine has no meaning across models.
+    What `calibrate_relevance_floor` measured on this corpus with this model --
+    None until measured, and None for good if no gap was found. None means
+    retrieval cannot tell an answer from noise; a cosine is never borrowed from
+    another model.
     """
     return floor_from_calibration(floor_calibration(persist_dir))
 
@@ -316,12 +268,10 @@ def relevance_floor(persist_dir: str | Path | None = None) -> float | None:
 def calibrate_relevance_floor(kb: "GraphRAGKnowledgeBase") -> dict[str, Any]:
     """Take the relevance floor for this corpus's embedding model, and keep it.
 
-    Twelve questions this corpus answers against twelve it cannot, each asked
-    once. The floor is the midpoint of the gap between the lowest answered
-    score and the highest unanswered one -- a value in open space rather than
-    on an observed boundary. When the populations overlap there is no gap and
-    no floor: any number inside the overlap would misfile some question, and
-    nothing would say which.
+    Twelve questions this corpus answers against twelve it cannot. The floor is
+    the midpoint of the gap between the lowest answered score and the highest
+    unanswered one; when the populations overlap there is no floor, since any
+    number inside the overlap would misfile some question silently.
     """
     questions = json.loads(FLOOR_CALIBRATION_QUESTIONS.read_text(encoding="utf-8"))
 
@@ -346,100 +296,32 @@ def calibrate_relevance_floor(kb: "GraphRAGKnowledgeBase") -> dict[str, Any]:
     temporary.replace(path)
     return record
 
-# What every caller says when asked to search a corpus nobody has built. One
-# string because three doors report it -- the MCP tools, the Builder's tool
-# belt, and the console -- and a corpus that reads as absent in one place and
-# as merely empty in another is the confusion this whole path exists to avoid.
+
+# What every caller says when asked to search a corpus nobody has built, so an
+# absent corpus never reads as an empty one.
 NO_CORPUS_NOTE = (
-    "No corpus has been indexed here, so there is nothing to retrieve. Two "
-    "things build one: a run, which indexes the project it was started from "
-    "before the Architect opens, and embedding a document into the corpus from "
-    "the console. Nothing else does. Reaching this note during a run means the "
-    "walk found nothing to index, or INDEX_PROJECT_BEFORE_RUN is off."
+    "No corpus has been indexed here, so there is nothing to retrieve. The "
+    "corpus is the research archive -- pages online research kept, uploaded "
+    "documents, and generated projects opted in -- and the console rebuilds it "
+    "from there when it starts and before every run. Reaching this note during "
+    "a run means the archive is empty, or REBUILD_CORPUS is off."
 )
 
 
-
-
-
-
-
 # Capitalised tokens that are not entities. `add_document` mints an entity for
-# every capitalised word over four characters, and in a corpus of prose and
-# numpy-style docstrings that rule fires constantly on words whose capital is
-# an artefact of where they sit rather than of what they mean: a sentence
-# opener (`Every`, `Nothing`, `Without`), a docstring section header
-# (`Returns`, `Parameters`, `Raises`), a report heading (`Files`, `Status`), or
-# a Python literal (`False`, `None`). Measured before this list, `False` was
-# the 4th best-connected node in the graph and `Returns` the 6th, above
-# `Fiedler`, `Planner` and `Cheeger`: 21 documents share an edge through
-# `Returns`, which says only that all 21 contain a docstring.
+# every capitalised word over four characters, and many capitals come from
+# where a word sits rather than what it means: a sentence opener (`Every`), a
+# docstring header (`Returns`), a report heading (`Status`), a literal
+# (`False`). Unfiltered, `False` and `Returns` rank among the best-connected
+# nodes, joining every document with a docstring through a relation that means
+# nothing.
 #
-# **This list does not exist to make `topics()` decisive, and it does not.**
-# That was the first hypothesis and the measurement refused it: removing every
-# one of the 97 entities that bridge this corpus's two topic areas -- the
-# theoretical maximum any such filter could achieve -- moves the eigengap
-# decisiveness from 1.12x to 1.09x. The corpus's spectrum is a smooth
-# continuum because the corpus genuinely has no decisive k, not because
-# boilerplate is gluing it together. What the list is for is the graph itself:
-# an edge through `Returns` is a false claim that two documents are related,
-# and `neighborhood()`, `top_entities` and `duplicate_entities` all read those
-# edges as evidence.
-#
-# Matched case-insensitively against the whole token, never as a prefix. A
-# **stopword list, not a heuristic**, on purpose: the obvious alternative is to
-# drop a token that only ever appears where a capital is forced (line start,
-# after a full stop), and it was built and measured. It removes the same noise
-# and severs real edges doing it -- `Planner` 18 documents down to 15,
-# `Spectral` 19 to 15, `ValueError` 14 to 11 -- because a term introduced in a
-# bulleted list (`- **Planner** -- interprets goals`) never appears anywhere
-# else in that document. Silently dropping a true relation to catch a false one
-# is the wrong trade here, and a list a reader can audit line by line beats a
-# rule whose failures are invisible. Measured on this corpus, this list removes
-# 84 entities and 437 edges and costs **no** meaningful term a single edge.
-#
-# **A hand-audited list drifts, and this one did.** The claim above held when
-# it was written and had stopped holding by 2026-09-09, because the corpus it
-# was audited against had moved on -- much of it prose written *since*, in this
-# file and in CLAUDE.md. `Tests`, `Measured` and `System` were the 6th, 8th and
-# 10th best-connected entities in the graph, which is the exact failure the
-# list exists to prevent, one vocabulary later. `Measured` is the sharpest:
-# CLAUDE.md opens sentences with it ("Measured on this corpus...") twenty-nine
-# times, so the prose recording these measurements was minting the entity.
-#
-# The additions below were chosen by counting, per token, the capitals that
-# position does **not** explain -- not at a line start, not after a full stop,
-# not the first cell of a table row. A token with zero of those is recording
-# where it sits. That is the same heuristic rejected above, used the way it is
-# sound: to *nominate* candidates for a human to rule on, never to filter. Two
-# nominations were refused on that read and are the reason the pass is a hand
-# audit rather than a script. `L_dense` scores zero free capitals because an
-# assignment starts its line -- it is a real identifier and stays. `Spectral`
-# scores two, both marginal, and stays because it is a term this corpus is
-# about; the cost of a wrong removal is a severed true relation, which is
-# exactly what the paragraph above refuses. `System`, `Search`, `State` and
-# `Verification` were nominated by rank and cleared by the count: `System`
-# alone carries 22 free capitals, so the entity is earned.
-#
-# It moved again on 2026-09-12, which is the point of the guard rather than a
-# surprise: `Reported` and `Computed` each crossed the four-document floor at
-# zero position-free capitals, as prose was written about what a phase reports
-# and about what is computed where. Both are the `Measured` case exactly -- the
-# writing-up of a change minting the entity -- and both joined the list by the
-# same count. The lesson is not the two words: it is that this list is a claim
-# about a vocabulary, and the vocabulary grows every time someone documents
-# something -- and code is documented too: the same day an agent-written
-# spectral-analysis module (the quisce prototype, since moved out of the
-# checkout) took `Perform` and `Useful` across
-# the floor, both docstring openers at zero position-free capitals, and `Prose`
-# crossed it the same day as the first word of a comment's sentence.
-#
-# `Observed` crossed on 2026-09-18, and it is the plainest case of the pattern
-# yet: this project records what it measured, so it opens sentences with the
-# word for having seen something. Four documents, zero position-free capitals --
-# two line starts, two after a full stop -- and it reached the floor within the
-# one change that added a fourth, which is the guard doing exactly what it is
-# for. Nothing here is *about* observation.
+# A hand-audited list, not a rule: dropping tokens whose every capital is
+# positional was measured and severs real relations (a term introduced in a
+# bulleted list never appears elsewhere in its document). Candidates are
+# nominated by counting position-free capitals and ruled on by hand, and the
+# vocabulary drifts as prose is written -- `tests/test_claims.py` pins the
+# audit so a newcomer fails the build instead of the graph.
 ENTITY_STOPWORDS = frozenset(
     word.lower()
     for word in """
@@ -467,82 +349,44 @@ ENTITY_STOPWORDS = frozenset(
     Insert Tests Write Reported Computed Cached Complete Convert Dimension
     Naming Perform Useful Prose Measure Observed Nodes Spectrum
 
-    Hello Inference Three Verification
+    Hello Inference Three Verification Asked Entities Local Opening
     """.split()
 )
 
-# A chunk's length in the embedding model's tokens. Far inside the 512-token
-# window the daemon is loaded with (`OLLAMA_EMBED_OPTIONS`), so the cut is
-# deliberate rather than window-forced. Not a tuning knob: a passage longer
-# than the model's window is not embedded badly, it is **silently truncated
-# and the tail discarded** -- and that failure once cost this corpus 91.5% of
-# itself.
-#
-# A document used to be embedded whole, in one `encode()` call, with
-# `MAX_INDEXABLE_BYTES` then allowing 100 KB -- so the vector for a 46 KB file
-# was computed from its first ~1,000 characters and nothing else. Measured on
-# this project's own corpus before chunking: 73 of 77 documents over the
-# limit, 224,809 tokens present and 19,147 embedded, **91.5% of the corpus
-# unreachable by search**. Two failures came out of that, and neither
-# announces itself: retrieval acquired a *length bias*, because a short file
-# is fully represented while a long one is represented by its preamble -- so
-# the file that actually answers the query loses to a shorter one that merely
-# mentions it -- and scores sat low enough that plan-shaped queries fell under
-# the relevance gate in `nodes.py`, discarding retrieval and sending the run
-# to the Researcher's model, which is the loop this project already knows is
-# fragile.
+# A chunk's length in the embedding model's tokens. A passage longer than the
+# model's window is not embedded badly but silently truncated: embedded whole,
+# 91.5% of this corpus was once unreachable by search, and long files lost to
+# short ones that merely mentioned the answer.
 CHUNK_MAX_TOKENS = 254
 
-# Tokens carried from the end of one chunk into the start of the next. Chunk
-# boundaries are cut on token counts, not on sentences, so a passage can be
-# split down the middle; the overlap is what keeps such a passage whole in at
-# least one chunk, and it is why boundaries are *not* snapped to line breaks.
-# Snapping would have to either shorten a chunk (dropping tokens the model
-# could have seen) or lengthen it past the window (truncating again, which is
-# the bug), so the cut stays where the arithmetic puts it and the overlap
-# absorbs the cosmetic cost.
+# Tokens carried from the end of one chunk into the next. Boundaries are cut on
+# token counts, not sentences, and the overlap keeps a split passage whole in
+# one chunk -- which is why boundaries are not snapped to line breaks, which
+# would shorten a chunk or push it past the window.
 CHUNK_OVERLAP_TOKENS = 48
 
 # Separates a document id from its chunk number: `CLAUDE.md#0003`. A filename
-# may itself contain "#" -- every filesystem this runs on allows it -- so the
-# id alone is not what maps a chunk back to its document: each chunk carries
-# `doc_id` in its metadata, `_document_id_of` reads that first, and the id is
-# split only as a fallback, at the last "#" and only when a number follows it.
+# may contain "#" itself, so each chunk also carries `doc_id` in its metadata.
 CHUNK_ID_SEPARATOR = "#"
 
 
 def _content_sha(content: str) -> str:
     """A fingerprint of a document's text, stored on every chunk it becomes.
 
-    This is what lets a rebuild keep the vectors it already has. Embedding is
-    the only expensive part of indexing this project -- measured warm, a full
-    rebuild of 77 files and 1,618 chunks takes 52.0s, of which reading every
-    file, hashing it, fetching the store's metadata and rebuilding the whole
-    entity graph account for 0.1s. So a rebuild that re-embeds only what
-    changed costs what the change costs, and one where nothing changed costs
-    nothing at all and never loads the model.
-
-    A hash rather than an mtime: a checkout, a `git stash`, a file copied back
-    into place all move the timestamp without changing a byte, and re-embedding
-    a corpus because someone switched branches is the cost this exists to
-    avoid. Truncated to 16 hex characters because it is compared, never
-    trusted -- a collision re-uses a stale vector, which the next edit to that
-    file corrects, and 64 bits of it is not a risk anyone here will meet.
+    What lets a rebuild keep the vectors it has: embedding is the only expensive
+    part of indexing, so a rebuild where nothing changed never loads the model.
+    A hash, not an mtime, since a branch switch moves timestamps without changing
+    a byte. Truncated: it is compared, never trusted.
     """
     return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
 
-# How many chunks to pull per requested result before collapsing them onto
-# their documents. A query that matches one document strongly can match several
-# of its chunks, and `search` returns documents, so without oversampling a
-# top_k of 5 could collapse to 1. Four is enough for the shapes measured here
-# without making Chroma do meaningfully more work.
+
+# Chunks pulled per requested result before collapsing them onto documents, so
+# a query matching several chunks of one document still fills top_k.
 SEARCH_CHUNK_OVERSAMPLE = 4
 
-# The second and last rung of the ladder in `search`, taken only when the first
-# window of hits collapsed to fewer documents than the caller asked for. A
-# focused query really can match a dozen passages of one large file before it
-# matches anything else, and answering a request for five sources with one is
-# narrower than the behaviour chunking replaced.
+# The second and last rung of `search`'s ladder, for a query whose first window
+# collapsed to fewer documents than asked for.
 SEARCH_ESCALATION = 8
 
 
@@ -551,22 +395,14 @@ def _chunk_windows(
 ) -> list[tuple[int, int]]:
     """Token index windows `[start, end)` covering `n_tokens`, with overlap.
 
-    Pure arithmetic, kept out of `chunk_text` so the packing can be tested
-    without loading the embedding model -- the thing every other test in this
-    project goes out of its way to avoid.
-
-    Every token lands in at least one window and no window is longer than
-    `max_tokens`, which together are the whole contract: the first is what
-    stops the truncation this exists to fix, and the second is what stops each
-    chunk from being truncated in turn.
+    Every token lands in at least one window, and no window is longer than
+    `max_tokens`. Pure arithmetic, testable without loading a tokenizer.
     """
     if n_tokens <= max_tokens:
         return [(0, n_tokens)] if n_tokens else []
 
-    # A stride at or below zero would never advance and the loop would not
-    # terminate. Clamped rather than raised on: an overlap wider than the
-    # window is a caller's misconfiguration, and degrading to "no overlap" is
-    # better than refusing to index at all.
+    # An overlap wider than the window degrades to no overlap rather than a
+    # loop that never advances.
     stride = max(max_tokens - overlap, 1)
 
     windows: list[tuple[int, int]] = []
@@ -584,12 +420,8 @@ def _document_id_of(
 ) -> str:
     """The document a stored row belongs to.
 
-    Prefers the `doc_id` the chunk carries in its metadata and falls back to
-    parsing the id, because both shapes exist in a live store: rows written
-    before chunking are keyed by the bare document path and carry no `doc_id`,
-    and they must keep resolving to themselves rather than being read as
-    strangers and pruned. The suffix is only stripped when it is actually a
-    chunk number, so a path that happens to contain "#" is left alone.
+    The chunk's `doc_id` metadata first; failing that, the id with a numeric
+    `#NNNN` suffix stripped, so a path containing "#" is left alone.
     """
     if metadata:
         doc_id = metadata.get("doc_id")
@@ -609,11 +441,7 @@ _R = TypeVar("_R")
 def _embedder_at_work(method: Callable[_P, _R]) -> Callable[_P, _R]:
     """Mark the embedder busy while `method` runs, for the console's embedder light.
 
-    Put on the only two places the embedder does anything: `_load_embedder`,
-    which builds the daemon handle, and `_encode`, which every embedding goes
-    through. Loading counts as work because the first search after a start
-    spends seconds there, and a light that stayed dark through it would call a
-    busy embedder idle.
+    On `_load_embedder` and `_encode` -- everything the embedder does.
     """
 
     @functools.wraps(method)
@@ -627,27 +455,12 @@ def _embedder_at_work(method: Callable[_P, _R]) -> Callable[_P, _R]:
 def _needs_the_cards(method: Callable[_P, _R]) -> Callable[_P, _R]:
     """Hold `GPU_ARBITER` and free the cards while `method` embeds.
 
-    This is what makes "nothing else runs while the embedder is working" a
-    property of the code rather than of the phase ordering. The ordering
-    already covers the big cases -- the corpus and web phases both run before
-    `graph.stream` -- and covers none of the small ones: a console search or an
-    upload arrives on its own thread at any moment, and a run's own Planner map
-    and Researcher search embed from inside a node. Those are the embeds that
-    used to meet a seat's model on the cards.
-
-    It goes on `_encode` alone, not on `_embedder_at_work`, and the difference
-    is `_load_embedder`. That builds a handle and loads no weights, but it is
-    also what `self.embedder.tokenizer` goes through -- the chunker asks for a
-    tokenizer that runs in this process and touches no card. Evicting a seat's
-    model in order to cut a document into passages would be a reload paid for
-    nothing, so the marking and the arbitration are separate decorators rather
-    than one.
-
-    The meter is entered *inside* the arbiter by the decorator below, so a
-    batch queued behind a seat reads as waiting rather than working and the
-    console's light keeps meaning "the model is doing something". Holding the
-    cards does not delay a stop: `encode` asks `should_stop` between batches,
-    which a waiting embed reaches as readily as a working one.
+    Makes "nothing else runs while the embedder works" a property of the code:
+    a console search or a node's own search embeds at any moment, not only in the
+    pre-run phases. On `_encode` alone, not `_load_embedder`, which only builds
+    the handle the in-process tokenizer is reached through -- evicting a seat to
+    chunk a document would be a reload for nothing. The meter is entered inside
+    the arbiter, so a batch queued behind a seat reads as waiting, not working.
     """
 
     @functools.wraps(method)
@@ -656,8 +469,7 @@ def _needs_the_cards(method: Callable[_P, _R]) -> Callable[_P, _R]:
         from langgraph_agent.control import GPU_ARBITER
 
         with GPU_ARBITER.exclusive("embedder"):
-            # Freed inside the arbiter, so nothing loads into the gap between
-            # the eviction and the embedding that wanted the room.
+            # Freed inside the arbiter, so nothing loads into the gap.
             free_the_cards_for(EMBEDDING_MODEL_NAME)
             return method(*args, **kwargs)
 
@@ -665,74 +477,53 @@ def _needs_the_cards(method: Callable[_P, _R]) -> Callable[_P, _R]:
 
 
 class GraphRAGKnowledgeBase(CorpusSpectralMixin):
-    """Simple GraphRAG: NetworkX graph + Chroma vector store.
+    """The corpus: a NetworkX document/entity graph beside a Chroma vector store.
 
-    Constructing this **creates the store on disk** -- `mkdir`, plus Chroma's
-    own files under `chroma/`. That is why it is not the door most callers go
-    through: `open_knowledge_base()` returns the corpus only if one already
-    exists, and `get_knowledge_base()` is reserved for the act of building one.
-    A corpus that appeared because a status poll happened to run is not a
-    corpus anyone asked for.
+    Constructing one **creates the store on disk**, which is why most callers go
+    through `open_knowledge_base()`, which never builds one; `get_knowledge_base()`
+    is reserved for indexing.
     """
 
-    # Declared on the class, not assigned in `__init__`, so an instance built
-    # field by field around a fake collection -- which is how the corpus tests
-    # avoid the model entirely -- still reads as "not loaded yet" rather than
-    # raising on the attribute.
+    # Declared on the class, not in `__init__`, as the attributes below are:
+    # the corpus tests build instances field by field around fakes, and these
+    # must read as "not loaded yet" there.
     _embedder: "OllamaEmbedder | None" = None
 
-    # Same reasoning, and the same construction path: (nodes, edges) -> the
-    # connectivity result computed at that shape. A cache must not depend on
-    # which door built the object, so it defaults on the class rather than in
-    # `__init__`.
+    # (nodes, edges) -> the connectivity computed at that shape.
     _connectivity_cache: "tuple[tuple[int, int], dict[str, Any]] | None" = None
 
-    # The lexical half of search, built on first use from what the store holds
-    # and dropped whenever the store changes. Declared on the class for the
-    # same reason as the two above: an instance assembled field by field
-    # around a fake collection still reads as "not built yet".
+    # The lexical half of search, built on first use and dropped on every
+    # change.
     _lexical_index: "BM25Index | None" = None
 
-    # Where the loaded embedder sits (`ollama` -- the daemon places it) and a
-    # note when the daemon split the model onto the CPU. Declared on the class
-    # for the reason the three above are: an instance built field by field
-    # around a fake embedder reads as "not placed yet" rather than raising.
+    # Where the loaded embedder sits (`ollama`), and a note when the daemon
+    # split it onto the CPU.
     embedding_device: str | None = None
     embedding_device_note: str | None = None
 
-    # The model this corpus is embedded with. There is exactly one, but the
-    # name rides on the instance so the export can say which model produced
-    # the corpus it is dumping and the calibration record is not mistaken for
-    # another model's.
+    # The model this corpus is embedded with, carried so the export can say so.
     embedding_model: str = EMBEDDING_MODEL_NAME
-    # Set by `index_project_files` while it runs, so an embedding through
-    # Ollama -- ~17s a batch for qwen3-embedding here -- stops between batches
-    # instead of finishing a document that can take minutes.
+    # Set by `index_corpus_files` while it runs, so an embed stops between
+    # batches.
     _should_stop: "Callable[[], bool] | None" = None
 
     def __init__(self, persist_dir: str | None = None):
         self.persist_dir = resolve_persist_dir(persist_dir)
         self.persist_dir.mkdir(parents=True, exist_ok=True)
 
-        # Initialize Chroma vector store
         self.chroma_client = chromadb.PersistentClient(str(self.persist_dir / "chroma"))
         self.collection = self.chroma_client.get_or_create_collection(
             name="knowledge",
             metadata={"hnsw:space": "cosine"}
         )
 
-        # Initialize knowledge graph
         self.graph = nx.DiGraph()
         self._load_graph()
 
     @property
     def embedder(self) -> "OllamaEmbedder":
-        """The daemon's embedding endpoint, built the first time something embeds.
-
-        Deferred because building the handle used to load a model, and it is
-        only needed to add a document or to run a query. It used to load in
-        `__init__`, so opening the corpus at all -- a header poll, a document
-        list -- paid for it.
+        """The daemon's embedding endpoint, built the first time something embeds, so
+        opening the corpus to read it costs nothing.
         """
         model = self._embedder
         if model is None:
@@ -741,12 +532,7 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
 
     @_embedder_at_work
     def _load_embedder(self) -> "OllamaEmbedder":
-        """Point the corpus at the daemon: no weights load in this process.
-
-        Placement -- which GPU, how much of it -- is the daemon's decision,
-        reported back through `cpu_share` on the first real encode rather than
-        chosen here.
-        """
+        """Point the corpus at the daemon; no weights load in this process."""
         model = OllamaEmbedder(self.embedding_model)
         self._embedder = model
         self.embedding_device = "ollama"
@@ -758,9 +544,7 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
     def _encode(self, texts: str | list[str]) -> Any:
         """Embed at `EMBEDDING_BATCH_SIZE`, stopping between batches when asked.
 
-        Every encode goes through here, so no call site reaches the daemon at
-        a size of its own, and a stopped run abandons the rest of a document
-        between batches rather than after it.
+        Every encode goes through here.
         """
         model = self.embedder
         vectors = model.encode(
@@ -772,24 +556,18 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         return vectors
 
     def _load_graph(self) -> None:
-        """Load graph from disk if exists."""
+        """Load the graph from disk, if there is one."""
         graph_path = self.persist_dir / "knowledge_graph.json"
         if graph_path.exists():
             with open(graph_path, encoding="utf-8") as handle:
                 self.graph = nx.readwrite.json_graph.node_link_graph(json.load(handle))
 
     def _save_graph(self) -> None:
-        """Save graph to disk, whole or not at all.
+        """Save the graph to disk, whole or not at all.
 
-        Written to a temporary file and renamed over the real one, the way
-        `calibrate_relevance_floor` writes its record. `json.dump` straight
-        into the file truncated it first and filled it after, and the thread
-        doing that can die in between: the console's exit and install.sh's
-        start-up check both end the process under a rebuild that is still
-        running on a daemon thread, and this is called once per document. A
-        file cut off mid-write does not load (`_load_graph` raises on it), and
-        a corpus whose graph does not load cannot be opened at all -- by the
-        header, the Researcher, or the rebuild that would have repaired it.
+        Written to a temporary file and renamed over the real one: a process ending
+        mid-write (a rebuild runs on a daemon thread) would otherwise leave a file
+        that does not load, and a corpus whose graph does not load cannot be opened.
         """
         graph_path = self.persist_dir / "knowledge_graph.json"
         node_link_data = nx.readwrite.json_graph.node_link_data(self.graph)
@@ -799,20 +577,13 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         os.replace(temporary, graph_path)
 
     def chunk_text(self, content: str) -> list[str]:
-        """Split a document into passages the embedder can actually read whole.
+        """Split a document into passages the embedder can read whole.
 
-        One tokenizer pass with an offset mapping, then `_chunk_windows` over
-        the token indices; each window's character span runs from the start of
-        its first token to the end of its last, so the text between tokens --
-        whitespace, indentation, blank lines -- is carried rather than dropped.
-        Concatenating the chunks therefore reproduces the document apart from
-        the deliberate overlap, and the join is checked in the tests.
-
-        `verbose=False` suppresses the tokenizer's own "sequence longer than
-        the maximum" warning. It is silenced only because this function is the
-        thing that answers it: the sequence *is* longer than the window, that
-        is why it is being cut up, and the warning would otherwise fire once
-        per document on every reindex.
+        One tokenizer pass with an offset mapping, then `_chunk_windows`; each
+        window's span runs from its first token's start to its last token's end, so
+        the text between tokens is kept and the chunks rejoin into the document bar
+        the overlap. `verbose=False` silences the "sequence too long" warning this
+        function exists to answer.
         """
         if not content:
             return []
@@ -827,10 +598,8 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         )
         offsets = encoded["offset_mapping"]
         if not offsets:
-            # Content the tokenizer maps to nothing -- whitespace, or a run of
-            # characters with no token of their own. There is no passage to
-            # embed, and returning the raw text would put a vector of noise in
-            # the store under the document's name.
+            # Content the tokenizer maps to nothing: there is no passage to
+            # embed.
             return []
 
         chunks = [
@@ -842,34 +611,17 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         return self._fit_chunks(chunks)
 
     def _fit_chunks(self, chunks: list[str]) -> list[str]:
-        """Trim any chunk that re-tokenizes past the window, and say which end.
+        """Trim any chunk that re-tokenizes past the window, and choose the end.
 
-        Slicing on the parent document's token boundaries does **not**
-        guarantee the slice re-tokenizes to the same length. A word-piece
-        tokenizer decides on context, so a fragment cut mid-word encodes
-        differently standalone than it did inside the document -- measured on
-        this corpus, 16 of 1,052 full-size chunks came back one token longer,
-        which put them at 257 against a 256 window and handed them straight
-        back to the truncation this whole change exists to remove.
-
-        Measuring the drift and padding the constant would be guessing with an
-        extra step: +1 is what this corpus does today, not a bound anybody can
-        prove for the next document. So the chunks are re-encoded and the
-        overflow is cut, which makes the window a fact rather than an estimate.
-        Only the overflowing chunks are touched, and the batched encode of the
-        rest is a few tens of milliseconds per reindex.
-
-        **Which end is trimmed is the part that matters.** A chunk's tail is
-        covered by the next chunk's overlap and its head by the previous one's,
-        so trimming into a neighbour's overlap loses nothing from the corpus --
-        except at the two ends of the document, which have no neighbour. The
-        last chunk is therefore trimmed at the *head* and every other at the
-        tail; trimming the last one's tail would drop the final tokens of the
-        file, silently, which is the original bug in miniature.
+        A fragment cut mid-word can re-tokenize one token longer standalone than it
+        measured inside its document, so chunks are re-encoded and the overflow cut --
+        the window is then a fact, not an estimate. Every chunk is trimmed at its tail,
+        which a neighbour's overlap covers, except the last, trimmed at its head:
+        trimming its tail would drop the end of the file.
         """
         if len(chunks) < 2:
-            # A lone chunk is the whole document, un-sliced, so it re-tokenizes
-            # to exactly what it was measured as and cannot overflow.
+            # A lone chunk is the whole document, un-sliced, and cannot
+            # overflow.
             return chunks
 
         encoded = self.embedder.tokenizer(
@@ -891,72 +643,38 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         return fitted
 
     def add_document(self, doc_id: str, content: str, metadata: dict[str, Any] | None = None) -> int:
-        """Add a document to the knowledge base.
+        """Add a document: its chunks to the store, one node and its entities to the graph.
 
-        The document is embedded as several chunks and stored as several rows,
-        keyed `doc_id#0000`, `doc_id#0001`, ... -- see `CHUNK_MAX_TOKENS` for
-        what embedding it as one row cost. The graph is unaffected: it still
-        gets exactly one node per document, with entities drawn from the whole
-        text, so chunking changes what search can find and not what the corpus
-        is shaped like.
-
-        Args:
-            doc_id: Unique document identifier
-            content: Document text content
-            metadata: Optional metadata (path, type, etc.)
+        Chunks are stored as `doc_id#0000`, `doc_id#0001`, ...; the graph still gets
+        one node per document, with entities drawn from the whole text.
 
         Returns:
-            How many chunks this document became. Reported rather than
-            discarded because it is the one number that says whether a
-            document is *reachable*: chunking is what made a long file
-            searchable past its first thousand characters, and a caller adding
-            one document at a time -- an upload -- has no other way to see that
-            it landed as several passages rather than as a truncated header.
+            How many chunks the document became -- the number that says it is
+            reachable past its first passage.
         """
         chunks = self.chunk_text(content)
 
-        # Embedded before anything is deleted. A failed or stopped embed then
-        # leaves the document exactly as the store held it, rather than
-        # deleting it and failing to put it back: on 2026-09-18 a load that
-        # ran out of GPU memory at console startup removed CLAUDE.md,
-        # frontend/index.html and pyproject.toml from the corpus outright, and
-        # the header read `stale: 3 not indexed` until the next rebuild. Old
-        # vectors still carry the old `sha`, so the next rebuild re-embeds it.
-        #
-        # Chunks are embedded in one batched call rather than one per chunk:
-        # the model is the expensive thing on this machine and batching is
-        # most of what makes a reindex of ~1,100 chunks finish in the time a
-        # reindex of 77 documents used to take.
+        # Embedded before anything is deleted, so a failed or stopped embed
+        # leaves the document as the store held it. One batched call for all
+        # the chunks.
         embeddings = self._encode(chunks).tolist() if chunks else []
 
-        # A document's previous chunks are deleted before the new ones land,
-        # rather than left to be overwritten by `upsert`. A file that shrank
-        # between reindexes -- 10 chunks down to 3 -- overwrites 0..2 and
-        # leaves 3..9 in the store, still matching queries with text the file
-        # no longer contains. That is the same "a reindex rebuilds rather than
-        # accumulates" rule `index_project_files` follows for whole documents,
-        # applied one level down.
-        #
-        # Keyed on the `doc_id` metadata, so it also sweeps up the single
-        # unsuffixed row a pre-chunking store holds for this document.
+        # A document's previous chunks go before the new ones land: a file that
+        # shrank would otherwise leave its old tail matching queries. Keyed on
+        # `doc_id`, which also sweeps the single unsuffixed row of a pre-
+        # chunking store.
         try:
             self.collection.delete(where={"doc_id": doc_id})
         except Exception:
-            # A collection that cannot filter by metadata (an older store, or
-            # the fakes the corpus tests build) still gets a correct insert
-            # below; what is lost is the sweep of rows this call is replacing.
+            # A collection that cannot filter by metadata still gets a correct
+            # insert; only the sweep is lost.
             pass
         self.collection.delete(ids=[doc_id])
 
         if chunks:
             base = dict(metadata or {})
-            # The fingerprint rides on every chunk, so `index_project_files`
-            # can ask "is this document still the one I embedded?" from the
-            # metadata it already fetches to prune with. Computed here rather
-            # than passed in, for the reason `doc_id` and `chunk_count` are:
-            # it describes what the store did with the text, not what the
-            # caller knows about the file, and one caller forgetting it would
-            # silently cost that document its reuse.
+            # The fingerprint rides on every chunk, so a rebuild can tell an
+            # unchanged document from the metadata it already fetches.
             base["sha"] = _content_sha(content)
             self.collection.upsert(
                 ids=[
@@ -972,10 +690,8 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
 
         self._add_to_graph(doc_id, content, metadata)
 
-        # The lexical index describes a corpus that no longer exists. Dropped
-        # rather than amended: the next search rebuilds it from the store in
-        # milliseconds, and an index maintained in parallel with Chroma is a
-        # second account of the same corpus, free to disagree with it.
+        # The lexical index now describes a corpus that no longer exists; the
+        # next search rebuilds it.
         self._lexical_index = None
 
         self._save_graph()
@@ -984,19 +700,13 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
     def _add_to_graph(
         self, doc_id: str, content: str, metadata: dict[str, Any] | None = None
     ) -> None:
-        """The half of `add_document` that costs nothing: node and entities.
+        """The half of `add_document` that costs nothing: the node and its entities.
 
-        Split out because a rebuild that keeps a document's vectors still has
-        to put it back in the graph -- `index_project_files` clears the graph
-        up front, so a document whose embeddings were reused would otherwise
-        vanish from it while staying perfectly searchable. Entity extraction is
-        a regex over the text and the whole graph rebuilds in 0.04s, so the
-        cheap half is simply always done.
+        Separate because a rebuild that keeps a document's vectors still has to put
+        it back in the graph it cleared.
         """
-        # `type` on a node is structural -- document vs entity -- and drives how
-        # the console draws it. Metadata carries its own `type` (python,
-        # markdown), which collides as a duplicate keyword and takes down the
-        # whole insert, so it goes in under its own name.
+        # `type` on a node is structural -- document vs entity; the metadata's
+        # own `type` would collide with it, so it goes in as `doc_type`.
         node_attrs = {k: v for k, v in (metadata or {}).items() if k != "type"}
         if metadata and "type" in metadata:
             node_attrs["doc_type"] = metadata["type"]
@@ -1008,34 +718,15 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
             **node_attrs
         )
 
-        # Extract simple entities (words that look like important terms).
-        # The strip set has to cover code punctuation as well as prose: over a
-        # corpus that is mostly source files, a prose-only `.,!?;:` leaves
-        # entities like `Builder")` standing as graph nodes.
+        # Capitalised words over four characters, stripped of prose and code
+        # punctuation and filtered through `ENTITY_STOPWORDS`.
         #
-        # `ENTITY_STOPWORDS` is what stops the capital rule firing on words
-        # whose capital comes from where they sit rather than what they mean --
-        # a sentence opener, a docstring heading, a Python literal. Without it
-        # `False` and `Returns` are the 4th and 6th best-connected nodes in
-        # this corpus's graph, ahead of `Fiedler` and `Cheeger`, and every
-        # document carrying a docstring is joined to every other one through a
-        # relation that means nothing.
-        # A fetched web page is a *retrieval source*, not knowledge-graph
-        # material, and the capital rule is far worse on it than on this
-        # project's own files. `ENTITY_STOPWORDS` is a hand-audited list, and it
-        # was audited against source code and numpy docstrings, where the forced
-        # capitals are `Returns`, `Every`, `False`. Web prose opens sentences
-        # with a different vocabulary entirely, and none of it is on the list.
-        # Measured on 2026-09-09: 15 fetched pages minted **551 entities that no
-        # project document mentions -- 19% of the whole graph, 36.7 per page** --
-        # `Although`, `Afterward`, `Altogether`, `Again`, `Accessed`. Skipping
-        # them took the graph from 2,830 entities to 2,285 and duplicate
-        # candidates from 205 to 171. Those edges are read as evidence by
-        # `neighborhood`, `topics` and `duplicate_entities`, so the graph
-        # degrades as the corpus grows.
-        # The page is still chunked, embedded and fully retrievable; it simply
-        # stops voting on what the entities of this project are. Markup, script
-        # and config follow the same rule: see `ENTITY_FREE_SUFFIXES`.
+        # Fetched pages and markup, script and config files mint no entities
+        # (`_mints_entities`): web prose opens sentences with a vocabulary the
+        # hand-audited list was never checked against -- 15 pages once minted
+        # 551 entities, a fifth of the graph -- and the graph's edges are read
+        # as evidence. Those documents are still chunked, embedded and
+        # retrievable.
         entities = []
         for word in (content.split() if _mints_entities(doc_id) else []):
             token = word.strip("\"'`()[]{}<>.,!?;:*=+-/\\|")
@@ -1047,77 +738,35 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
             ):
                 entities.append(token)
 
-        # Add entities and relationships
         for entity in set(entities):
             self.graph.add_node(entity, type="entity")
             self.graph.add_edge(doc_id, entity, relation="mentions")
 
     def search(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
-        """Search the knowledge base.
+        """Search the knowledge base: matches chunks, answers in documents.
 
-        Matches on chunks and answers in documents. `id` stays the document's
-        path -- the thing callers index the graph with, print as a filename and
-        derive an entity from -- while `content` becomes the passage that
-        actually matched rather than the document's first 200 characters. That
-        is the half of chunking the Researcher feels: what it forwards to the
-        Builder (up to `RESEARCH_SNIPPET_CHARS` of each passage, in `nodes.py`)
-        used to be the opening characters of whichever file's *header* scored
-        best.
-
-        Chunks are oversampled and then collapsed onto their documents, keeping
-        each document's best-scoring chunk. Collapsing is what makes `top_k`
-        mean what every caller already assumed it meant: without it a query
-        that matches six passages of one file would return that file six times
-        and crowd out five other sources, which is worse than the pre-chunking
-        behaviour rather than better.
-
-        The retrieval is **hybrid**: the dense window is re-ranked against BM25
-        before it is collapsed. Dense similarity is a poor instrument for "this
-        passage contains this exact rare identifier", which is what a plan
-        naming `BUILDER_DEADLINE_SECONDS` is really asking. Measured through
-        this method against the real store, on 541 identifiers each defined in
-        exactly one project file, the defining file came first 53.4% of the
-        time on dense alone and 65.1% with the re-rank (McNemar p < 0.001, 85
-        fixed against 22 broken). The prose case improved too -- 66.0% to 68.2%
-        on 400 held-out passages -- so this is not a code-search special case
-        bought at the expense of ordinary questions. See `lexical.py` for why
-        it re-ranks rather than retrieving in parallel, and why ranks are fused
-        rather than scores.
-
-        `score` therefore stays exactly what it was: the dense cosine of the
-        chunk that matched. Every candidate comes from the dense window, so
-        there is no result whose score had to be invented -- which matters
-        because the relevance floor is read off the first one to decide
-        whether the corpus answered at all.
+        `id` is the document's path; `content` is the passage that matched (from the
+        start of its line, with `line` set, when the file still contains it). Chunks
+        are oversampled, re-ranked against BM25 (see `lexical.py`) and collapsed onto
+        their documents, best chunk first, so `top_k` counts documents. `score` stays
+        the dense cosine of the chunk that matched -- the number the relevance floor
+        is read off.
 
         Args:
-            query: Search query
-            top_k: Number of documents to return
-
-        Returns:
-            List of results with content, metadata, and graph context
+            query: Search query; an empty one answers nothing.
+            top_k: Number of documents to return.
         """
         if top_k <= 0:
             return []
-        # An empty query is not a question and must not answer like one. The
-        # empty string still embeds, and on this corpus it matched five chunks
-        # topping 0.412 -- over the relevance floor of the time, so those would have
-        # been formatted as findings and announced as "Research complete". The
-        # fabricated retrieval hit, arriving through the query this time.
+        # An empty query is not a question: it still embeds, and would match
+        # something.
         if not query or not query.strip():
             return []
 
-        # Generate query embedding. `_encode` is what keeps it at the batch cap
-        # and draws no progress bar.
         query_embedding = self._encode(query).tolist()
 
-        # Widen once if one document monopolised the first window of hits.
-        # A focused query genuinely can match a dozen passages of the same
-        # large file before it matches anything else, and collapsing those
-        # onto one document would answer a request for five sources with one
-        # -- narrower than the behaviour chunking replaced. The ladder is two
-        # rungs and stops early: there is no point asking a third time, and an
-        # unbounded search for breadth would let one query walk the corpus.
+        # Widen once if one document monopolised the first window of hits; two
+        # rungs, so one query cannot walk the corpus.
         results: list[dict[str, Any]] = []
         wanted = top_k * SEARCH_CHUNK_OVERSAMPLE
         for n_results in (wanted, wanted * SEARCH_ESCALATION):
@@ -1131,27 +780,18 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
             )
             hits = len((raw.get("ids") or [[]])[0] or [])
             if len(results) >= top_k or hits < n_results:
-                # Either the caller has what it asked for, or the collection
-                # returned fewer chunks than requested and has no more to give.
+                # Enough documents, or the collection has no more chunks to
+                # give.
                 break
 
         return results
 
     @property
     def lexical_index(self) -> "BM25Index | None":
-        """The BM25 index over the stored chunks, built on first use.
+        """The BM25 index over the stored chunks, built from the store on first use.
 
-        Built from the store rather than kept alongside it, so it cannot drift:
-        whatever `search` re-ranks is what `search` retrieved. `add_document`
-        and `clear` drop it instead of updating it -- rebuilding over this
-        corpus's ~1,200 chunks is milliseconds, and an index that edits itself
-        in place is a second thing that can disagree with Chroma.
-
-        Returns `None` rather than raising if the store cannot produce its
-        documents. A collection too old or too foreign to answer `get` is a
-        reason to fall back to dense-only retrieval, not a reason for search to
-        stop working -- the lexical half is an improvement to the ranking, and
-        the dense half is still a correct answer without it.
+        None, falling back to dense-only search, when the store cannot list its
+        documents.
         """
         if self._lexical_index is None:
             try:
@@ -1168,12 +808,9 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
     def _rerank_lexically(
         self, query: str, raw: "Mapping[str, Any]"
     ) -> list[str] | None:
-        """Fuse the dense window's order with BM25's, or leave it alone.
+        """Fuse the dense window's order with BM25's; None to keep Chroma's order.
 
-        Returns `None` -- meaning "use the order Chroma gave" -- when there is
-        no index or fewer than two candidates to reorder. A single hit has no
-        ranking to improve, and paying for an index build to discover that is
-        the sort of cost that lands on the console's five-second poll.
+        None when there is no index, fewer than two candidates, or no disagreement.
         """
         chunk_ids = [str(c) for c in ((raw.get("ids") or [[]])[0] or [])]
         if len(chunk_ids) < 2:
@@ -1185,39 +822,30 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
 
         by_lexical = lexical_order(query, chunk_ids, index)
         if by_lexical == chunk_ids:
-            # The lexical half agrees, or had nothing to say. Either way the
-            # fusion would return the order we already have.
             return None
         return reciprocal_rank_fusion(chunk_ids, by_lexical)
 
     def _collapse_chunk_hits(
         self, raw: "Mapping[str, Any]", top_k: int, order: list[str] | None = None
     ) -> list[dict[str, Any]]:
-        """Fold chunk hits onto the documents they came from, best chunk first.
+        """Fold chunk hits onto their documents, best chunk first.
 
-        Chroma returns hits best-first, so the first chunk seen for a document
-        is its best one and every later chunk of it only adds to the count.
-        `order`, when given, replaces that ordering with the hybrid one --
-        the same hits, re-ranked, so "best chunk first" still holds and every
-        result still carries the dense score its chunk was retrieved with.
+        `order`, when given, is the hybrid ranking of the same hits; every result
+        still carries the dense score its chunk was retrieved with.
         """
         ids = raw.get("ids") or [[]]
         documents = raw.get("documents") or [[]]
         metadatas = raw.get("metadatas") or [[]]
         distances = raw.get("distances") or [[]]
 
-        # Guard against empty collections / no hits
         if not ids or not ids[0]:
             return []
 
         collapsed: list[dict[str, Any]] = []
         by_document: dict[str, dict[str, Any]] = {}
 
-        # Walk the hits in the hybrid order when there is one, and in Chroma's
-        # otherwise. A chunk id `order` names that this response does not hold
-        # is skipped rather than trusted: the two come from the same query, but
-        # the collapse reads `documents`/`distances` positionally and an id
-        # without a row here would index the wrong one.
+        # In the hybrid order when there is one. An id the response does not
+        # hold is skipped, since rows are read positionally.
         position = {str(c): i for i, c in enumerate(ids[0])}
         walk = (
             [(position[c], c) for c in order if c in position]
@@ -1234,9 +862,7 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
                 continue
 
             if len(collapsed) == top_k:
-                # Full. Keep draining the hits already paid for so
-                # `chunks_matched` counts every match, but admit no new
-                # documents.
+                # Full: keep counting matches, admit no new documents.
                 continue
 
             result: dict[str, Any] = {
@@ -1251,7 +877,6 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
             if location is not None:
                 result["line"], result["content"] = location
 
-            # Add graph neighbors
             if doc_id in self.graph:
                 neighbors = list(self.graph.neighbors(doc_id))[:5]
                 result["related_entities"] = neighbors
@@ -1262,34 +887,24 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         return collapsed
 
     def query_graph(self, entity: str, hops: int = 2) -> dict[str, Any]:
-        """Query the knowledge graph for entity relationships.
-
-        Args:
-            entity: Entity name to search for
-            hops: Number of hops to traverse
+        """An entity's neighbourhood within `hops`, resolved fuzzily (`_match_node`).
 
         Returns:
-            Entity info with relationships
+            The entity, its neighbours with their distances, and the subgraph's size;
+            `resolved_from` and `alternatives` when the id typed was not the one found.
         """
-        # One spelling of the fuzzy match, so the console and the Researcher's
-        # tool cannot resolve an id differently.
         found, alternatives = self._match_node(entity)
         if found is None:
             return {"error": f"Entity '{entity}' not found"}
         typed, entity = entity, found
 
-        # Undirected, for the reason `neighborhood` is: every edge runs
-        # document -> entity, so an entity has in-edges only and a directed walk
-        # from one reaches nothing. It returned the entity alone for every
-        # entity in the corpus -- `Planner`, 21 edges, reported 0 against a real
-        # 2-hop neighbourhood of 614 -- which reads as "this term connects to
-        # nothing" rather than as a broken walk. See `test_graph_queries.py`.
+        # Undirected: every edge runs document -> entity, so a directed walk
+        # from an entity reaches nothing.
         undirected = self.graph.to_undirected(as_view=True)
         neighbors = nx.single_source_shortest_path_length(
             undirected, entity, cutoff=hops
         )
 
-        # Build subgraph
         subgraph = self.graph.subgraph(neighbors.keys())
 
         result: dict[str, Any] = {
@@ -1299,35 +914,22 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
             "subgraph_edges": len(subgraph.edges()),
         }
         if entity != typed:
-            # The Researcher reads this too: a relationship question answered
-            # about a different node than the one it named should say so.
+            # A relationship question answered about a different node says so.
             result["resolved_from"] = typed
             result["alternatives"] = alternatives
         return result
 
-
-    def _resolve_node(self, node_id: str) -> str | None:
-        """Resolve a node id; see `_match_node`. Both entry points use it."""
-        return self._match_node(node_id)[0]
-
     def _match_node(self, node_id: str) -> tuple[str | None, list[str]]:
         """Resolve a typed id to a node, and name the others it could have meant.
 
-        The fallback used to be the first node whose id contained the text, in
-        whatever order the graph enumerated its nodes -- so the same loose id
-        could trace a different node after a reindex, and nobody was told there
-        had been a choice. Candidates are ranked instead: the exact id ignoring
-        case, a document by its file name or stem, an id starting with the text,
-        an id containing it; within a rank the shorter id wins, then the better
-        connected node. The runners-up come back with the match, so a caller can
-        say what it chose between.
+        Ranked: the exact id ignoring case, a document by its file name or stem, an
+        id starting with the text, an id containing it; within a rank the shorter id,
+        then the better connected node -- deterministic across rebuilds. A blank id
+        resolves to nothing.
         """
         if node_id in self.graph:
             return node_id, []
 
-        # `"" in anything` is True, so a blank id matched on the first
-        # comparison and resolved to whatever the graph enumerated first. The
-        # caller asked about nothing and got a real document's neighbourhood.
         if not node_id or not node_id.strip():
             return None, []
 
@@ -1360,17 +962,15 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         return candidates[0][3], [c[3] for c in candidates[1 : 1 + MAX_MATCH_ALTERNATIVES]]
 
     def _node_record(self, node_id: str) -> dict[str, Any]:
-        """Render one graph node in the shape the console draws."""
+        """One graph node in the shape the console draws."""
         attrs = dict(self.graph.nodes[node_id])
         node_type = attrs.pop("type", "entity")
 
-        # The stored content snippet is for retrieval, not for a properties
-        # blob the user hovers over; drop it rather than ship 200 chars per node.
+        # The content snippet is for retrieval, not for hovering.
         attrs.pop("content", None)
 
-        # A bare basename collides -- this project has two README.md files, and
-        # two nodes labelled the same are unreadable on a graph. Keep the
-        # parent directory for anything that is not at the repository root.
+        # A bare basename collides (two README.md files), so a document's label
+        # keeps its parent directory.
         label = str(node_id)
         path = attrs.get("path")
         if node_type == "document" and path:
@@ -1386,12 +986,7 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         }
 
     def list_documents(self) -> dict[str, Any]:
-        """List every document node in the knowledge graph.
-
-        Documents are the centres the console sweeps from. A centre never
-        appears in its own neighbourhood, so the client seeds its node map from
-        this list before it queries anything.
-        """
+        """Every document node -- the centres the console sweeps from."""
         documents = [
             {"id": node_id, "title": self._node_record(node_id)["label"], "node_type": "document"}
             for node_id, attrs in self.graph.nodes(data=True)
@@ -1403,36 +998,11 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
     def _sign_split(self, keep: set[Any], centre: str) -> dict[str, Any]:
         """Fiedler sign bipartition of a swept neighbourhood, oriented on the centre.
 
-        The A4 application of the spectral applicability study, and the
-        cheapest technique in it: one eigenvector, 1.7-3.3ms on subgraphs of
-        43-291 nodes, against the 1.0ms `neighborhood()` itself costs. That is
-        why it is a flag rather than always-on -- it triples the cost of a call
-        the console makes on every click, and a caller who only wants the node
-        list should not pay it.
-
-        Sides are named `center` and `other` rather than by the sign of the
-        eigenvector, whose direction is arbitrary: an eigenvector and its
-        negation are equally valid, so a raw sign would swap the two halves
-        between runs for no reason. Orienting on the centre also makes the
-        answer the one the caller asked for -- "what clusters with the node I
-        looked up, and what is peripheral to it".
-
-        `mu_2` is returned because the split is always *available* and only
-        sometimes *meaningful*. A sign cut exists for any connected graph; what
-        says whether it corresponds to a real division is how small `mu_2` is,
-        and on these subgraphs it ranges from 0.134 (a two-hop sweep, barely
-        divided) to 0.006 (a five-hop sweep spanning two topic areas). The
-        caller is given the number rather than a bare verdict because the
-        threshold that matters depends on what the split is being used for --
-        here, whether it is worth drawing.
-
-        Runs on the largest component: `min_degree` pruning can disconnect the
-        swept subgraph -- measured at depth 3, min_degree 3, which left one
-        node isolated -- and on a disconnected graph the Fiedler vector is a
-        component indicator, so the "split" would just be that stray node
-        against everything else. Nodes outside the largest component are
-        reported as `detached` and given no side, which is the truth: they were
-        not part of the division.
+        Sides are `center` and `other`, not signs, which flip arbitrarily between
+        runs. `mu_2` is returned because a split always exists and is only meaningful
+        when `mu_2` is small; the caller decides what counts. Runs on the largest
+        component -- `min_degree` pruning can disconnect the sweep -- and reports the
+        rest as `detached`.
         """
         undirected = self.graph.to_undirected(as_view=True)
         subgraph = undirected.subgraph(keep)
@@ -1480,27 +1050,19 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         self, node_id: str, max_depth: int = 2, min_degree: int = 1,
         split: bool = False,
     ) -> dict[str, Any]:
-        """Return a node's neighbourhood as drawable nodes and edges.
-
-        `query_graph` answers "how big is this neighbourhood"; this answers
-        "what is in it", in the record shape the console renders directly.
+        """A node's neighbourhood as drawable nodes and edges.
 
         Args:
             node_id: Centre of the traversal; resolved fuzzily.
-            max_depth: Hops to traverse out from the centre.
-            min_degree: Drop entity nodes with fewer edges than this. A sweep
-                passes 2, because `add_document` mints an entity for every
-                capitalised word and the one-document ones bury the structure
-                worth looking at. A single trace passes 1, so a node the user
-                asked for by name never has its neighbours hidden.
-            split: Also compute the Fiedler sign bipartition, tagging every
-                node `center` or `other`. Off by default: it triples the cost
-                of this call, and only a caller that is going to draw the
-                division wants it. See `_sign_split`.
+            max_depth: Hops out from the centre.
+            min_degree: Drop entity nodes with fewer edges -- a sweep passes 2 so
+                one-document entities do not bury the structure; a trace passes 1.
+            split: Also tag every node `center` or `other` (`_sign_split`); off by
+                default, since it triples the cost of the call.
 
         Returns:
-            center_node, related_nodes (excluding the centre), edges, and
-            totals; plus `split` when asked for.
+            center_node, center, related_nodes (excluding the centre), edges and
+            totals; `split` when asked for.
         """
         centre, alternatives = self._match_node(node_id)
         if centre is None:
@@ -1513,9 +1075,8 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
                 "total_edges": 0,
             }
 
-        # Traverse undirected: every edge runs document -> entity, so a directed
-        # walk from a document reaches its entities but never the sibling
-        # documents that share them, which is the structure worth showing.
+        # Undirected, so a document's walk reaches the sibling documents
+        # sharing its entities.
         undirected = self.graph.to_undirected(as_view=True)
         reachable = nx.single_source_shortest_path_length(
             undirected, centre, cutoff=max_depth
@@ -1545,9 +1106,8 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
 
         result = {
             "center_node": centre,
-            # The centre's own record, because only the graph knows whether it
-            # is a document or an entity. Without it the console assumed a
-            # document and drew every traced entity as a file.
+            # Only the graph knows whether the centre is a document or an
+            # entity.
             "center": self._node_record(centre),
             "related_nodes": related,
             "edges": edges,
@@ -1556,16 +1116,13 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         }
 
         if centre != node_id:
-            # Said whenever the id typed was not the id found, so a trace of
-            # the wrong node reads as a choice rather than as the answer.
+            # The id typed was not the id found: say so.
             result["resolved_from"] = node_id
             result["alternatives"] = alternatives
 
         if split:
             division = self._sign_split(keep, centre)
-            # `sides` is folded onto the node records and dropped from the
-            # summary: the console draws nodes, not a lookup table, and
-            # shipping both would let the two disagree.
+            # Folded onto the node records, so the two cannot disagree.
             sides = division.pop("sides", {})
             for record in related:
                 record["side"] = sides.get(record["id"])
@@ -1576,19 +1133,9 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
     def overview(self, min_degree: int = 4, include_isolated: bool = False) -> dict[str, Any]:
         """The whole corpus as one drawable graph -- what the console's sweep draws.
 
-        The console used to assemble this itself: `list_documents`, then one
-        `neighborhood` call per document -- 97 round trips on this corpus, each
-        a line in the server log, before anything was drawn. Every document is
-        always kept and entities are kept by degree, so for any depth of one or
-        more the union of those neighbourhoods is exactly every document plus
-        every entity with at least `min_degree` edges. That is computed here
-        once, from the same degree `neighborhood` reads.
-
-        A document linked to nothing in that subgraph -- a fetched page, an
-        entity-free source file, a document whose entities are all rarer than
-        `min_degree` -- is a dot joined to nothing, and a sweep has no use for
-        it. It is left out unless asked for, and counted in
-        `unlinked_documents` so the drawing does not silently lose it.
+        Every document plus every entity with at least `min_degree` edges, in one
+        call. A document linked to nothing in it is left out unless asked for, and
+        counted in `unlinked_documents`.
         """
         undirected = self.graph.to_undirected(as_view=True)
         keep = {
@@ -1628,20 +1175,15 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         try:
             chunks = self.collection.count()
         except Exception:
-            # Chroma is a separate store from the graph; a failure here should
-            # not take out the node/edge counts that come from memory.
+            # A Chroma failure must not take the in-memory counts with it.
             chunks = 0
 
         nodes = self.graph.number_of_nodes()
         edges = self.graph.number_of_edges()
 
-        # The console polls this every five seconds and the eigendecomposition
-        # is ~44ms on a 920-node graph, growing with the corpus. It is cached
-        # against (nodes, edges) because those are what every mutation path in
-        # this class moves: `add_document` only ever adds, and `clear` zeroes
-        # both. Re-adding an identical document changes neither count -- and
-        # changes no structure either, so the cached answer is still the right
-        # one. Nothing here removes an edge without removing a node.
+        # Cached against (nodes, edges): the header polls every five seconds,
+        # and nothing in this class changes the graph's structure without
+        # changing one of the two.
         if self._connectivity_cache is not None and self._connectivity_cache[0] == (nodes, edges):
             connectivity = self._connectivity_cache[1]
         else:
@@ -1659,26 +1201,10 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
     def clear(self) -> dict[str, Any]:
         """Empty the knowledge base, keeping the files that hold it.
 
-        The store is emptied in place rather than deleted: Chroma has this
-        directory open, and pulling it out from under a live client is a worse
-        failure than an empty collection. What is left behind is the same shape
-        a reindex leaves -- a real store with nothing in it.
-
-        Chroma goes first, and the graph is only cleared once it has. The two
-        halves answer different questions (search, and structure), so a run that
-        wiped one and failed on the other would leave the corpus disagreeing
-        with itself while reporting success. On failure this raises with both
-        intact.
-
-        The floor record goes with them, and that is a third half rather than
-        tidiness: a floor is measured on *these texts* with this model, so a
-        record outliving the corpus it was taken on is a number about a corpus
-        that no longer exists -- and `_calibrate_the_floor_before_the_run` reads
-        a record's mere presence as `known`, so the run that rebuilds the corpus
-        would never measure a floor for it. The console would go on showing that
-        floor over an empty corpus meanwhile. Removed last, after both halves
-        are actually empty, so a failed wipe leaves the corpus and its floor
-        agreeing.
+        Emptied in place, since Chroma has the directory open. Chroma goes first and
+        the graph only once it has, so a failure leaves both intact; the floor record
+        goes last, since a floor measured on texts that are gone would otherwise be
+        read as `known` by the run that rebuilds the corpus.
 
         Returns:
             What was removed, plus the (now zeroed) stats.
@@ -1692,8 +1218,7 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
 
         self.graph.clear()
         self._lexical_index = None
-        # Without this the clear lives only in memory: the next process start
-        # reloads the old graph off disk and the corpus comes back.
+        # Without this the next start reloads the old graph from disk.
         self._save_graph()
 
         floor_record = _floor_calibration_path(self.persist_dir)
@@ -1711,15 +1236,8 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
     def export_corpus(self) -> dict[str, Any]:
         """The whole corpus as one JSON-serialisable document.
 
-        Embeddings are left out. They are the bulk of the store by a wide
-        margin and the least useful part of a dump: the embedder is local, so
-        anything reading this file back can regenerate them, and a reader
-        without the same model could not use them anyway. The file says so
-        itself rather than leaving the omission to be discovered.
-
-        The graph half is `node_link_data`, which is exactly the on-disk format
-        `_save_graph` writes, so it can be compared against
-        `knowledge/knowledge_graph.json` directly.
+        Embeddings are left out -- most of the bytes, and regenerated locally -- and
+        the file says so. The graph half is `node_link_data`, the format on disk.
         """
         errors: list[str] = []
         chunks: list[dict[str, Any]] = []
@@ -1731,10 +1249,8 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
             chunks = [
                 {
                     "id": chunk_id,
-                    # The document this passage came from, lifted out of the
-                    # metadata so the export stands on its own: a row's id is
-                    # `path#0007`, and a reader should not have to know how to
-                    # parse that to group the file back together.
+                    # The document, lifted out of the metadata so the export
+                    # stands on its own.
                     "doc_id": _document_id_of(
                         chunk_id, metadatas[i] if i < len(metadatas) else None
                     ),
@@ -1744,8 +1260,7 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
                 for i, chunk_id in enumerate(ids)
             ]
         except Exception as exc:
-            # Same posture as `stats()`: a Chroma failure must not cost us the
-            # graph half of the export as well.
+            # A Chroma failure must not cost the graph half too.
             errors.append(f"reading chunks: {exc}")
 
         return {
@@ -1762,159 +1277,70 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         }
 
 
-# Files worth indexing, and the directories that only add noise. One list, so
-# the rebuild a run does and the walk `corpus_health` compares against cannot
-# drift into describing different corpora.
-#
-# Markup, script and config are in it because the project is not only prose and
-# Python: the console itself is `frontend/index.html`, and none of it could be
-# retrieved. Measured on 2026-09-12 by embedding that file's passages against
-# five questions about the console: it would rank first on three -- "how does
-# the console reattach to a run after a page reload" at 0.644, against a best of
-# 0.426 from the corpus as it stood -- and it lifts one question the corpus could
-# not answer at all over the relevance floor, 0.308 before and 0.383 after.
-# Asked about the Corpus tab without it, a discussion Builder proposed changes to
-# "a React/Vue/Angular component" the project does not have. These files are
-# retrievable but mint no entities: see `ENTITY_FREE_SUFFIXES`.
-PROJECT_INDEX_PATTERNS = (
-    "**/*.py", "**/*.md", "**/*.txt", "**/*.rst",
-    "**/*.html", "**/*.js", "**/*.css",
-    "**/*.sh", "**/*.toml", "**/*.yml", "**/*.yaml", "**/*.ini", "**/*.cfg",
-)
-# Matched as plain substrings of the path, so no globs: "*.egg-info" never
-# matched anything and let build metadata (SOURCES.txt, top_level.txt) into
-# the corpus as if it were project knowledge.
-PROJECT_INDEX_EXCLUDES = (
-    # `.git/`, not `.git`: as a plain substring it also matched `.github/`, so
-    # the CI workflow went out with the repository's object store.
-    "__pycache__", ".git/", ".venv", "venv", "node_modules",
-    ".pytest_cache", ".mypy_cache", "build/", "dist/", ".egg-info",
-    "knowledge/", "scripts/", ".qwen/", ".claude/",
-    # Seat-diagnostic sweeps. `.gitignore` already calls these "per-run
-    # measurements against non-deterministic models, not history", but the walk
-    # is a glob and not git, so being gitignored kept them out of commits and
-    # not out of the corpus: five sweeps from one afternoon sat in the store as
-    # indexed documents, answering questions with a week-old measurement of a
-    # seating nobody runs any more. `reports/*.md` is written deliberately and
-    # stays indexed; only the timestamped sweeps under it are excluded.
-    "reports/diagnostics/",
-    # Where an agent run's own write-ups land -- a machine inspection, an
-    # integration sketch, a brainstorm nobody finished. Excluded for the reason
-    # the sweeps above are: the walk is a glob and not git, so an untracked file
-    # here is corpus material within seconds of being written, and these are
-    # per-run notes about one afternoon rather than knowledge of the project.
-    # Measured on 2026-09-18: one file here had minted 98 entities -- 43 of them
-    # mentioned by no other document, 4.7% of the graph -- from a template whose
-    # own body says the logic it analyses was never attached, and a heading in
-    # the other took a positional token to the four documents that fail the
-    # entity guard in `tests/test_claims.py`. A directory rather than an entry
-    # per file, because the class recurs: four artifacts of this shape were
-    # deleted on 2026-09-09 and the list grew no way to keep the fifth out.
-    "experimental/",
-    # Application's own source files -- these are the program itself, not
-    # project knowledge to be retrieved. The operator must explicitly request
-    # embedding (via upload or project opt-in) for any of these to enter the
-    # corpus. This prevents the corpus from being polluted with the program's
-    # own code, tests, prompts, and documentation.
-    "src/", "tests/", "prompts/", "frontend/", "spectral_graph/",
+# What the walk indexes: prose and Python, plus the markup, script and config a
+# generated project is made of -- retrievable, but minting no entities (see
+# `ENTITY_FREE_SUFFIXES`). Compared exactly, so an upload is stored with its
+# suffix lower-cased or the next rebuild would not see it.
+INDEXABLE_SUFFIXES = (
+    ".cfg", ".css", ".html", ".ini", ".js", ".md", ".py", ".rst",
+    ".sh", ".toml", ".txt", ".yaml", ".yml",
 )
 
-# Above this size a file is not a document at all -- a data dump, a minified
-# bundle, a log -- and reading it into the corpus indexes something nobody
-# wrote. It was 100,000, and that number outlived its own justification: it
-# said such a file "would dominate the embedding budget", which was true when
-# `add_document` embedded a whole file as ONE vector and a long document's
-# single embedding competed with everyone else's. Chunking ended that, and
-# `search` collapsing chunks back onto documents ended it twice -- a document
-# now takes exactly one result slot however many chunks it holds. Measured on
-# this corpus: CLAUDE.md carries 7.1% of all 1,687 chunks and returned in
-# exactly 1 of 5 slots on every query tried, never more.
-#
-# What the old number did instead was dictate the shape of the project.
-# `corpus_health.py` exists as a separate module because adding the staleness
-# check pushed `graphrag_server.py` from 98,920 characters to 104,582 -- the
-# module that defines the corpus would have dropped out of it. By 2026-09-11
-# `nodes.py` stood at 82% of the limit, `graphrag_server.py` at 75%,
-# `test_graph.py` at 73%, and CLAUDE.md had 13 characters left, so the next
-# paragraph anyone wrote would have silently cost the project its own
-# documentation. A constant that decides how files must be split is not
-# measuring anything about knowledge.
-#
-# The remaining real risk sets the ceiling, and it is why this is 250,000 and
-# not unbounded: `search` retrieves a window of chunks *before* collapsing
-# them, so a document holding a large enough share of the corpus can fill that
-# window with itself and starve every other source -- the case
-# `SEARCH_ESCALATION` widens the window for. At 7.1% the largest document here
-# is nowhere near it; a file several times this limit would be.
+# Directories the walk never enters, wherever they sit under a corpus root:
+# version control, virtualenvs, tool caches and build output -- what a generated
+# project accumulates without anyone writing it. Matched against whole directory
+# names (plus the `.egg-info` suffix), never as substrings, so `rebuild/` is not
+# `build/` and a project's own `src/` and `tests/` are indexed like any others.
+CORPUS_SKIP_DIRS = frozenset({
+    "__pycache__", ".git", ".venv", "venv", "node_modules",
+    ".pytest_cache", ".mypy_cache", "build", "dist",
+})
+
+# Above this size a file is not a document -- a dump, a minified bundle, a log.
+# Chunking means a long document takes one result slot however many chunks it
+# holds; the ceiling exists because `search` retrieves a window of chunks
+# before collapsing them, and a large enough document could fill that window
+# alone.
 MAX_INDEXABLE_BYTES = 250_000
 
 # Where a document uploaded from the console lands, relative to the project
-# root. An upload is written to disk *before* it is embedded, and that ordering
-# is the design rather than a convenience: the corpus is a function of what is
-# on disk, and `index_project_files` rebuilds it from there -- clearing the
-# graph and pruning every stored row whose document is not in the walk. So a
-# document embedded straight into the store and nowhere else survives exactly
-# until the next reindex, which then deletes it silently, in a pass that
-# reports success and a file count that looks right. Writing the file first is
-# what makes an upload part of the corpus rather than a guest in it, and it is
-# why this directory must stay out of `PROJECT_INDEX_EXCLUDES`.
+# root. An upload is written to disk *before* it is embedded: the corpus is a
+# function of what is on disk, and a rebuild prunes every stored row whose
+# document is not in the walk, so a document embedded straight into the store
+# would survive only until the next rebuild deleted it, silently.
 UPLOADS_DIR = "uploads"
 
-# Where the online research phase writes the pages it fetched, relative to the
-# project root. It lives here rather than in `web_research` because
-# `add_document` has to recognise one of these on sight -- see
-# `_is_web_document` -- and because `web_research` imports this module, so the
-# constant could not travel the other way.
+# Where the online research phase writes the pages it fetched. Defined here,
+# not in `web_research`, which imports this module, because `add_document` has
+# to recognise one on sight.
 WEB_RESEARCH_DIR = "research/web"
 
-# The suffixes an upload may carry, derived from the walk's own patterns rather
-# than restated beside them. The two have to agree exactly or an upload is
-# accepted, embedded, and then dropped at the next rebuild for a reason nobody
-# is told -- the same drift `PROJECT_INDEX_EXCLUDES` had while two scripts kept
-# their own copy of it. Compared case-insensitively but *stored* lower-cased,
-# because the walk is a glob and a glob is case-sensitive here: `NOTES.MD`
-# written as given is a file the reindex cannot see.
-INDEXABLE_SUFFIXES = tuple(sorted({Path(pattern).suffix for pattern in PROJECT_INDEX_PATTERNS}))
-
-# The only directories the walk reads. The corpus holds researched archive data
-# -- pages the online research phase fetched -- and what the operator embedded
-# on purpose: an upload, or a generated project opted in. The checkout itself
-# (README, CLAUDE.md, install.sh, config) is the program, not knowledge, and a
-# console coming up used to embed it unasked. Everything outside these roots is
-# pruned from the store by the next rebuild.
+# The only directories the walk reads: researched archive data, and what the
+# operator embedded on purpose. The checkout itself is the program, never the
+# corpus; anything else in the store is pruned by the next rebuild.
 CORPUS_ROOTS = (WEB_RESEARCH_DIR, UPLOADS_DIR, PROJECTS_DIR)
 
 
 def _is_web_document(doc_id: str) -> bool:
     """True for a page the online research phase fetched.
 
-    Decided from the **path**, never from the call site, for the same reason
-    `_document_metadata` is shared between the upload and the walk: a reindex
-    re-reads these files as ordinary markdown, so a decision made only where a
-    document is first stored would be silently reversed the next time anyone
-    rebuilt. Matching on the parent directories rather than a prefix keeps it
-    working when the root is absolute, which it is in every test.
+    Decided from the path, so an upload, a first index and every rebuild agree;
+    matched on parent directories, so an absolute root works.
     """
     parts = PurePosixPath(str(doc_id).replace("\\", "/")).parts
     wanted = PurePosixPath(WEB_RESEARCH_DIR).parts
     return len(parts) > len(wanted) and parts[-len(wanted) - 1 : -1] == wanted
 
 
-# Suffixes whose documents are retrievable but mint no entities. Their capitals
-# are identifiers and interface strings, not terms the project is about:
-# measured on 2026-09-12, the seven such files in this checkout would mint 72
-# entities the graph does not hold, 56 of them from `frontend/index.html` alone
-# -- `BRIDGE_VERDICTS`, `CLEAR_ARMED`, `ACTIVE_SEAT`, and the openers of its
-# comments and messages (`Copying`, `Dimming`, `Cancelling`). The decision
-# `_is_web_document` makes for fetched pages, for the same reason: they would
-# vote on what this project's entities are without saying anything about them.
-# Python stays out of the set, because its docstrings are where the terms live.
+# Suffixes whose documents are retrievable but mint no entities: their capitals
+# are identifiers and interface strings (`ACTIVE_SEAT`, `Copying`), not terms
+# the corpus is about. Python stays out of the set; its docstrings are where
+# the terms live.
 ENTITY_FREE_SUFFIXES = frozenset(
     {".html", ".js", ".css", ".sh", ".toml", ".yml", ".yaml", ".ini", ".cfg"}
 )
 
-# The `type` a document is stored under, by suffix. Prose falls through to
-# "markdown", which is what .md, .txt and .rst have always been filed as.
+# The `type` a document is stored under, by suffix; prose is "markdown".
 _DOCUMENT_TYPES = {
     ".py": "python",
     ".html": "html", ".js": "javascript", ".css": "css", ".sh": "shell",
@@ -1926,24 +1352,16 @@ _DOCUMENT_TYPES = {
 # How many runners-up a loose node id reports beside its match.
 MAX_MATCH_ALTERNATIVES = 5
 
-# The most of a passage's first line a search result reaches back for. A chunk
-# starts wherever the token arithmetic cut it, usually mid-line; reaching back
-# to the start of the line reads better, but a minified line has no useful start.
+# How much of a passage's line a result reaches back for: a chunk starts mid-
+# line, but a minified line has no useful start.
 MAX_PASSAGE_LEAD_CHARS = 240
 
 
 def _passage_location(doc_id: str, passage: str) -> tuple[int, str] | None:
     """Where a retrieved passage sits in its file: (1-based line, passage from that line's start).
 
-    A chunk begins where the token arithmetic cut it -- boundaries are not
-    snapped, see `CHUNK_OVERLAP_TOKENS` -- so the passage the Builder was handed
-    opened mid-statement ("in self.graph: neighbors = ...") and carried no
-    location at all. The line is what lets it open the file at the right place.
-
-    Read from the file on disk, because the store holds chunks, not documents.
-    None when the file cannot be read or no longer contains the passage -- a
-    document edited since it was indexed, where a guessed line would point at
-    the wrong code.
+    Read from the file on disk; None when it cannot be read or no longer contains
+    the passage, where a guessed line would point at the wrong code.
     """
     if not passage:
         return None
@@ -1962,11 +1380,7 @@ def _passage_location(doc_id: str, passage: str) -> tuple[int, str] | None:
 
 
 def _mints_entities(doc_id: str) -> bool:
-    """Whether a document takes part in entity extraction at all.
-
-    Decided from the path alone, like `_is_web_document`, so an upload, the
-    first index and every rebuild after it reach the same answer.
-    """
+    """Whether a document takes part in entity extraction, decided from its path."""
     if _is_web_document(doc_id):
         return False
     suffix = PurePosixPath(str(doc_id).replace("\\", "/")).suffix.lower()
@@ -1974,12 +1388,8 @@ def _mints_entities(doc_id: str) -> bool:
 
 
 def _document_metadata(path: Path) -> dict[str, str]:
-    """The metadata a document is stored under. One definition, two callers.
-
-    The reindex and an upload have to agree on this exactly: `path` is what the
-    graph node is keyed by and what `search` reports as a filename, and `type`
-    is what the console colours a node with. Two spellings of it would file the
-    same file twice under two descriptions.
+    """The metadata a document is stored under -- one definition for the rebuild
+    and an upload, so one file is never filed twice.
     """
     return {
         "path": str(path),
@@ -1995,40 +1405,28 @@ def store_uploaded_document(
 ) -> dict[str, Any]:
     """Write an uploaded document under `uploads/` and embed it, in that order.
 
-    See `UPLOADS_DIR` for why the file comes first. What is left after this
-    call is a document indistinguishable from any other in the corpus: the same
-    id shape, the same metadata, and a place in the walk, so the next reindex
-    re-reads it instead of pruning it.
-
-    Every refusal below is a `ValueError` naming what was wrong, because each
-    alternative to refusing is worse than a failed upload and none of them
-    announces itself. A file the embedder cannot read becomes a vector of noise
-    filed under a real filename. A file over the walk's size limit is embedded
-    now and dropped at the next rebuild. A name with a path in it writes
-    outside the directory the reindex looks at, so the document is embedded and
-    then pruned by the very next pass.
+    What is left is a document like any other: the same id shape, the same
+    metadata, and a place in the walk.
 
     Args:
-        kb: The corpus to add to. This is the *creating* door's knowledge base:
-            an upload is a request for a corpus to hold it.
-        name: The filename as the browser reported it. Only its last component
+        kb: The corpus to add to -- the creating door: an upload asks for a
+            corpus to hold it.
+        name: The filename as the browser reported it; only its last component
             is used.
         content: The document's text, already decoded.
-        root: Project root the walk runs from, so the id this stores under is
-            the id the walk will produce.
+        root: Project root, so the id stored is the id the walk produces.
 
     Returns:
-        What was stored -- the path, whether it replaced a document already
-        there, how many passages it became -- plus the corpus stats, so the
-        console can repaint its header from the same reply.
+        The path, whether it replaced a document, how many passages it became,
+        and the corpus stats.
 
     Raises:
-        ValueError: the name, the type, the size or the content is one the
-            corpus cannot take. The message says which, and why.
+        ValueError: a name, type, size or content the corpus cannot take --
+            anything else would embed noise under a real filename, or embed a
+            file the next rebuild drops. The message says which.
     """
-    # Only the last component, so a name carrying a path cannot place the file
-    # outside `uploads/`. `..` survives that (`PurePosixPath("..").name` is
-    # `".."`), so it is refused by name rather than left to the suffix check.
+    # Only the last component, so a name cannot place the file outside
+    # `uploads/`; `..` survives that and is refused by name.
     safe = PurePosixPath(name.replace("\\", "/")).name
     if safe in ("", ".", "..") or "\x00" in safe:
         raise ValueError(f"{name!r} is not a filename this can store.")
@@ -2052,8 +1450,7 @@ def store_uploaded_document(
         )
     if not content.strip():
         raise ValueError(f"{stored_name!r} has nothing in it to embed.")
-    # The walk's own test, character for character. Accepting a larger file
-    # here would embed it now and silently skip it at every reindex after.
+    # The walk's own limit, character for character.
     if len(content) > MAX_INDEXABLE_BYTES:
         raise ValueError(
             f"{stored_name!r} is {len(content):,} characters and the limit is "
@@ -2065,10 +1462,8 @@ def store_uploaded_document(
     directory = Path(root) / UPLOADS_DIR
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / stored_name
-    # Read before the write, so "replaced" is a fact rather than a guess. An
-    # upload of a name already there is the ordinary way to correct a document,
-    # and `add_document` deletes that document's previous chunks before the new
-    # ones land, so nothing of the old version is left behind in the store.
+    # Read before the write, so "replaced" is a fact. Re-uploading a name is
+    # how a document is corrected; `add_document` removes its previous chunks.
     replaced = path.exists()
     path.write_text(content, encoding="utf-8")
 
@@ -2085,77 +1480,57 @@ def store_uploaded_document(
     return report
 
 
-def iter_project_files(
-    root: str = ".",
-    exclude_dirs: tuple[str, ...] | list[str] | None = None,
-    roots: tuple[str, ...] | None = None,
-) -> list[Path]:
-    """Collect the archive files worth indexing.
+def _skipped_dir(name: str) -> bool:
+    return name in CORPUS_SKIP_DIRS or name.endswith(".egg-info")
 
-    Only `CORPUS_ROOTS` are walked, never the checkout as a whole: the corpus
-    is research and what the operator deliberately embedded. A run's generated
-    project under `projects/` is walked only once the operator has opted it in
-    -- see `langgraph_agent.projects`. `roots` overrides `CORPUS_ROOTS` for a
-    caller that audits something other than the corpus; `("",)` is the root.
+
+def iter_corpus_files(root: str = ".", roots: tuple[str, ...] | None = None) -> list[Path]:
+    """The files a rebuild indexes, spelled the way it stores them.
+
+    Walks `CORPUS_ROOTS` alone, never the checkout, pruning `CORPUS_SKIP_DIRS`; a
+    generated project is taken only once the operator has opted it in (see
+    `langgraph_agent.projects`). `roots` overrides `CORPUS_ROOTS` for a caller
+    auditing something other than the corpus; `("",)` is the root itself.
     """
-    excludes = tuple(exclude_dirs) if exclude_dirs is not None else PROJECT_INDEX_EXCLUDES
     root_path = Path(root)
     embedded = embedded_projects(root_path)
 
-    files: list[Path] = []
+    files: set[Path] = set()
     for corpus_root in CORPUS_ROOTS if roots is None else roots:
-        for pattern in PROJECT_INDEX_PATTERNS:
-            for file_path in (root_path / corpus_root).glob(pattern):
-                if any(excluded in str(file_path) for excluded in excludes):
-                    continue
-                if held_out_of_corpus(file_path.relative_to(root_path), embedded):
-                    continue
-                files.append(file_path)
-    return sorted(set(files))
+        for directory, subdirs, names in os.walk(root_path / corpus_root):
+            subdirs[:] = [name for name in subdirs if not _skipped_dir(name)]
+            for name in names:
+                path = Path(directory, name)
+                if name.endswith(INDEXABLE_SUFFIXES) and not held_out_of_corpus(
+                    path.relative_to(root_path), embedded
+                ):
+                    files.add(path)
+    return sorted(files)
 
 
-def index_project_files(
+def index_corpus_files(
     kb: "GraphRAGKnowledgeBase",
     root: str = ".",
     *,
     progress: "Callable[[int, int], None] | None" = None,
     should_stop: "Callable[[], bool] | None" = None,
 ) -> dict[str, Any]:
-    """Index every project file into the knowledge base.
+    """Rebuild the corpus from the walk, keeping the vectors of unchanged documents.
 
-    Returns a report rather than printing one, so both the CLI script and the
-    console's reindex button can render it their own way.
+    A rebuild, not an accumulation: rows whose document left the walk are pruned
+    first, and a document whose text still hashes to what the store holds keeps
+    its vectors and only rejoins the graph -- so a rebuild costs what changed.
 
-    `progress(done, total)` is called after each file, and `should_stop` is
-    asked before each file and -- through `OllamaEmbedder.encode` -- between
-    batches of an embedding: a batch is ~17s for qwen3-embedding here, and a
-    document's worth of them can take minutes, so a phase that long has to say
-    how far it has got and has to stop when asked. A stop is `stopped` in the
-    report and leaves the corpus part-built, which the next run finishes rather
-    than repeats, because what is already embedded keeps its vectors.
+    `progress(done, total)` follows each file; `should_stop` is asked before each
+    file and between embedding batches. A stop, or the daemon's circuit opening,
+    ends the pass early -- `stopped` or `unavailable` in the report -- and leaves
+    the corpus part-built for the next rebuild to finish.
     """
-    files = iter_project_files(root)
+    files = iter_corpus_files(root)
     wanted = {str(path) for path in files}
 
-    # A reindex rebuilds rather than accumulates. A file that no longer
-    # qualifies -- renamed, deleted, or newly excluded -- has to leave the
-    # corpus, or it keeps answering searches and keeps its graph node long
-    # after it stops existing.
-    #
-    # Stored rows are chunks, so staleness is a question about the *document*
-    # a row belongs to, not about the row's own id: `CLAUDE.md#0007` is not in
-    # `wanted` and never will be. Comparing ids directly would delete the
-    # entire corpus on every reindex and rebuild it from scratch -- which
-    # ends in the same place here, but would quietly become a full re-embed of
-    # every document the moment anything reindexed a subset.
-    #
-    # The same pass reads each surviving row's fingerprint. A document whose
-    # text still hashes to what the store holds keeps the vectors it has: the
-    # rebuild is then proportional to what actually changed rather than to how
-    # big the corpus is, which is what makes it something a run can do for
-    # itself before the Architect opens. Measured warm on this project, 77
-    # files and 1,618 chunks: 52.0s re-embedding everything, 0.1s when nothing
-    # changed -- and in that case the embedding model is never loaded at all.
+    # Stored rows are chunks, so staleness is asked of the document each row
+    # belongs to, read alongside each surviving row's fingerprint.
     stored_sha: dict[str, str] = {}
     try:
         existing = kb.collection.get(include=["metadatas"])
@@ -2171,11 +1546,7 @@ def index_project_files(
                 stale_documents.add(document)
             elif row and row.get("sha"):
                 stored_sha[document] = str(row["sha"])
-        # Counted in documents, not rows: "3 chunks pruned" is a fact about
-        # the store, and the caller wants to know how many *files* stopped
-        # answering searches. It is also the only half of a rebuild's work that
-        # `embedded` cannot see -- a pass that deleted a document and re-read
-        # nothing did something, and must not report itself as a no-op.
+        # Counted in documents, not rows: how many files stopped answering.
         dropped = len(stale_documents)
         if stale:
             kb.collection.delete(ids=stale)
@@ -2190,6 +1561,7 @@ def index_project_files(
     errors: list[str] = list(errors_pre)
 
     stopped = False
+    unavailable = ""
     kb._should_stop = should_stop
     for position, file_path in enumerate(files, 1):
         if should_stop is not None and should_stop():
@@ -2204,9 +1576,7 @@ def index_project_files(
             doc_id = str(file_path)
             metadata = _document_metadata(file_path)
             if stored_sha.get(doc_id) == _content_sha(content):
-                # Its chunks and their vectors are still correct and were not
-                # pruned above. Only the graph has to come back, because this
-                # function cleared it -- and that half is free.
+                # Unchanged: only the cleared graph needs it back.
                 kb._add_to_graph(doc_id, content, metadata)
                 reused += 1
             else:
@@ -2216,31 +1586,26 @@ def index_project_files(
         except EmbeddingStopped:
             stopped = True
             break
+        except CircuitOpenError as exc:
+            # The daemon is gone: every document left would fail the same way.
+            unavailable = str(exc)
+            break
         except Exception as exc:
             errors.append(f"{file_path}: {exc}")
         if progress is not None:
             progress(position, len(files))
 
-    # Both halves of the rebuild above are otherwise persisted only as a side
-    # effect of `add_document`: the `graph.clear()` reaches disk through its
-    # `_save_graph()`, and the pruned rows leave the lexical index through its
-    # invalidation. So a reindex that added nothing -- no matching files, or
-    # every one of them oversized or unreadable -- cleared the graph in memory
-    # and left the old `knowledge_graph.json` for the next process start to
-    # reload, while an index built before the prune went on answering with the
-    # chunks the prune had just deleted. Unconditional, the way `clear()` ends
-    # with the same two lines: the work was done either way, and a reindex is
-    # the one operation after which the lexical index must be rebuilt anyway.
+    # Persisted unconditionally: a rebuild that embedded nothing must still
+    # save the cleared graph and drop the lexical index built before the prune.
     kb._save_graph()
     kb._lexical_index = None
 
-    # `indexed` is how many documents the corpus now holds, which is what every
-    # caller has always printed. `embedded` and `reused` split that by cost --
-    # the only number that moves when a rebuild is nearly a no-op, and the one
-    # thing that says whether a rebuild did any work at all.
+    # `indexed` is how many documents the corpus holds; `embedded` and `reused`
+    # split it by cost.
     kb._should_stop = None
     report: dict[str, Any] = {
         "stopped": stopped,
+        "unavailable": unavailable,
         "indexed": indexed,
         "embedded": embedded,
         "reused": reused,
@@ -2252,24 +1617,16 @@ def index_project_files(
     return report
 
 
-# Cached knowledge base instance so repeated MCP calls and test runs do not
-# reload the embedding model and Chroma store every time.
+# The one knowledge base this process holds.
 _kb_instance: GraphRAGKnowledgeBase | None = None
 
 
 def get_knowledge_base(persist_dir: str | None = None) -> GraphRAGKnowledgeBase:
     """The singleton knowledge base, **built if it does not exist yet**.
 
-    This is the door for the one act that is allowed to bring a corpus into
-    existence: indexing. Everything that only wants to read -- the console's
-    header, the document list, the graph sweep, the Researcher's search --
-    goes through `open_knowledge_base()` instead, which returns `None` rather
-    than manufacturing a store. Reading is not a reason for a corpus to exist.
-
-    `persist_dir` is honoured only on the call that builds the singleton; the
-    process holds one corpus, and the argument exists so a caller that opened
-    a store somewhere other than the default is not silently handed the
-    default one instead.
+    The door reserved for indexing; every read goes through
+    `open_knowledge_base()`, which never creates a store. `persist_dir` is honoured
+    only by the call that builds the singleton.
     """
     global _kb_instance
     if _kb_instance is None:
@@ -2278,15 +1635,10 @@ def get_knowledge_base(persist_dir: str | None = None) -> GraphRAGKnowledgeBase:
 
 
 def embedding_device_status() -> dict[str, Any]:
-    """How the embedder is placed, without touching the daemon.
+    """How the embedder is placed, for the header's poll, without touching the daemon.
 
-    For the console header, which polls: `active` is None until something has
-    embedded. Placement -- which GPU, how much of the model -- is the daemon's
-    decision, so what there is to report is the share it left on the CPU the
-    last time it embedded, and the note when that share would slow indexing to
-    a fraction. Both are None until something has embedded. It reads the
-    singleton only if something already opened the corpus, so asking never
-    opens one.
+    `active` and `cpu_share` are None until something has embedded; reading this
+    never opens a corpus.
     """
     kb = _kb_instance
     loaded = kb is not None and kb._embedder is not None
@@ -2295,8 +1647,6 @@ def embedding_device_status() -> dict[str, Any]:
         "configured": "ollama",
         "active": kb.embedding_device if kb is not None and loaded else None,
         "note": kb.embedding_device_note if kb is not None else None,
-        # The share of the model the daemon left on the CPU when it last
-        # embedded. None until something has, or when it cannot say.
         "cpu_share": embedder.cpu_share if isinstance(embedder, OllamaEmbedder) else None,
     }
 
@@ -2304,9 +1654,7 @@ def embedding_device_status() -> dict[str, Any]:
 def corpus_exists(persist_dir: str | None = None) -> bool:
     """Whether a corpus has been built, without building or opening one.
 
-    A store that was emptied by `clear()` still exists -- that is the point of
-    emptying it in place -- so this answers "has anyone indexed here", not "is
-    there anything in it". `corpus_state()` tells those two apart.
+    An emptied store still exists; `corpus_state()` tells empty from absent.
     """
     return (resolve_persist_dir(persist_dir) / "chroma").is_dir()
 
@@ -2314,12 +1662,8 @@ def corpus_exists(persist_dir: str | None = None) -> bool:
 def open_knowledge_base(persist_dir: str | None = None) -> GraphRAGKnowledgeBase | None:
     """The corpus if one has been built, `None` if none has. Never builds one.
 
-    The reason this exists rather than every caller using `get_knowledge_base`:
-    constructing a `GraphRAGKnowledgeBase` creates the store on disk. The
-    console polls its header every five seconds, so with the creating door
-    wired to a read, starting the server was enough to leave a corpus behind --
-    an empty one that then reported itself as a knowledge base. A corpus should
-    be there because someone indexed, or not be there at all.
+    Constructing a knowledge base creates the store, so a read wired to
+    `get_knowledge_base` would leave a corpus behind on the first status poll.
     """
     if _kb_instance is not None:
         return _kb_instance
@@ -2331,15 +1675,9 @@ def open_knowledge_base(persist_dir: str | None = None) -> GraphRAGKnowledgeBase
 def corpus_state(persist_dir: str | None = None) -> tuple[str, str]:
     """Report the corpus as `absent`, `empty` or `indexed`, plus the model name.
 
-    Deliberately lightweight and deliberately non-creating: it opens Chroma
-    read-only and never touches the embedding model, so the console can poll
-    it on a timer without either calling the daemon or bringing a store into
-    being as a side effect of asking about one.
-
-    `absent` and `empty` are kept apart because they call for different things.
-    Nothing has ever been indexed here, versus a corpus that exists and was
-    emptied -- and a run against either finds nothing, which is exactly why the
-    operator has to be told which it was.
+    Non-creating and cheap enough to poll: opens Chroma read-only and never
+    touches the embedder. `absent` and `empty` are told apart because only one of
+    them means nothing was ever indexed here.
 
     Returns:
         (state, embedding_model_name)
@@ -2350,81 +1688,15 @@ def corpus_state(persist_dir: str | None = None) -> tuple[str, str]:
 
     try:
         client = chromadb.PersistentClient(str(chroma_dir))
-        # `get_collection`, not `get_or_create_collection`: asking after the
-        # corpus must not create the collection it is asking about.
+        # `get_collection`: asking must not create what it asks about.
         collection = client.get_collection(name="knowledge")
         return ("indexed" if collection.count() > 0 else "empty"), EMBEDDING_MODEL_NAME
     except Exception:
-        # A store whose collection is missing or unreadable has nothing to
-        # answer with, which is what `empty` already means to every caller.
+        # A store with no readable collection has nothing in it.
         return "empty", EMBEDDING_MODEL_NAME
 
 
-def is_knowledge_base_indexed(persist_dir: str | None = None) -> tuple[bool, str]:
-    """Whether the knowledge base holds any documents.
-
-    Returns:
-        (indexed, embedding_model_name)
-    """
-    state, model = corpus_state(persist_dir)
-    return state == "indexed", model
-
-
-# Create MCP server
-# At WARNING, because the SDK's constructor runs `logging.basicConfig` at the
-# level it is given, and this module is imported by the console. At its default
-# of INFO every library in the process logged at INFO from then on: of the 1,772
-# lines the server log held on 2026-09-12, 84 were HTTP requests -- each call
-# to the Ollama daemon that embeds and to the seats that answer.
-server = MCPServer("graphrag", log_level="WARNING")
-
-
-# Register tools with the server
-@server.tool(name="search_knowledge_graph")
-def search_tool(query: str, top_k: int = 5) -> str:
-    """Search the knowledge base for relevant documents and passages.
-
-    Searching a corpus nobody built returns no results and says why. It does
-    not build one: a retrieval call is not a request for a knowledge base.
-    """
-    kb = open_knowledge_base()
-    if kb is None:
-        return json.dumps({"results": [], "source": "no_corpus", "note": NO_CORPUS_NOTE}, indent=2)
-    return json.dumps(kb.search(query, top_k), indent=2)
-
-
-@server.tool(name="query_knowledge_graph")
-def query_tool(entity: str, hops: int = 2) -> str:
-    """Query the knowledge graph for entity relationships."""
-    kb = open_knowledge_base()
-    if kb is None:
-        return json.dumps(
-            {
-                "entity": entity,
-                "neighbors": [],
-                "subgraph_nodes": 0,
-                "subgraph_edges": 0,
-                "source": "no_corpus",
-                "note": NO_CORPUS_NOTE,
-            },
-            indent=2,
-        )
-    return json.dumps(kb.query_graph(entity, hops), indent=2)
-
-
-async def main() -> None:
-    """Run the GraphRAG MCP server."""
-    server.run(transport="stdio")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
-
-# Re-exported from `corpus_spectral`, which is where the four whole-graph
-# diagnostics now live. Named here because `serve.py`, the tests and CLAUDE.md
-# all reach for them through this module, and moving the code should not have
-# moved the vocabulary.
+# Re-exported from `corpus_spectral`, where the whole-graph diagnostics live.
 __all__ = [
     "BOTTLENECK_CONDUCTANCE",
     "DUPLICATE_BLOCK_PREFIX",

@@ -11,7 +11,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import pytest_asyncio
 
 from langgraph_agent.mcp_client import (
     TERMINAL_TIMEOUT_MAX_SECONDS,
@@ -21,37 +20,23 @@ from langgraph_agent.mcp_client import (
     _resolve_cwd,
     _resolve_timeout,
     _unexpanded_hint,
-    mcp_client,
 )
+from langgraph_agent.nodes import BUILDER_TOOL_NAMES
 
 
-@pytest_asyncio.fixture
-async def client():
-    """Yield a connected MCP client."""
-    async with mcp_client() as c:
-        yield c
+@pytest.fixture
+def client() -> MCPClient:
+    return MCPClient()
 
 
-@pytest.mark.asyncio
-async def test_list_tools(client: MCPClient):
-    """All documented tools are exposed."""
-    tools = await client.list_tools()
-
-    expected = {
-        "search_knowledge_graph",
-        "query_knowledge_graph",
-        "filesystem_read",
-        "filesystem_write",
-        "git_status",
-        "git_diff",
-        "terminal_execute",
-        "run_tests",
-    }
-    assert expected.issubset(set(tools))
+def test_every_tool_a_seat_is_offered_is_served(client: MCPClient):
+    """A schema in `BUILDER_TOOLS` with no tool behind it fails at call time."""
+    served = set(client._discover_tools())
+    assert BUILDER_TOOL_NAMES <= served
+    assert {"search_knowledge_graph", "query_knowledge_graph"} <= served
 
 
-@pytest.mark.asyncio
-async def test_filesystem_write_and_read(client: MCPClient, tmp_path, monkeypatch):
+def test_filesystem_write_and_read(client: MCPClient, tmp_path, monkeypatch):
     """Builder can write and read files through MCP tools.
 
     The write happens inside the project root, because `_resolve_write_path`
@@ -62,19 +47,18 @@ async def test_filesystem_write_and_read(client: MCPClient, tmp_path, monkeypatc
     path = tmp_path / "test.txt"
     content = "Hello from MCP filesystem tool"
 
-    write_result = await client.call_tool(
+    write_result = client.call_tool(
         "filesystem_write", {"path": "test.txt", "content": content}
     )
     assert write_result["success"]
     assert path.read_text(encoding="utf-8") == content
 
-    read_result = await client.call_tool("filesystem_read", {"path": str(path)})
+    read_result = client.call_tool("filesystem_read", {"path": str(path)})
     assert read_result["success"]
     assert read_result["content"] == content
 
 
-@pytest.mark.asyncio
-async def test_filesystem_write_refuses_an_absolute_path_outside_the_project(
+def test_filesystem_write_refuses_an_absolute_path_outside_the_project(
     client: MCPClient, tmp_path, monkeypatch
 ):
     """The run of 2026-09-11 wrote `/tmp/gen_doc.py` while working on this checkout.
@@ -86,7 +70,7 @@ async def test_filesystem_write_refuses_an_absolute_path_outside_the_project(
     monkeypatch.chdir(tmp_path)
     outside = tmp_path.parent / "escaped.py"
 
-    result = await client.call_tool(
+    result = client.call_tool(
         "filesystem_write", {"path": str(outside), "content": "print('nope')"}
     )
 
@@ -95,14 +79,13 @@ async def test_filesystem_write_refuses_an_absolute_path_outside_the_project(
     assert not outside.exists(), "the refusal has to happen before the write"
 
 
-@pytest.mark.asyncio
-async def test_filesystem_write_refuses_a_dotdot_escape(
+def test_filesystem_write_refuses_a_dotdot_escape(
     client: MCPClient, tmp_path, monkeypatch
 ):
     """`..` is the other spelling of the same escape, and `resolve()` is what sees it."""
     monkeypatch.chdir(tmp_path)
 
-    result = await client.call_tool(
+    result = client.call_tool(
         "filesystem_write", {"path": "../escaped.py", "content": "print('nope')"}
     )
 
@@ -111,8 +94,7 @@ async def test_filesystem_write_refuses_a_dotdot_escape(
     assert not (tmp_path.parent / "escaped.py").exists()
 
 
-@pytest.mark.asyncio
-async def test_filesystem_write_refuses_a_symlinked_parent(
+def test_filesystem_write_refuses_a_symlinked_parent(
     client: MCPClient, tmp_path, monkeypatch
 ):
     """Resolution, not string matching, is what catches this one.
@@ -125,7 +107,7 @@ async def test_filesystem_write_refuses_a_symlinked_parent(
     target.mkdir()
     (tmp_path / "link").symlink_to(target)
 
-    result = await client.call_tool(
+    result = client.call_tool(
         "filesystem_write", {"path": "link/escaped.py", "content": "print('nope')"}
     )
 
@@ -134,14 +116,13 @@ async def test_filesystem_write_refuses_a_symlinked_parent(
     assert not (target / "escaped.py").exists()
 
 
-@pytest.mark.asyncio
-async def test_filesystem_write_creates_parent_directories_inside_the_project(
+def test_filesystem_write_creates_parent_directories_inside_the_project(
     client: MCPClient, tmp_path, monkeypatch
 ):
     """Containment must not cost the Builder the ability to make a subdirectory."""
     monkeypatch.chdir(tmp_path)
 
-    result = await client.call_tool(
+    result = client.call_tool(
         "filesystem_write", {"path": "reports/nested/out.md", "content": "ok"}
     )
 
@@ -149,28 +130,25 @@ async def test_filesystem_write_creates_parent_directories_inside_the_project(
     assert (tmp_path / "reports" / "nested" / "out.md").read_text(encoding="utf-8") == "ok"
 
 
-@pytest.mark.asyncio
-async def test_git_tools(client: MCPClient):
+def test_git_tools(client: MCPClient):
     """Builder can call git status and diff."""
-    status = await client.call_tool("git_status", {})
+    status = client.call_tool("git_status", {})
     assert status["success"]
     assert "status" in status
 
-    diff = await client.call_tool("git_diff", {})
+    diff = client.call_tool("git_diff", {})
     assert diff["success"]
     assert "diff" in diff
 
 
-@pytest.mark.asyncio
-async def test_terminal_execute(client: MCPClient):
+def test_terminal_execute(client: MCPClient):
     """Builder can run safe shell commands."""
-    result = await client.call_tool("terminal_execute", {"command": "echo hello"})
+    result = client.call_tool("terminal_execute", {"command": "echo hello"})
     assert result["success"]
     assert "hello" in result["stdout"]
 
 
-@pytest.mark.asyncio
-async def test_terminal_execute_neutralises_injection(client: MCPClient):
+def test_terminal_execute_neutralises_injection(client: MCPClient):
     """A chained command is inert data, never a second command.
 
     There is no shell, so `;` separates nothing. This replaced a character
@@ -183,7 +161,7 @@ async def test_terminal_execute_neutralises_injection(client: MCPClient):
         canary = Path(tmpdir) / "canary.txt"
         canary.write_text("still here", encoding="utf-8")
 
-        result = await client.call_tool(
+        result = client.call_tool(
             "terminal_execute", {"command": f"echo hello; rm -rf {tmpdir}"}
         )
 
@@ -196,10 +174,9 @@ async def test_terminal_execute_neutralises_injection(client: MCPClient):
         assert canary.read_text(encoding="utf-8") == "still here"
 
 
-@pytest.mark.asyncio
-async def test_terminal_execute_runs_a_python_one_liner(client: MCPClient):
+def test_terminal_execute_runs_a_python_one_liner(client: MCPClient):
     """The exact shape the old filter refused: `;` and `()` in a -c argument."""
-    result = await client.call_tool(
+    result = client.call_tool(
         "terminal_execute",
         {"command": 'python -c "import sys; print(sys.version_info[0])"'},
     )
@@ -207,8 +184,7 @@ async def test_terminal_execute_runs_a_python_one_liner(client: MCPClient):
     assert result["stdout"].strip() == "3"
 
 
-@pytest.mark.asyncio
-async def test_terminal_execute_refuses_a_shell_operator_and_names_it(
+def test_terminal_execute_refuses_a_shell_operator_and_names_it(
     client: MCPClient,
 ):
     """An operator written as its own word is refused, with the reason.
@@ -224,28 +200,27 @@ async def test_terminal_execute_refuses_a_shell_operator_and_names_it(
     before using `cwd`. A description is consulted before the turn, an error at
     the moment of the mistake.
     """
-    chained = await client.call_tool(
+    chained = client.call_tool(
         "terminal_execute", {"command": "echo a && echo b"}
     )
     assert not chained["success"]
     assert "&&" in chained["error"]
     assert "cwd" in chained["error"]
 
-    piped = await client.call_tool("terminal_execute", {"command": "echo a | wc -l"})
+    piped = client.call_tool("terminal_execute", {"command": "echo a | wc -l"})
     assert not piped["success"]
     assert "pipe" in piped["error"]
 
     # Redirection is answered with the tool that replaces it, the way `cd` is
     # answered with `cwd`; chaining has no replacement and is not given one.
-    redirected = await client.call_tool(
+    redirected = client.call_tool(
         "terminal_execute", {"command": "echo a > out.txt"}
     )
     assert not redirected["success"]
     assert "filesystem_write" in redirected["error"]
 
 
-@pytest.mark.asyncio
-async def test_an_operator_inside_an_argument_is_still_just_text(
+def test_an_operator_inside_an_argument_is_still_just_text(
     client: MCPClient,
 ):
     """The precision that separates this from the filter it replaced.
@@ -256,7 +231,7 @@ async def test_an_operator_inside_an_argument_is_still_just_text(
     inside a quoted argument is untouched -- and a filename containing one is
     still a filename.
     """
-    quoted = await client.call_tool(
+    quoted = client.call_tool(
         "terminal_execute",
         {"command": 'python -c "print(\'a && b | c > d\')"'},
     )
@@ -264,15 +239,14 @@ async def test_an_operator_inside_an_argument_is_still_just_text(
     assert quoted["stdout"].strip() == "a && b | c > d"
 
 
-@pytest.mark.asyncio
-async def test_a_glued_redirect_is_refused_like_a_spaced_one(client: MCPClient):
+def test_a_glued_redirect_is_refused_like_a_spaced_one(client: MCPClient):
     """`2>/dev/null` is one token to `shlex`, so the whole-token check missed it.
 
     The Builder on the 2026-09-10 run wrote that suffix nine times in one pass,
     and the one no other operator was caught ahead of reached `find` as a
     literal argument: `paths must precede expression: '2>/dev/null'`.
     """
-    discarded = await client.call_tool(
+    discarded = client.call_tool(
         "terminal_execute", {"command": "find . -maxdepth 0 2>/dev/null"}
     )
     assert not discarded["success"]
@@ -280,24 +254,23 @@ async def test_a_glued_redirect_is_refused_like_a_spaced_one(client: MCPClient):
     # Discarding a stream needs no replacement: both come back separately.
     assert "separately" in discarded["error"]
 
-    merged = await client.call_tool("terminal_execute", {"command": "echo a 2>&1"})
+    merged = client.call_tool("terminal_execute", {"command": "echo a 2>&1"})
     assert not merged["success"]
     assert "separately" in merged["error"]
 
-    written = await client.call_tool("terminal_execute", {"command": "echo a >x.txt"})
+    written = client.call_tool("terminal_execute", {"command": "echo a >x.txt"})
     assert not written["success"]
     assert "filesystem_write" in written["error"]
 
 
-@pytest.mark.asyncio
-async def test_an_argument_that_only_resembles_a_redirect_passes(client: MCPClient):
+def test_an_argument_that_only_resembles_a_redirect_passes(client: MCPClient):
     """Only output redirection is read into a glued token, never a comparison.
 
     An input redirect glued to its target cannot be told from markup a grep is
     looking for, and `>=1` is a version bound.
     """
     for argument in (">=1", "<div>", "->"):
-        echoed = await client.call_tool(
+        echoed = client.call_tool(
             "terminal_execute",
             {"command": f'python -c "import sys; print(sys.argv[1])" "{argument}"'},
         )
@@ -305,8 +278,7 @@ async def test_an_argument_that_only_resembles_a_redirect_passes(client: MCPClie
         assert echoed["stdout"].strip() == argument
 
 
-@pytest.mark.asyncio
-async def test_an_unexpanded_glob_is_named_when_the_program_trips_on_it(
+def test_an_unexpanded_glob_is_named_when_the_program_trips_on_it(
     client: MCPClient, tmp_path: Path
 ):
     """With no shell, `cat dir/*` asks `cat` for a file literally named that.
@@ -316,12 +288,12 @@ async def test_an_unexpanded_glob_is_named_when_the_program_trips_on_it(
     """
     (tmp_path / "manifest").write_text("x")
 
-    missed = await client.call_tool("terminal_execute", {"command": f"cat {tmp_path}/*"})
+    missed = client.call_tool("terminal_execute", {"command": f"cat {tmp_path}/*"})
     assert not missed["success"]
     assert "glob" in missed["hint"]
 
     # A literal the program wants is not a mistake, and earns no hint.
-    wanted = await client.call_tool(
+    wanted = client.call_tool(
         "terminal_execute", {"command": f'find {tmp_path} -name "*"'}
     )
     assert wanted["success"], wanted.get("stderr")
@@ -338,21 +310,20 @@ def test_the_glob_hint_needs_the_program_to_have_quoted_the_token():
     assert _unexpanded_hint(["cat", "plain"], "cat: 'plain': No such file") is None
 
 
-@pytest.mark.asyncio
-async def test_terminal_execute_reports_unparseable_and_missing_commands(
+def test_terminal_execute_reports_unparseable_and_missing_commands(
     client: MCPClient,
 ):
     """Two failures the shell used to fold into a return code."""
-    unbalanced = await client.call_tool(
+    unbalanced = client.call_tool(
         "terminal_execute", {"command": 'python -c "print(1)'}
     )
     assert not unbalanced["success"]
     assert "quoting" in unbalanced["error"].lower()
 
-    empty = await client.call_tool("terminal_execute", {"command": "   "})
+    empty = client.call_tool("terminal_execute", {"command": "   "})
     assert not empty["success"]
 
-    missing = await client.call_tool(
+    missing = client.call_tool(
         "terminal_execute", {"command": "no-such-program-xyzzy --help"}
     )
     assert not missing["success"]
@@ -360,18 +331,16 @@ async def test_terminal_execute_reports_unparseable_and_missing_commands(
     assert "no-such-program-xyzzy" in missing["error"]
 
 
-@pytest.mark.asyncio
-async def test_terminal_execute_honours_a_requested_timeout(client: MCPClient):
+def test_terminal_execute_honours_a_requested_timeout(client: MCPClient):
     """A caller-supplied timeout bounds the command and reports the kill."""
-    result = await client.call_tool(
+    result = client.call_tool(
         "terminal_execute", {"command": "sleep 30", "timeout": 1}
     )
     assert not result["success"]
     assert result["timed_out"] is True
 
 
-@pytest.mark.asyncio
-async def test_a_timeout_survives_into_the_report_line(client: MCPClient):
+def test_a_timeout_survives_into_the_report_line(client: MCPClient):
     """The report line must say it timed out, however long the command was.
 
     `str(TimeoutExpired)` puts the fact behind a repr of the whole argv, and
@@ -382,7 +351,7 @@ async def test_a_timeout_survives_into_the_report_line(client: MCPClient):
     from langgraph_agent.nodes import _failure_reason
 
     padding = "x" * 200
-    result = await client.call_tool(
+    result = client.call_tool(
         "terminal_execute",
         {"command": f'python -c "import time; time.sleep(30)  # {padding}"', "timeout": 1},
     )
@@ -417,8 +386,7 @@ def test_terminal_timeout_is_clamped_not_trusted():
         assert _resolve_timeout(bad) == TERMINAL_TIMEOUT_SECONDS
 
 
-@pytest.mark.asyncio
-async def test_terminal_execute_runs_in_a_requested_cwd(client: MCPClient):
+def test_terminal_execute_runs_in_a_requested_cwd(client: MCPClient):
     """`cwd` is the replacement for a `cd` that cannot exist.
 
     Removing the shell removed the only spelling the Builder had for "run this
@@ -428,7 +396,7 @@ async def test_terminal_execute_runs_in_a_requested_cwd(client: MCPClient):
     with tempfile.TemporaryDirectory() as tmpdir:
         (Path(tmpdir) / "marker.txt").write_text("here", encoding="utf-8")
 
-        result = await client.call_tool(
+        result = client.call_tool(
             "terminal_execute",
             {
                 "command": 'python -c "import pathlib; print(pathlib.Path.cwd())"',
@@ -439,7 +407,7 @@ async def test_terminal_execute_runs_in_a_requested_cwd(client: MCPClient):
         assert Path(result["stdout"].strip()).samefile(tmpdir)
 
         # And the command sees that directory's files by relative path.
-        read = await client.call_tool(
+        read = client.call_tool(
             "terminal_execute",
             {"command": "cat marker.txt", "cwd": tmpdir},
         )
@@ -447,8 +415,7 @@ async def test_terminal_execute_runs_in_a_requested_cwd(client: MCPClient):
         assert read["stdout"].strip() == "here"
 
 
-@pytest.mark.asyncio
-async def test_terminal_execute_blames_a_bad_cwd_not_the_program(
+def test_terminal_execute_blames_a_bad_cwd_not_the_program(
     client: MCPClient,
 ):
     """The directory is named, and the program is not accused of missing.
@@ -460,7 +427,7 @@ async def test_terminal_execute_blames_a_bad_cwd_not_the_program(
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         missing = str(Path(tmpdir) / "no-such-dir")
-        result = await client.call_tool(
+        result = client.call_tool(
             "terminal_execute", {"command": "python --version", "cwd": missing}
         )
         assert not result["success"]
@@ -470,7 +437,7 @@ async def test_terminal_execute_blames_a_bad_cwd_not_the_program(
         # A file is not a directory, and raises something else again.
         a_file = Path(tmpdir) / "file.txt"
         a_file.write_text("x", encoding="utf-8")
-        on_file = await client.call_tool(
+        on_file = client.call_tool(
             "terminal_execute", {"command": "python --version", "cwd": str(a_file)}
         )
         assert not on_file["success"]
@@ -495,8 +462,7 @@ def test_resolve_cwd_returns_a_directory_or_an_error_never_both():
         assert error
 
 
-@pytest.mark.asyncio
-async def test_terminal_execute_points_a_builtin_at_its_replacement(
+def test_terminal_execute_points_a_builtin_at_its_replacement(
     client: MCPClient,
 ):
     """`cd` is the mistake the Builder actually makes, so the error answers it.
@@ -505,7 +471,7 @@ async def test_terminal_execute_points_a_builtin_at_its_replacement(
     `cd there && ...` before the Builder found the argument that replaces it.
     The schema said so; an error is read at the moment the mistake is made.
     """
-    result = await client.call_tool(
+    result = client.call_tool(
         "terminal_execute", {"command": "cd /tmp && python --version"}
     )
     assert not result["success"]
@@ -622,6 +588,35 @@ def test_report_line_says_why_a_call_failed():
     assert ran.endswith("-> ok")
 
 
+def test_the_builder_cannot_call_a_researcher_tool(monkeypatch):
+    """The client serves GraphRAG too; the Builder's loop refuses it unrun."""
+    from langgraph_agent import nodes
+
+    def must_not_run(name, args):
+        raise AssertionError(f"{name} ran for the Builder")
+
+    monkeypatch.setattr(nodes, "_call_tool", must_not_run)
+
+    class _Searches:
+        def __init__(self) -> None:
+            self.turn = 0
+
+        def invoke(self, _messages):
+            self.turn += 1
+            if self.turn > 1:
+                return SimpleNamespace(content="done", tool_calls=[])
+            return SimpleNamespace(content="", tool_calls=[{
+                "name": "search_knowledge_graph", "args": {"query": "x"}, "id": "c1",
+            }])
+
+    tool_log: list[str] = []
+    nodes._run_builder_tools(_Searches(), [], [], tool_log, nodes._Deadline(60))
+
+    assert tool_log == [
+        "search_knowledge_graph() -> failed: search_knowledge_graph is not a Builder tool"
+    ]
+
+
 def test_a_failure_reason_is_one_line_in_the_tools_own_words():
     """The tool's own error first, then the last thing the program said."""
     from langgraph_agent.nodes import MAX_FAILURE_REASON_CHARS, _failure_reason
@@ -675,61 +670,27 @@ def test_builder_can_ask_for_a_longer_timeout():
     assert str(int(TERMINAL_TIMEOUT_SECONDS)) in tool["function"]["description"]
 
 
-@pytest.mark.asyncio
-async def test_run_tests(client: MCPClient):
+def test_run_tests(client: MCPClient):
     """Builder can run the pytest suite via the test tool."""
     with tempfile.TemporaryDirectory() as tmpdir:
         # Create a minimal passing test so the tool has something to execute.
         test_file = Path(tmpdir) / "test_dummy.py"
         test_file.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
 
-        result = await client.call_tool("run_tests", {"path": str(tmpdir)})
+        result = client.call_tool("run_tests", {"path": str(tmpdir)})
         assert result["success"], result.get("stderr", "")
         assert "passed" in result.get("stdout", "")
 
 
-def test_sync_tool_call(tmp_path, monkeypatch):
-    """The sync helper in nodes.py can call MCP tools."""
+def test_nodes_reach_the_tool_belt_through_one_seam(tmp_path, monkeypatch):
+    """`nodes._call_tool` is the door every node uses, and what the graph tests patch."""
     monkeypatch.chdir(tmp_path)
-    from langgraph_agent.nodes import _call_mcp_tool_sync
+    from langgraph_agent.nodes import _call_tool
 
-    result = _call_mcp_tool_sync(
-        "filesystem_write", {"path": "sync.txt", "content": "sync ok"}
-    )
-    assert result["success"]
-    assert (tmp_path / "sync.txt").read_text(encoding="utf-8") == "sync ok"
-
-
-def test_a_tool_raising_runtime_error_is_reported_as_itself(monkeypatch):
-    """The bridge used to catch any RuntimeError as "a loop is already running".
-
-    Its fallback then asked for an event loop that does not exist on a worker
-    thread -- or on any thread, from Python 3.14 -- and raised "There is no
-    current event loop" in place of the tool's own error. The embedder reports
-    every failure as RuntimeError, so that was the error most often lost.
-    """
-    from langgraph_agent import mcp_client as module
-    from langgraph_agent.nodes import _call_mcp_tool_sync
-
-    async def broken(self, args):
-        raise RuntimeError("Ollama could not embed with the model: refused")
-
-    monkeypatch.setattr(module.MCPClient, "_filesystem_read", broken)
-
-    with pytest.raises(RuntimeError, match="could not embed"):
-        _call_mcp_tool_sync("filesystem_read", {"path": "x"})
-
-
-@pytest.mark.asyncio
-async def test_the_sync_bridge_works_under_a_running_loop(tmp_path, monkeypatch):
-    """`asyncio.run` refuses to nest, so a caller already in a loop gets a thread."""
-    monkeypatch.chdir(tmp_path)
-    from langgraph_agent.nodes import _call_mcp_tool_sync
-
-    result = _call_mcp_tool_sync("filesystem_write", {"path": "in_loop.txt", "content": "ok"})
+    result = _call_tool("filesystem_write", {"path": "seam.txt", "content": "ok"})
 
     assert result["success"]
-    assert (tmp_path / "in_loop.txt").read_text(encoding="utf-8") == "ok"
+    assert (tmp_path / "seam.txt").read_text(encoding="utf-8") == "ok"
 
 
 def _git_repo(path: Path) -> None:
@@ -749,8 +710,7 @@ def _git_repo(path: Path) -> None:
     git("commit", "-qm", "init")
 
 
-@pytest.mark.asyncio
-async def test_git_diff_with_no_path_shows_the_whole_diff(client: MCPClient, tmp_path, monkeypatch):
+def test_git_diff_with_no_path_shows_the_whole_diff(client: MCPClient, tmp_path, monkeypatch):
     """`git_diff()` ran `git diff ""`, which git refuses outright.
 
     The exit status went unread, so the refusal's empty stdout came back as
@@ -760,26 +720,24 @@ async def test_git_diff_with_no_path_shows_the_whole_diff(client: MCPClient, tmp
     (tmp_path / "a.txt").write_text("two\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
 
-    whole = await client.call_tool("git_diff", {})
-    one = await client.call_tool("git_diff", {"path": "a.txt"})
+    whole = client.call_tool("git_diff", {})
+    one = client.call_tool("git_diff", {"path": "a.txt"})
 
     assert whole["success"] and "+two" in whole["diff"]
     assert one["success"] and "+two" in one["diff"]
 
 
-@pytest.mark.asyncio
-async def test_git_status_outside_a_repository_is_a_failure(client: MCPClient, tmp_path, monkeypatch):
+def test_git_status_outside_a_repository_is_a_failure(client: MCPClient, tmp_path, monkeypatch):
     """Nothing on stdout is what a clean tree prints -- and what a failure prints."""
     monkeypatch.chdir(tmp_path)
 
-    status = await client.call_tool("git_status", {})
+    status = client.call_tool("git_status", {})
 
     assert not status["success"]
     assert "not a git repository" in status["error"]
 
 
-@pytest.mark.asyncio
-async def test_run_tests_runs_the_suite_in_the_directory_it_is_given(
+def test_run_tests_runs_the_suite_in_the_directory_it_is_given(
     client: MCPClient, tmp_path, monkeypatch
 ):
     """A generated project's Builder is told to pass `cwd`, and the tool ignored it.
@@ -800,9 +758,9 @@ async def test_run_tests_runs_the_suite_in_the_directory_it_is_given(
     project = tmp_path / "proj"
     project.mkdir()
 
-    result = await client.call_tool("run_tests", {"cwd": str(project)})
-    missing = await client.call_tool("run_tests", {"cwd": str(tmp_path / "nope")})
-    await client.call_tool("run_tests", {})
+    result = client.call_tool("run_tests", {"cwd": str(project)})
+    missing = client.call_tool("run_tests", {"cwd": str(tmp_path / "nope")})
+    client.call_tool("run_tests", {})
 
     assert result["success"]
     (in_project, in_project_kwargs), (checkout, checkout_kwargs) = calls
@@ -813,8 +771,7 @@ async def test_run_tests_runs_the_suite_in_the_directory_it_is_given(
     assert not missing["success"] and "does not exist" in missing["error"]
 
 
-@pytest.mark.asyncio
-async def test_run_tests_clamps_the_timeout_it_is_asked_for(client: MCPClient, monkeypatch):
+def test_run_tests_clamps_the_timeout_it_is_asked_for(client: MCPClient, monkeypatch):
     """A tool call is never abandoned, so an unclamped timeout outlives every deadline."""
     seen: dict = {}
 
@@ -825,14 +782,13 @@ async def test_run_tests_clamps_the_timeout_it_is_asked_for(client: MCPClient, m
     monkeypatch.setattr("langgraph_agent.mcp_client.subprocess.run", fake_run)
 
     for asked in (99999, None, "soon"):
-        await client.call_tool("run_tests", {} if asked is None else {"timeout": asked})
+        client.call_tool("run_tests", {} if asked is None else {"timeout": asked})
         # A malformed value falls back to the suite's own default, the ceiling,
         # rather than to the one-command default a test suite would outrun.
         assert seen["timeout"] == TERMINAL_TIMEOUT_MAX_SECONDS
 
 
-@pytest.mark.asyncio
-async def test_a_file_too_large_to_read_whole_is_refused_with_a_way_to_read_part(
+def test_a_file_too_large_to_read_whole_is_refused_with_a_way_to_read_part(
     client: MCPClient, tmp_path, monkeypatch
 ):
     """A dump the size of the disk was read into memory whole, to be cut at 20,000."""
@@ -842,8 +798,8 @@ async def test_a_file_too_large_to_read_whole_is_refused_with_a_way_to_read_part
     (tmp_path / "big.log").write_text("x" * 11, encoding="utf-8")
     (tmp_path / "small.txt").write_text("0123456789", encoding="utf-8")
 
-    refused = await client.call_tool("filesystem_read", {"path": str(tmp_path / "big.log")})
-    read = await client.call_tool("filesystem_read", {"path": str(tmp_path / "small.txt")})
+    refused = client.call_tool("filesystem_read", {"path": str(tmp_path / "big.log")})
+    read = client.call_tool("filesystem_read", {"path": str(tmp_path / "small.txt")})
 
     assert not refused["success"] and "head -n 200" in refused["error"]
     assert read["success"] and read["content"] == "0123456789"

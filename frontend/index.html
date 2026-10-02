@@ -80,6 +80,13 @@ body::before{
    that has moved on. Red is for a seat that cannot run at all. */
 #stats .stale{color:#f2b544;border:1px solid #f2b54455;border-radius:4px;
   padding:0 6px;cursor:help}
+/* Red: a service the console depends on is refusing calls. Clicking it lets
+   the next call through at once instead of waiting out the cooldown. */
+#stats .circuit{color:#ffb4b4;border:1px solid #f8717155;border-radius:4px;
+  padding:0 6px;cursor:pointer}
+#healing td.ok{color:var(--ok)}
+#healing td.bad{color:var(--err)}
+#healing .ev{cursor:default}
 
 #warn{
   grid-area:warn; display:none; background:#3a1618; border-bottom:1px solid #f8717155;
@@ -440,8 +447,12 @@ pre#state-dump{font:11px/1.7 var(--mono);color:var(--ink-2);white-space:pre-wrap
   </section>
 
   <section class="panel" data-p="state">
-    <h2>Agent state</h2>
-    <div class="scroll"><pre id="state-dump">(no run yet)</pre></div>
+    <div class="scroll">
+      <h2>Self-healing</h2>
+      <div id="healing"><div class="muted">no health check yet</div></div>
+      <h2>Agent state</h2>
+      <pre id="state-dump">(no run yet)</pre>
+    </div>
   </section>
 </main>
 
@@ -451,7 +462,6 @@ const $$ = s => [...document.querySelectorAll(s)];
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
-const ROLES = ["architect","planner","researcher","builder"];
 const ROLE_COLOR = {architect:"#f2b544", planner:"#4ea3ff", researcher:"#76d13a", builder:"#ff6a8a"};
 
 /* ---------- transport ---------- */
@@ -485,8 +495,8 @@ async function rpc(method, params, quiet){
 
 /* ---------- telemetry ---------- */
 const EVS = [];
-function ev(name, ms, bad){
-  EVS.unshift({t:new Date().toLocaleTimeString(), name, ms, bad});
+function ev(name, ms, bad, at){
+  EVS.unshift({t:(at ? new Date(at) : new Date()).toLocaleTimeString(), name, ms, bad});
   if(EVS.length > 140) EVS.length = 140;
   $("#evs").innerHTML = EVS.map(e =>
     `<div class="ev${e.bad?" bad":""}"><span class="tm">${esc(e.t)}</span>`+
@@ -867,8 +877,8 @@ function draw(ns, es, emptyNote){
   $("#gempty").style.display = ns.length ? "none" : "grid";
   if(!ns.length) $("#gempty").innerHTML = emptyNote || (CORPUS === "absent"
     ? "No corpus &mdash; nothing is indexed until something asks for it."
-      + (BUILDS_ON_RUN ? "<br>Start a run: it indexes the project before the Architect opens."
-                       : "<br><code>INDEX_PROJECT_BEFORE_RUN</code> is off, so nothing will.")
+      + (BUILDS_ON_RUN ? "<br>Start a run: it rebuilds the corpus from the archive before the Architect opens."
+                       : "<br><code>REBUILD_CORPUS</code> is off, so nothing will.")
     : "No graph yet &mdash; start a run and the corpus is rebuilt before it.");
 
   NODES = ns.map((n, i) => ({...n,
@@ -1251,8 +1261,8 @@ $("#q").onkeydown = e => { if(e.key === "Enter") search().catch(searchFailed); }
 // are meaningless against `absent`, so they are disabled rather than left to
 // fail: creating a store in order to empty it is the opposite of the ask.
 let CORPUS = "absent";
-// Whether a run would index the project itself from here, reported by the
-// server rather than assumed. `INDEX_PROJECT_BEFORE_RUN=0` makes the promise
+// Whether a run would rebuild the corpus itself from here, reported by the
+// server rather than assumed. `REBUILD_CORPUS=0` makes the promise
 // false, and the absent state is the one place someone looks to find out why
 // retrieval came back with nothing.
 let BUILDS_ON_RUN = true;
@@ -1341,8 +1351,8 @@ async function loadDocs(){
   $("#docs").innerHTML = docs.length ? docs.map(d =>
     `<div class="doc" data-id="${esc(d.id)}"><span>${esc(d.title)}</span><span>${esc(d.id)}</span></div>`).join("")
     : (CORPUS === "absent"
-        ? `<div class="muted">no corpus — ${BUILDS_ON_RUN ? "a restart or the next run indexes the project" : "INDEX_PROJECT_BEFORE_RUN is off, so nothing will build one"}</div>`
-        : `<div class="muted">corpus is empty — ${BUILDS_ON_RUN ? "a restart or the next run indexes the project" : "INDEX_PROJECT_BEFORE_RUN is off, so nothing will rebuild it"}</div>`);
+        ? `<div class="muted">no corpus — ${BUILDS_ON_RUN ? "a restart or the next run rebuilds it from the archive" : "REBUILD_CORPUS is off, so nothing will build one"}</div>`
+        : `<div class="muted">corpus is empty — ${BUILDS_ON_RUN ? "a restart or the next run rebuilds it from the archive" : "REBUILD_CORPUS is off, so nothing will rebuild it"}</div>`);
   $$("#docs .doc").forEach(el => el.onclick = () => {
     $("#gnode").value = el.dataset.id;
     $$(".tab").find(t => t.dataset.p === "graph").click();
@@ -2404,7 +2414,7 @@ async function loadEmbedding(quiet){
 function embeddingChips(o){
   const chips = [];
   if(o.corpus === "absent")
-    chips.push(`<span class="chip warn" title="The next run indexes the project with this model before the Architect opens.">no corpus yet</span>`);
+    chips.push(`<span class="chip warn" title="The next run rebuilds the corpus with this model before the Architect opens.">no corpus yet</span>`);
   else if(o.corpus === "empty") chips.push(`<span class="chip warn">corpus empty</span>`);
   else if(o.corpus) chips.push(`<span class="chip">corpus built</span>`);
   if(typeof o.floor === "number"){
@@ -2429,19 +2439,73 @@ function embeddingChips(o){
 function indexingChip(st){
   const ix = st && st.indexing;
   if(!ix || !ix.running) return "";
-  const what = ix.message || "checking the project against the corpus";
+  const what = ix.message || "checking the archive against the corpus";
   const why = "Started with the console, on its own thread. The stale verdict is "
     + "withheld until it finishes, and a run started now takes over from it.";
   return `<span class="stale" title="${esc(why)}">${esc(what)}</span>`;
 }
 
+/* ---------- self-healing ---------- */
+// The journal is read from the last sequence number seen, so each event
+// reaches the telemetry once; circuits and health are read whole every poll.
+let HEAL_SEQ = 0;
+const HEAL_RECENT = [];
+
+function healingChip(h){
+  return (h.circuits || []).filter(c => c.state === "open").map(c => {
+    const wait = c.retry_in_s ? ` · retry ${Math.ceil(c.retry_in_s)}s` : " · next call tests it";
+    const why = `${c.name} failed ${c.threshold} times in a row, so calls to it are refused `
+      + "until it answers again. Click to let the next call through now.";
+    return `<span class="circuit" data-circuit="${esc(c.name)}" title="${esc(why)}">`
+      + `${esc(c.name)} down${wait}</span>`;
+  }).join("");
+}
+
+function renderHealing(h){
+  const health = Object.entries(h.health || {}).map(([name, r]) =>
+    `<tr><td>${esc(name)}</td><td class="${r.status === "healthy" ? "ok" : "bad"}">`
+    + `${esc(r.status)}</td><td>${esc(r.details)}</td></tr>`).join("");
+  const circuits = (h.circuits || []).map(c =>
+    `<tr><td>${esc(c.name)}</td><td class="${c.state === "closed" ? "ok" : "bad"}">${esc(c.state)}</td>`
+    + `<td>${c.failures}/${c.threshold} failures`
+    + `${c.retry_in_s == null ? "" : ` · retry in ${Math.ceil(c.retry_in_s)}s`}</td></tr>`).join("");
+  const events = HEAL_RECENT.slice(0, 30).map(e =>
+    `<div class="ev${["WARNING","ERROR","CRITICAL"].includes(e.level) ? " bad" : ""}">`
+    + `<span class="tm">${esc(new Date(e.timestamp).toLocaleTimeString())}</span>`
+    + `<span class="nm" title="${esc(e.message)}">${esc(e.message)}</span></div>`).join("");
+  $("#healing").innerHTML =
+    (health ? `<table class="bridges"><tr><th>service</th><th>status</th><th>last check</th></tr>${health}</table>`
+            : `<div class="muted">the first health check has not run yet</div>`)
+    + (circuits ? `<table class="bridges"><tr><th>circuit</th><th>state</th><th></th></tr>${circuits}</table>` : "")
+    + (events || `<div class="muted">no healing events yet</div>`);
+}
+
+function takeHealing(h){
+  for(const e of h.events || []){
+    HEAL_SEQ = Math.max(HEAL_SEQ, e.seq);
+    HEAL_RECENT.unshift(e);
+    ev(`healing · ${e.message}`, null, ["WARNING","ERROR","CRITICAL"].includes(e.level), e.timestamp);
+  }
+  HEAL_RECENT.length = Math.min(HEAL_RECENT.length, 200);
+  renderHealing(h);
+}
+
+$("#stats").addEventListener("click", async e => {
+  const chip = e.target.closest("[data-circuit]");
+  if(!chip) return;
+  try{ await rpc("reset_circuit", {name: chip.dataset.circuit}); }catch(err){ /* told in telemetry */ }
+  poll(true);
+});
+
 async function poll(quiet){
   if(EXITING) return;
   try{
-    const [st, stats] = await Promise.all([
+    const [st, stats, healing] = await Promise.all([
       rpc("status", {}, true),
       rpc("rag_stats", {}, true),
+      rpc("healing", {since: HEAL_SEQ}, true),
     ]);
+    takeHealing(healing);
     showEmbeddingDevice(st.embedding_device);
     SERVER_BUSY = {indexing: !!(st.indexing && st.indexing.running), run: !!st.run_in_flight};
     updateGraphHold();
@@ -2454,11 +2518,11 @@ async function poll(quiet){
     // An emptied corpus is the same sentence with a different first clause:
     // counting to zero four times says less than naming the state, and it is
     // what the operator has just this second asked for by pressing Clear.
-    const indexing = indexingChip(st);
+    const indexing = indexingChip(st) + healingChip(healing);
     $("#stats").innerHTML = CORPUS === "absent"
-      ? `<span class="nocorpus">no corpus &mdash; ${BUILDS_ON_RUN ? "a restart or the next run indexes the project" : "nothing indexed"}</span>`+indexing
+      ? `<span class="nocorpus">no corpus &mdash; ${BUILDS_ON_RUN ? "a restart or the next run rebuilds it from the archive" : "nothing indexed"}</span>`+indexing
       : CORPUS === "empty"
-      ? `<span class="nocorpus">corpus empty &mdash; ${BUILDS_ON_RUN ? "a restart or the next run indexes the project" : "INDEX_PROJECT_BEFORE_RUN is off, so nothing will rebuild it"}</span>`+indexing
+      ? `<span class="nocorpus">corpus empty &mdash; ${BUILDS_ON_RUN ? "a restart or the next run rebuilds it from the archive" : "REBUILD_CORPUS is off, so nothing will rebuild it"}</span>`+indexing
       : `<span>docs <b>${stats.total_documents}</b></span>`+
         `<span>chunks <b>${stats.total_chunks}</b></span>`+
         `<span>nodes <b>${stats.total_nodes}</b></span>`+

@@ -1,15 +1,11 @@
-"""Configuration and LLM setup.
+"""Seats, model tags and LLM setup, and the Ollama daemon's circuit.
 
-Supports per-agent LLM selection so Architect, Planner, Researcher, and Builder
-can each use a different model/provider. Inference defaults to local: every
-seat defaults to a model the Ollama daemon on this machine serves from its own
-weights, so a fresh checkout runs with no API key and no ollama.com credentials
-at all. Ollama Cloud tags, Anthropic and OpenAI remain available per seat for
-anyone who wants them.
-
-The embedding model also runs on this machine, served by the same daemon --
-it belongs to GraphRAG rather than to any agent seat, and is never a seat
-choice itself.
+Each of the four seats can run a different model on a different provider.
+Inference defaults to local: every seat runs a model the Ollama daemon on this
+machine serves from its own weights, so a fresh checkout needs no API key and
+no ollama.com credentials. Ollama Cloud tags, Anthropic and OpenAI remain
+available per seat. The embedding model runs on the same daemon but belongs to
+GraphRAG, never to a seat.
 """
 
 import functools
@@ -17,14 +13,21 @@ import json
 import os
 import re
 import time
+import urllib.error
 import urllib.request
 from collections.abc import Callable
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeVar, cast
 
 from dotenv import load_dotenv
 from pydantic import SecretStr
 
-# Load environment variables from .env file
+from langgraph_agent.self_healing import (
+    Circuit,
+    CircuitOpenError,
+    call_with_retry,
+    get_healing_logger,
+)
+
 load_dotenv()
 
 
@@ -34,101 +37,212 @@ AgentName = Literal["architect", "planner", "researcher", "builder"]
 Provider = Literal["openai", "anthropic", "ollama"]
 
 AGENTS: tuple[AgentName, ...] = ("architect", "planner", "researcher", "builder")
+PROVIDERS: tuple[Provider, ...] = ("ollama", "anthropic", "openai")
 
+# Every model tag this project names, spelled once. Seat defaults, the tags
+# install.sh pulls, the seat diagnostic and ollama_client.py all refer to these.
+DOLPHIN_9B = "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M"
+DOLPHIN3_CYBER_8B = "hf.co/RavichandranJ/Dolphin3-Cyber-8B-GGUF:Q5_K_M"
+QWEN3_8 = "qwen3.8:latest"
+NEMOTRON_3_ULTRA = "nemotron-3-ultra:cloud"
+CLAUDE_OPUS = "claude-opus-5"
+CLAUDE_SONNET = "claude-sonnet-5"
+GPT_4O = "gpt-4o"
+GPT_4O_MINI = "gpt-4o-mini"
 
-# Default model per (provider, agent) when a per-agent provider is configured
-# but no model is supplied. Local-first defaults.
-_DEFAULT_AGENT_MODELS: dict[tuple[str, str], str] = {
-    ("anthropic", "architect"): "claude-opus-5",
-    ("anthropic", "planner"): "claude-opus-5",
-    ("anthropic", "researcher"): "claude-sonnet-5",
-    ("anthropic", "builder"): "claude-sonnet-5",
-    ("ollama", "architect"): "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M",
-    ("ollama", "planner"): "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M",
-    ("ollama", "researcher"): "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M",
-    ("ollama", "builder"): "qwen3.8:latest",
-    ("openai", "architect"): "gpt-4o",
-    ("openai", "planner"): "gpt-4o",
-    ("openai", "researcher"): "gpt-4o-mini",
-    ("openai", "builder"): "gpt-4o-mini",
+# The model each seat takes on each provider when `{ROLE}_PROVIDER` names the
+# provider and nothing names the model.
+_DEFAULT_AGENT_MODELS: dict[Provider, dict[AgentName, str]] = {
+    # Three seats run weights this machine's daemon holds, with no key and no
+    # ollama.com credentials. The Builder's work *is* tool calls and neither
+    # dolphin tag reports `tools`, so it takes the one local tag that does.
+    "ollama": {
+        "architect": DOLPHIN_9B, "planner": DOLPHIN_9B,
+        "researcher": DOLPHIN_9B, "builder": QWEN3_8,
+    },
+    "anthropic": {
+        "architect": CLAUDE_OPUS, "planner": CLAUDE_OPUS,
+        "researcher": CLAUDE_SONNET, "builder": CLAUDE_SONNET,
+    },
+    "openai": {
+        "architect": GPT_4O, "planner": GPT_4O,
+        "researcher": GPT_4O_MINI, "builder": GPT_4O_MINI,
+    },
 }
 
+# The model a provider runs when neither the seat nor the environment
+# (`OLLAMA_MODEL`, `ANTHROPIC_MODEL`, `OPENAI_MODEL`) names one.
+_PROVIDER_DEFAULT_MODELS: dict[Provider, str] = {
+    "ollama": DOLPHIN_9B, "anthropic": CLAUDE_OPUS, "openai": GPT_4O_MINI,
+}
 
-# The seat each agent takes when nothing overrides it. Three of the four run a
-# model this machine's own daemon holds the weights for -- no API key, no
-# ollama.com credentials, nothing to sign in to. The Builder is the exception:
-# its work *is* tool calls, and neither dolphin tag reports `tools` (checked
-# live against this daemon -- both answer `capabilities: ["completion"]` and
-# nothing else), so it takes the one local tag that does. Point a seat at
-# Anthropic, OpenAI or an Ollama Cloud tag with {ROLE}_PROVIDER / {ROLE}_MODEL,
-# or from the console dropdown.
-DEFAULT_SEATS: dict[str, dict[str, str]] = {
-    "architect": {"provider": "ollama",
-                  "model": "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M"},
-    "planner": {"provider": "ollama",
-                "model": "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M"},
-    "researcher": {"provider": "ollama",
-                   "model": "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M"},
-    "builder": {"provider": "ollama", "model": "qwen3.8:latest"},
+# Local first: no seat needs an API key or ollama.com credentials by default.
+# Point one elsewhere with {ROLE}_PROVIDER / {ROLE}_MODEL, or from the console.
+DEFAULT_PROVIDER: Provider = "ollama"
+
+DEFAULT_SEATS: dict[AgentName, dict[str, str]] = {
+    agent: {"provider": DEFAULT_PROVIDER, "model": _DEFAULT_AGENT_MODELS[DEFAULT_PROVIDER][agent]}
+    for agent in AGENTS
 }
 
 
 # The tags `install.sh` pulls so a seat can be moved onto any of them without a
-# mid-run pull. It is NOT the offer: the console's dropdowns and `set_seat` read
-# `ollama ls` (`_seat_model_options` in serve.py), so anything the daemon carries
-# is selectable and nothing here is offered unless it has been pulled. `group` is
-# kept for the labels. qwen3-embedding is not a seat choice -- the daemon reports
-# it with no `completion` capability -- and the embedder card offers it instead.
-# Anthropic and OpenAI still work for a seat configured in .env.
+# mid-run pull. It is not the offer: the console's dropdowns and `set_seat`
+# read `ollama ls` (`_seat_model_options` in serve.py). qwen3-embedding is not
+# here -- it is the embedder, never a seat.
 AGENT_LLM_OPTIONS: list[dict[str, str]] = [
-    {"label": "Qwen3.8", "provider": "ollama", "model": "qwen3.8:latest",
+    # 17 GB against 6 GB of VRAM, so it always runs partly on the CPU -- but it
+    # is the only local tag here that reports `tools`.
+    {"label": "Qwen3.8", "provider": "ollama", "model": QWEN3_8,
      "group": "Ollama (local)"},
-    # qwen3.8 is 17 GB against 6 GB of VRAM and always takes the CPU fallback
-    # (see the seat-placement bullet in CLAUDE.md), but it is the only local
-    # tag here that reports `tools`, which is why it -- not either dolphin --
-    # holds the Builder by default: that seat's work *is* tool calls.
-    {"label": "Dolphin 2.9.1 9B", "provider": "ollama",
-     "model": "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M",
+    # 5.3 GB, wholly on the GPU; `completion` only, which is all the three
+    # tool-free seats need.
+    {"label": "Dolphin 2.9.1 9B", "provider": "ollama", "model": DOLPHIN_9B,
      "group": "Ollama (local)"},
-    # 5.3 GB, loads 100% on the GPU, measured 2026-09-20 at 2,958 + 2,975 MiB.
-    # Holds Architect, Planner and Researcher by default -- none of the three
-    # are offered tools anyway, so `completion`-only is the right seat for
-    # them rather than a defect (same reasoning `get_agent_status` uses for
-    # the Builder's `tools_note`, just the other three seats it doesn't fire
-    # for).
-    {"label": "Dolphin3 Cyber 8B", "provider": "ollama",
-     "model": "hf.co/RavichandranJ/Dolphin3-Cyber-8B-GGUF:Q5_K_M",
+    # 5.7 GB, also `completion` only: a second local choice for those seats.
+    {"label": "Dolphin3 Cyber 8B", "provider": "ollama", "model": DOLPHIN3_CYBER_8B,
      "group": "Ollama (local)"},
-    # 5.7 GB. Also `completion`-only (checked live against this daemon, same
-    # as the 2.9.1 tag above) -- not a Builder option, but a second local
-    # choice for the three tool-free seats.
-    {"label": "Nemotron 3 Ultra", "provider": "ollama", "model": "nemotron-3-ultra:cloud",
+    {"label": "Nemotron 3 Ultra", "provider": "ollama", "model": NEMOTRON_3_ULTRA,
      "group": "Ollama Cloud"},
 ]
 
 
-# How long one call to a seat may take before the client gives up. Every
-# provider client defaults to no deadline at all, so a stalled cloud call
-# blocked `llm.invoke` forever -- and RUN_BUDGET_SECONDS could not end it,
-# because that is checked between graph supersteps and a node in flight never
-# reaches a superstep boundary. A run could therefore hang indefinitely inside
-# a single node with the console still naming the previous one.
-#
-# This bounds the socket, not the call: for Ollama it becomes an httpx timeout
-# on a streamed response, so it fires on a connection that goes quiet, not on a
-# model that trickles tokens forever. The node-level deadline in nodes.py
-# covers that second case; the two are not redundant.
+# How long one call to a seat may wait at the socket. Every provider client
+# defaults to no deadline, and `RUN_BUDGET_SECONDS` is checked only between
+# supersteps, so a stalled call would hang the run. It fires on a connection
+# that goes quiet, not on a model trickling tokens forever -- the node deadline
+# in nodes.py covers that.
 LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
 
 
-def _ollama_base_url() -> str:
-    """Where the local Ollama daemon listens.
-
-    Every default seat runs through it: a local tag from weights the daemon
-    holds itself, or a `:cloud` tag it forwards to ollama.com. The embedder is
-    served by the same daemon.
-    """
+def ollama_base_url() -> str:
+    """Where the local Ollama daemon listens: every default seat and the embedder."""
     return os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+
+
+def _causes(exc: BaseException) -> list[BaseException]:
+    """`exc` and every exception it was raised from or during, outermost first."""
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    while current is not None and all(current is not seen for seen in chain):
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def daemon_unreachable(exc: BaseException) -> bool:
+    """Whether a failure means the Ollama daemon could not be reached at all.
+
+    A refused or reset connection, a host that does not resolve, or a connect
+    that timed out. An HTTP status is the daemon answering, and a reply that is
+    slow to come is a busy daemon; neither counts. Read off the whole chain,
+    because each client wraps it differently: urllib in `URLError`, httpx in
+    `ConnectError`, the ollama client in a bare `ConnectionError`.
+    """
+    for cause in _causes(exc):
+        if isinstance(cause, urllib.error.HTTPError):
+            return False
+        # urllib raises URLError only while connecting and sending, before any
+        # response: refused, unresolvable, or a connect that timed out.
+        if isinstance(cause, (urllib.error.URLError, ConnectionError)):
+            return True
+        if type(cause).__name__ in ("ConnectError", "ConnectTimeout"):
+            return True
+    return False
+
+
+def provider_unavailable(exc: BaseException) -> bool:
+    """Whether a cloud provider's failure says the service is down, not the request wrong.
+
+    Unreachable, timed out, or a 5xx (Anthropic's 529 "overloaded" included).
+    A 4xx is the request or the key, and is the provider answering.
+    """
+    for cause in _causes(exc):
+        if daemon_unreachable(cause) or "Timeout" in type(cause).__name__:
+            return True
+        status = getattr(cause, "status_code", None)
+        if isinstance(status, int):
+            return status >= 500
+    return False
+
+
+# The local Ollama daemon, as one circuit: the seats, the embedder and the
+# status poll's reads all count toward it, and only a daemon that cannot be
+# reached trips it. While it is open every caller fails at once rather than
+# each waiting out its own connection, and the first call after the cooldown
+# is the probe that closes it again.
+OLLAMA_CIRCUIT_THRESHOLD = 3
+OLLAMA_CIRCUIT_COOLDOWN_SECONDS = float(os.getenv("OLLAMA_CIRCUIT_COOLDOWN_SECONDS", "15"))
+OLLAMA_DAEMON = Circuit(
+    "ollama-daemon",
+    failure_threshold=OLLAMA_CIRCUIT_THRESHOLD,
+    recovery_timeout=OLLAMA_CIRCUIT_COOLDOWN_SECONDS,
+    trips_on=daemon_unreachable,
+)
+
+# The cloud providers, one circuit each, opened by outages rather than by
+# refusals. Their SDKs already retry a failed request, so nothing here retries
+# on top of them; the circuit is what stops the next seat from waiting out the
+# same outage.
+PROVIDER_CIRCUIT_COOLDOWN_SECONDS = 60.0
+PROVIDER_CIRCUITS: dict[str, Circuit] = {
+    provider: Circuit(
+        f"{provider}-api",
+        failure_threshold=3,
+        recovery_timeout=PROVIDER_CIRCUIT_COOLDOWN_SECONDS,
+        trips_on=provider_unavailable,
+    )
+    for provider in ("anthropic", "openai")
+}
+
+
+# How many times a call is attempted while the daemon cannot be reached, and
+# the first wait (doubling after it): enough to ride out a daemon restart,
+# short enough that a daemon that is gone fails within seconds and opens its
+# circuit.
+DAEMON_CONNECT_ATTEMPTS = 3
+DAEMON_RETRY_WAIT_SECONDS = 1.0
+
+_R = TypeVar("_R")
+
+
+def retry_unreachable(
+    func: Callable[[], _R], *, name: str, give_up: Callable[[], bool] | None = None
+) -> _R:
+    """`func`, retried briefly while the daemon cannot be reached.
+
+    Safe for any daemon call: an unreachable daemon ran nothing, so asking
+    again cannot repeat work. `func` goes through `OLLAMA_DAEMON` itself.
+    """
+    return call_with_retry(
+        func,
+        max_attempts=DAEMON_CONNECT_ATTEMPTS,
+        min_wait=DAEMON_RETRY_WAIT_SECONDS,
+        max_wait=DAEMON_RETRY_WAIT_SECONDS * 2,
+        retry_if=daemon_unreachable,
+        give_up=give_up,
+        name=name,
+    )
+
+
+def daemon_request(path: str, payload: dict[str, Any] | None = None, *, timeout: float) -> Any:
+    """One JSON request to the local Ollama daemon, through its circuit.
+
+    POSTs `payload` when given and GETs otherwise; returns the decoded reply.
+    Raises what urllib raises -- an `HTTPError` is the daemon answering -- and
+    `CircuitOpenError` while the daemon is known to be unreachable.
+    """
+    request = urllib.request.Request(
+        f"{ollama_base_url()}{path}",
+        data=None if payload is None else json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+
+    def send() -> Any:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read())
+
+    return OLLAMA_DAEMON.call(send)
 
 
 _ollama_tags_cache: tuple[float, list[str]] = (0.0, [])
@@ -137,9 +251,8 @@ _ollama_tags_cache: tuple[float, list[str]] = (0.0, [])
 def list_ollama_models() -> list[str]:
     """Tags the local Ollama daemon reports, cached for 30s.
 
-    Feeds both the seat dropdowns and the liveness check, either of which can
-    be hit on every status poll -- hence the cache and the short timeout. An
-    unreachable daemon is an empty list, never an exception.
+    Both the seat dropdowns and the liveness check can ask on every status poll.
+    An unreachable daemon is an empty list, never an exception.
     """
     global _ollama_tags_cache
 
@@ -149,10 +262,7 @@ def list_ollama_models() -> list[str]:
         return cached
 
     try:
-        with urllib.request.urlopen(
-            f"{_ollama_base_url()}/api/tags", timeout=2.0
-        ) as response:
-            payload = json.loads(response.read())
+        payload = daemon_request("/api/tags", timeout=2.0)
         tags = sorted(str(entry["name"]) for entry in payload.get("models", []))
     except Exception:
         tags = []
@@ -167,34 +277,20 @@ _ollama_caps_cache: dict[str, tuple[float, list[str] | None]] = {}
 def ollama_model_capabilities(model: str) -> list[str] | None:
     """What the daemon says a tag can do (`thinking`, `tools`, ...), cached 30s.
 
-    Asked of the daemon rather than kept as a list here, because the daemon
-    answers for every tag it can reach -- cloud tags that were never pulled
-    included -- and a list kept here would be wrong about the next tag someone
-    pulls.
-
-    `None` means no answer: the daemon is unreachable or has no such tag. That
-    is a different claim from a list without `thinking` in it, and the seat
-    card must not turn "could not ask" into "this model cannot think". Failures
-    are cached as well as answers: the status poll asks for every seat every
-    five seconds, and a dead daemon should cost one refused connection per
-    half-minute rather than four per poll.
+    Asked of the daemon, which answers for every tag it can reach. None means no
+    answer -- unreachable, or no such tag -- which is not a list without
+    `thinking` in it: "could not ask" must not read as "cannot think". Failures are
+    cached too, so a dead daemon costs one refused connection per half-minute.
     """
     now = time.monotonic()
     cached = _ollama_caps_cache.get(model)
     if cached and now - cached[0] < 30.0:
         return cached[1]
 
-    request = urllib.request.Request(
-        f"{_ollama_base_url()}/api/show",
-        data=json.dumps({"model": model}).encode(),
-        headers={"Content-Type": "application/json"},
-    )
     caps: list[str] | None = None
     try:
-        with urllib.request.urlopen(request, timeout=2.0) as response:
-            payload = json.loads(response.read())
-        # A daemon too old to report capabilities answers without the field,
-        # which says nothing about the model -- so it stays None, not [].
+        payload = daemon_request("/api/show", {"model": model}, timeout=2.0)
+        # A daemon too old to report capabilities says nothing about the model.
         listed = payload.get("capabilities")
         if isinstance(listed, list):
             caps = [str(cap) for cap in listed]
@@ -206,20 +302,15 @@ def ollama_model_capabilities(model: str) -> list[str] | None:
 
 
 def _ollama_ps() -> list[dict[str, Any]]:
-    """Every model the local daemon has loaded, as `/api/ps` lists them.
-
-    Raises when the daemon cannot be asked; each caller decides what that means.
-    """
-    with urllib.request.urlopen(f"{_ollama_base_url()}/api/ps", timeout=2.0) as response:
-        payload = json.loads(response.read())
-    return list(payload.get("models", []))
+    """Every model the daemon has loaded (`/api/ps`). Raises when it cannot be asked."""
+    return list(daemon_request("/api/ps", timeout=2.0).get("models", []))
 
 
 def ollama_cpu_share(model: str) -> float | None:
     """The fraction of a loaded `model` the daemon holds in system memory, not on a GPU.
 
-    0.0 when it is wholly on the cards. None when it is not loaded or the
-    daemon cannot be asked, because an unknown split is not a clean one.
+    0.0 when wholly on the cards; None when not loaded or the daemon cannot be
+    asked, since an unknown split is not a clean one.
     """
     try:
         loaded = _ollama_ps()
@@ -243,35 +334,18 @@ def _same_ollama_tag(a: str, b: str) -> bool:
     return full(a) == full(b)
 
 
-# Sent with every call to a seat the daemon runs locally, and with none it
-# proxies to ollama.com. `num_gpu` is llama.cpp's layer-offload count, and 999
-# means "every layer": the same lever `OLLAMA_EMBED_OPTIONS` pulls for the
-# embedder, which seats were never given.
-#
-# The daemon's own estimate is the problem, and it is not a context-window
-# problem. Measured on 2026-09-20, dolphin-2.9.1-yi-1.5-9b Q4_K_M on two 3 GB
-# GTX 1060s, one load per row:
-#
-#     options sent                      placement        card 0 + card 1
-#     (none -- what a seat got)         37% CPU/63% GPU  1940 + 1981 MiB
-#     num_ctx 2048                      37% CPU/63% GPU  1892 + 1919 MiB
-#     num_ctx 4096, num_gpu 999         100% GPU         2968 + 2975 MiB
-#
-# Shrinking the window moved nothing: the estimator leaves ~1.1 GB unused on
-# *each* card whatever it is asked for, and 37% of the model runs on the CPU
-# beside 2.2 GB of idle VRAM. Forced, the whole model lands on the cards at the
-# full 4,096-token window. No `num_ctx` is sent with it, because the window is
-# the seat's to want and the measurement says it was never what decided the
-# split -- a seat capped here would lose context for nothing.
+# Sent with every call to a seat the daemon runs locally (none for `:cloud`
+# tags): `num_gpu: 999` puts every layer on the cards. The daemon's own
+# estimate left 37% of a 9B dolphin on the CPU beside 2.2 GB of idle VRAM,
+# whatever `num_ctx` was asked for; forced, it loads wholly on the GPU at the
+# full window. No `num_ctx` is sent -- the window is the seat's to want.
 OLLAMA_SEAT_GPU_OPTIONS: dict[str, int] = {"num_gpu": 999}
 
 
 def is_local_ollama_model(model: str) -> bool:
-    """Whether this tag runs on the cards here, rather than at ollama.com.
+    """Whether this tag runs on the cards here rather than at ollama.com.
 
-    A `:cloud` tag is proxied by the local daemon and holds no VRAM, so it
-    neither needs the GPU options nor competes for the cards. Spelled the same
-    way `get_agent_status` decides `remote`.
+    A `:cloud` tag is proxied by the daemon and holds no VRAM.
     """
     return not model.endswith((":cloud", "-cloud"))
 
@@ -279,40 +353,25 @@ def is_local_ollama_model(model: str) -> bool:
 def unload_ollama_model(model: str) -> bool:
     """Ask the daemon to drop `model` from VRAM now. False if it could not be asked.
 
-    `keep_alive: 0` with an empty prompt is Ollama's own spelling of an unload;
-    it returns once the runner is gone rather than scheduling it, which is what
-    makes it usable as "the cards are free from here on".
+    `keep_alive: 0` with no prompt returns once the runner is gone, which is what
+    makes "the cards are free from here on" true.
     """
     try:
-        request = urllib.request.Request(
-            f"{_ollama_base_url()}/api/generate",
-            data=json.dumps({"model": model, "keep_alive": 0}).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(request, timeout=30.0):
-            return True
+        daemon_request("/api/generate", {"model": model, "keep_alive": 0}, timeout=30.0)
+        return True
     except Exception:
-        # An unload that fails costs a slower load, never a wrong answer, so
-        # nothing here raises: the caller is about to do its real work either
-        # way and a card it could not free is the state it was already in.
+        # An unload that fails costs a slower load, never a wrong answer.
         return False
 
 
 def free_the_cards_for(model: str) -> list[str]:
     """Unload every locally-resident model but `model`; return what went.
 
-    Serializing the work in time is not enough on its own, which is the whole
-    reason this exists. The daemon keeps a runner resident for five minutes
-    after its last token, so a seat that finished its turn still holds ~3 GB of
-    a 6 GB pool while the embedder tries to load 4.7 GB beside it -- and the
-    loser of that is not slowed down but failed, as the 07:02:10 journal entry
-    shows. Evicting is what turns "one at a time" into "all of the cards".
-
-    A `:cloud` tag is never unloaded because it was never loaded, and the model
-    about to be used is kept so this cannot evict its own caller. Reload is the
-    price: ~5s for the embedder and ~25s for a 9B seat, paid once per handover
-    rather than once per call, since a model already alone on the cards finds
-    nothing here to evict.
+    Serializing the work is not enough: the daemon keeps a runner resident for
+    five minutes after its last token, so a finished seat would still hold the
+    cards when the embedder loads. Evicting is what turns "one at a time" into
+    "all of the cards". Reload costs ~5s for the embedder and ~25s for a 9B seat,
+    once per handover.
     """
     try:
         loaded = _ollama_ps()
@@ -331,13 +390,10 @@ def free_the_cards_for(model: str) -> list[str]:
 def _is_gpu_fit_failure(exc: Exception) -> bool:
     """Whether this failure is the daemon refusing to fit a forced offload.
 
-    `num_gpu: 999` trades a graceful split for a hard failure where the model
-    does not fit, which is the right trade for the embedder -- a corpus built
-    on a split placement is a corpus with different vectors -- and the wrong
-    one for a seat, where it would fail the run outright. qwen3.8 is 17 GB
-    against 6 GB of cards and can never fit. So the shapes that mean "it did
-    not fit" are named, and the seat retries without forcing; every other
-    failure is the seat's real failure and is raised as it always was.
+    `num_gpu: 999` trades a graceful split for a hard failure where the model does
+    not fit -- right for the embedder, whose vectors depend on placement, wrong for
+    a seat, which then retries unforced. Only these shapes mean "did not fit";
+    every other failure is the seat's own.
     """
     text = str(exc).lower()
     return any(
@@ -353,16 +409,16 @@ def _is_gpu_fit_failure(exc: Exception) -> bool:
     )
 
 
-# Why the last call to a seat failed, if it did. A key can be present and the
-# seat still unusable -- out of credits, expired, revoked, wrong workspace --
-# and only a real call finds that out. Recording the outcome here is what lets
-# the console stop claiming a seat is live without spending a probe request on
-# every five-second status poll.
+# Why the last call to a seat failed, if it did. Only a real call can tell a
+# present key from a working one, so the console reports this instead of
+# probing every seat on every poll.
 _seat_failures: dict[str, str] = {}
 
 
 def _failure_reason(exc: Exception) -> str:
     """Turn a provider exception into something a seat card can show."""
+    if isinstance(exc, CircuitOpenError):
+        return f"{exc.circuit} unreachable; next try in {max(0, round(exc.retry_in))}s"
     text = str(exc)
 
     # Providers wrap their real message in a dict repr; pull it back out.
@@ -376,9 +432,8 @@ def _failure_reason(exc: Exception) -> str:
         return "API key rejected"
     if "rate limit" in lowered:
         return "Rate limited"
-    # httpx raises ReadTimeout with an empty message, so the class name is the
-    # only thing that identifies it -- without this a timed-out seat showed a
-    # blank chip, which reads as "fine" rather than "gave up after 120s".
+    # httpx's ReadTimeout has an empty message, so the class name identifies
+    # it.
     if "timeout" in lowered or "timed out" in lowered or "Timeout" in type(exc).__name__:
         return f"No response within {int(LLM_TIMEOUT_SECONDS)}s"
     if "not found" in lowered and "model" in lowered:
@@ -390,24 +445,14 @@ def _failure_reason(exc: Exception) -> str:
 
 
 class _SeatLLM:
-    """Wraps a seat's chat model so its failures are visible in the console.
+    """A seat's chat model, wrapped so its failures reach the console.
 
-    Transparent apart from `invoke`: every other attribute passes through to
-    the wrapped model.
-
-    It is also the one place every seat call passes through, which is why the
-    cards are arbitrated here rather than in each node. A call takes
-    `GPU_ARBITER`, so no seat is talking to a model while the embedder is
-    working and no two seats are loading models at once; a locally-run tag
-    additionally evicts whatever else is resident, because the daemon holds a
-    finished runner for five minutes and two models do not fit in 6 GB.
-
-    `build` is kept beside the built model so a forced load that did not fit
-    can be rebuilt unforced -- the fallback that lets `num_gpu: 999` be the
-    default without making an oversized seat a failed run.
-
-    `provider` is the seat's provider, which `bind_tools` needs: whether a
-    model can call tools is asked of the Ollama daemon, and only of it.
+    Transparent apart from `invoke` and `bind_tools`. Every seat call passes
+    through `invoke`, which is why the cards are arbitrated here: a call takes
+    `GPU_ARBITER`, and a local tag evicts whatever else is resident. `build` is
+    kept so a forced load that did not fit can be rebuilt unforced. `provider`
+    picks the call's circuit, and tells `bind_tools` to ask the daemon whether a
+    tag can call tools.
     """
 
     def __init__(
@@ -434,11 +479,8 @@ class _SeatLLM:
     def _unforce(self) -> bool:
         """Rebuild this seat with the daemon choosing the split. False if it cannot.
 
-        Sticky: the seat stays unforced for the rest of its life rather than
-        paying a failed load per call. A seat is rebuilt per node turn, so the
-        forced attempt is retried on the next turn -- which is what should
-        happen, since the reason it did not fit is usually another model that
-        has since been evicted.
+        Sticky for this seat object; seats are rebuilt per node turn, so the forced
+        load is tried again next turn, once whatever crowded it out has gone.
         """
         if self._build is None or not self._force_gpu:
             return False
@@ -453,6 +495,27 @@ class _SeatLLM:
         self._force_gpu = False
         return True
 
+    def _call(self, *args: Any, **kwargs: Any) -> Any:
+        """One call to the model, through its provider's circuit.
+
+        A daemon that cannot be reached is retried briefly -- nothing ran, so
+        asking again cannot repeat any work -- and the emergency stop ends the
+        waiting. Cloud SDKs retry their own requests, so only the circuit is
+        added there.
+        """
+        if self._provider == "ollama":
+            from langgraph_agent.control import RUN_CONTROL
+
+            return retry_unreachable(
+                lambda: OLLAMA_DAEMON.call(self._inner.invoke, *args, **kwargs),
+                name=f"seat:{self._agent}",
+                give_up=RUN_CONTROL.stopped,
+            )
+        circuit = PROVIDER_CIRCUITS.get(self._provider)
+        if circuit is not None:
+            return circuit.call(self._inner.invoke, *args, **kwargs)
+        return self._inner.invoke(*args, **kwargs)
+
     def invoke(self, *args: Any, **kwargs: Any) -> Any:
         from langgraph_agent.control import GPU_ARBITER
 
@@ -464,43 +527,39 @@ class _SeatLLM:
                 # between freeing the cards and using them.
                 free_the_cards_for(tag)
             try:
-                result = self._inner.invoke(*args, **kwargs)
+                result = self._call(*args, **kwargs)
             except Exception as exc:
                 if local and _is_gpu_fit_failure(exc) and self._unforce():
+                    healing = get_healing_logger()
                     try:
-                        result = self._inner.invoke(*args, **kwargs)
+                        result = self._call(*args, **kwargs)
                     except Exception as retried:
+                        healing.log_recovery_action(
+                            "unforced reload", f"seat:{self._agent}", False,
+                            f"{tag}: {_failure_reason(retried)}",
+                        )
                         _seat_failures[self._agent] = _failure_reason(retried)
                         raise
+                    healing.log_recovery_action(
+                        "unforced reload", f"seat:{self._agent}", True,
+                        f"{tag} did not fit the cards whole, so the daemon chose the split",
+                    )
                 else:
                     _seat_failures[self._agent] = _failure_reason(exc)
                     raise
-        # A call that works clears an older failure, so a seat recovers on its
-        # own once credits are topped up or the daemon comes back.
+        # A call that works clears an older failure: the seat recovers on its
+        # own.
         _seat_failures.pop(self._agent, None)
         return result
 
     def bind_tools(self, tools: Any, **kwargs: Any) -> "_SeatLLM":
         """Bind tools, keeping the wrapper so the bound model still reports.
 
-        Without this the bound runnable would come back unwrapped through
-        `__getattr__`, and every failure the Builder hit while calling tools
-        would be invisible to `get_agent_status`. Seats whose model cannot call
-        tools at all (`StubLLM`) raise AttributeError here on purpose, so a
-        caller wanting the no-tools path catches AttributeError around the
-        call itself -- `hasattr` is always True once this method exists.
-
-        The bound seat carries `build` and the tools forward, or an unforced
-        rebuild would come back without the belt the Builder is mid-turn with.
-
-        An Ollama tag the daemon says cannot call tools raises here too. The
-        attribute check alone never caught one: `bind_tools` is ChatOllama's
-        own method, so binding succeeds for every tag, and it is the daemon
-        that refuses -- answering the first call with a 400 ("does not support
-        tools") that failed the whole run, where a model without tools was
-        meant to report its work and change nothing. Asked through
-        `tool_support`, which caches the daemon's answer; "could not ask"
-        (None) binds as before, since it is not a no.
+        A seat whose model cannot call tools raises AttributeError -- `StubLLM` has no
+        `bind_tools`, and an Ollama tag the daemon says lacks `tools` is refused here
+        rather than failing its first call with a 400. "Could not ask" (None) binds
+        as before. The bound seat carries `build` and the tools forward, so an
+        unforced rebuild keeps its belt.
         """
         inner_bind = getattr(self._inner, "bind_tools", None)
         if inner_bind is None:
@@ -524,47 +583,33 @@ class _SeatLLM:
 def _accepts_temperature(provider: str, model: str) -> bool:
     """Whether this model still accepts a sampling temperature.
 
-    Anthropic removed temperature/top_p/top_k on the 4.6-and-later families
-    (Opus 5, Sonnet 5, Opus 4.6+) -- sending one is rejected with a 400, which
-    reads like a credentials problem and is not one. Legacy `claude-3-*` and
-    the 4.5 models still take it, as do Ollama and OpenAI.
+    Anthropic removed it on the 4.6-and-later families, and sending one is a 400
+    that reads like a credentials problem.
     """
     if provider != "anthropic":
         return True
     return model.startswith("claude-3") or "-4-5" in model
 
 
-# Whether a seat thinks before it answers, until someone switches it. Off, so a
-# fresh console starts with every thinking box unticked. That is a real change
-# on the wire, not a relabelling: a switchable model is always sent the flag
-# (`_thinking_for_call`), and leaving it out means *on* for several of them --
-# a switchable model given no flag pays for reasoning tokens langchain_ollama
-# then discards outright, so the cost is paid and nothing shows it. Opus 5 and
-# Sonnet 5 likewise think when the parameter is left out. Tick a seat's box
-# for the hard steps; the choice lasts until the server restarts.
+# Whether a seat thinks before it answers, until someone switches it. A
+# switchable model is always sent the flag, off included: for several of them
+# (and Opus 5 / Sonnet 5) omitting it means *on*, paying for reasoning nobody
+# sees.
 DEFAULT_THINKING = False
 
-# The ceiling on a pre-4.6 Claude model's thinking, the only way those models
-# can be told to think at all. Anthropic's floor is 1024; this is kept low
-# because a whole node turn is bounded by NODE_DEADLINE_SECONDS and a single
-# call by LLM_TIMEOUT_SECONDS, and thinking tokens are spent inside both.
+# The thinking budget of a pre-4.6 Claude model, the only way those can be told
+# to think; spent inside the node and socket timeouts, so kept modest.
 THINKING_BUDGET_TOKENS = int(os.getenv("THINKING_BUDGET_TOKENS", "4096"))
 
-# Claude models that think on every call. Anthropic rejects an explicit
-# "disabled" on them -- Opus 5.5 at every effort level -- so the card shows the
-# box ticked and locked rather than offering a switch whose "off" would fail
-# every call. Opus 5.5 was missing, so a seat moved onto it was sent
-# `{"type": "disabled"}` by default and every call came back a 400.
+# Claude models that think on every call: an explicit "disabled" is a 400, so
+# their box is ticked and locked.
 _ALWAYS_THINKING_CLAUDE = ("claude-fable", "claude-mythos", "claude-opus-5-5")
 
-# Claude models whose "off" is not spelled `disabled`. Sonnet 5.5 answers
-# `{"type": "disabled"}` with a 400 and turns thinking off with `between_tools`,
-# which takes no other field and is accepted at the default effort.
+# Claude models whose "off" is not spelled `disabled`.
 _CLAUDE_THINKING_OFF = {"claude-sonnet-5-5": {"type": "between_tools"}}
 
-# Both orders Anthropic has named models in (`claude-3-7-sonnet`,
-# `claude-opus-4-1`). The minor version is one or two digits, so a date suffix
-# is not read as one: `claude-sonnet-4-20250514` is 4.0, not 4.20250514.
+# Both orders Anthropic has named models in (`claude-3-7-sonnet`, `claude-
+# opus-4-1`); a date suffix is not read as a minor version.
 _CLAUDE_VERSION = re.compile(r"claude-(?:[a-z]+-)?(\d+)(?:-(\d{1,2})(?!\d))?")
 
 ThinkingSupport = Literal["switch", "never", "always", "unknown"]
@@ -579,14 +624,11 @@ def _claude_version(model: str) -> tuple[int, int] | None:
 
 
 def _claude_thinking(model: str, on: bool) -> dict[str, Any] | None:
-    """The `thinking` parameter that switches a Claude model on or off.
+    """The `thinking` parameter that switches a Claude model on or off; None to omit it.
 
-    `None` means leave the parameter out. There are two request shapes, split
-    at 4.6. From there `adaptive` is the only way on, and an explicit "off" has
-    to be sent, because Opus 5 and Sonnet 5 think when the parameter is
-    absent -- `disabled` for most, and `_CLAUDE_THINKING_OFF`'s spelling for a
-    model that rejects that one. Before 4.6 a token budget is the only way on
-    (and `budget_tokens` is a 400 on Opus 5), while absence already means off.
+    From 4.6, `adaptive` is the only way on and "off" must be sent explicitly --
+    `disabled`, or `_CLAUDE_THINKING_OFF`'s spelling. Before 4.6 a token budget is
+    the only way on, and absence means off.
     """
     version = _claude_version(model)
     if version is None or model.startswith(_ALWAYS_THINKING_CLAUDE):
@@ -607,13 +649,8 @@ def _claude_thinking(model: str, on: bool) -> dict[str, Any] | None:
 
 @functools.lru_cache(maxsize=64)
 def _openai_reasons(model: str) -> bool | None:
-    """Whether the profile langchain_openai ships for this model says it reasons.
-
-    Building the chat model is the public way to read that profile and makes
-    no request -- nothing goes on the wire before `invoke` -- so a placeholder
-    key is enough. `None` when the package has no profile for the model.
-    Cached because profiles are data in the installed package and the status
-    poll asks every five seconds.
+    """Whether langchain_openai's profile for this model says it reasons; None if
+    it has none. Building the model sends nothing, so a placeholder key is enough.
     """
     kwargs: dict[str, Any] = {"model": model, "api_key": SecretStr("unused")}
     try:
@@ -627,24 +664,12 @@ def _openai_reasons(model: str) -> bool | None:
 
 
 def tool_support(provider: str, model: str) -> tuple[bool | None, str]:
-    """Whether a model can call tools, and why it matters when it cannot.
+    """Whether a model can call tools; None when the daemon could not be asked.
 
-    Only the Builder is offered any (`BUILDER_TOOLS`), and it is the one seat
-    whose work *is* the tool calls: `files_changed` is appended only when a
-    write tool reports success, never from the model's prose. So a Builder on a
-    model without them reports in full and changes nothing -- the `StubLLM`
-    failure with a live seat behind it, which no chip in the console would
-    otherwise show, because the seat *is* live and every call *does* succeed.
-
-    It earns a place now because `AGENT_LLM_OPTIONS` offers its first such
-    model: dolphin reports `completion` alone, while every tag offered before
-    it reported `tools`. The daemon's answer is already cached by
-    `ollama_model_capabilities`, which `thinking_support` asks on the same poll,
-    so this costs no extra request.
-
-    `None` is "could not ask", kept apart from False for the reason
-    `thinking_support` keeps `unknown` apart from `never`: a daemon down for
-    thirty seconds must not read as four seats that lost a capability.
+    Only the Builder is offered tools, and its work *is* tool calls, so a Builder
+    on a model without them reports in full and changes nothing. None is kept
+    apart from False, for the reason `thinking_support` keeps `unknown` apart
+    from `never`.
     """
     if provider == "ollama":
         caps = ollama_model_capabilities(model)
@@ -652,30 +677,22 @@ def tool_support(provider: str, model: str) -> tuple[bool | None, str]:
             return None, ""
         return ("tools" in caps), ""
 
-    # Anthropic and OpenAI reject a tool call at the API rather than silently
-    # ignoring it, so there is no quiet failure of this shape to warn about.
+    # Anthropic and OpenAI reject an unsupported tool call at the API, so there
+    # is no quiet failure to warn about.
     return True, ""
 
 
 def thinking_support(provider: str, model: str) -> tuple[ThinkingSupport, str]:
     """Whether a model can think, and whether the console may switch it.
 
-    Returns the verdict and, when the card cannot offer the switch, the reason
-    to show on hover. Each provider is asked the question the way it can
-    actually answer it:
+    Returns the verdict and, when the card cannot offer the switch, the reason:
 
     - An Ollama tag answers for itself, through the daemon's capabilities.
-    - A Claude model is read off its version: thinking arrived with 3.7, and
-      every model since has it. Not langchain's profile, which has no entry
-      for 3.7 and none for a model released after the installed package, so it
-      would lock the switch on exactly the models someone just added.
-    - An OpenAI model is read off langchain's profile. Its reasoning is not
-      wired to this switch -- effort levels, not on and off -- so a model that
-      reasons reads `unknown` rather than claiming either state.
+    - A Claude model is read off its version: 3.7 and later can think.
+    - An OpenAI model is read off langchain's profile; its reasoning is set by
+      effort, not on and off, so a reasoning model reads `unknown`.
 
-    `unknown` is its own verdict, never folded into `never`: "could not ask" is
-    not "cannot think", and a daemon that is down for thirty seconds must not
-    read as four models that lost a capability.
+    `unknown` is never folded into `never`: "could not ask" is not "cannot think".
     """
     if provider == "ollama":
         caps = ollama_model_capabilities(model)
@@ -709,9 +726,8 @@ def thinking_support(provider: str, model: str) -> tuple[ThinkingSupport, str]:
     return "unknown", f"thinking is not switchable for {provider}"
 
 
-# Runtime per-agent thinking choices set from the console, for the life of the
-# process like `_agent_llm_overrides`. Kept per seat rather than per model, so
-# unticking the Builder survives moving the Builder to another model.
+# Per-seat thinking choices from the console, for the life of the process; kept
+# per seat, so they survive a model change.
 _agent_thinking: dict[str, bool] = {}
 
 
@@ -723,13 +739,8 @@ def get_agent_thinking(agent: str) -> bool:
 def set_agent_thinking(agent: str, on: bool) -> None:
     """Switch one seat's thinking on or off, for the life of the process.
 
-    Refused for a seat whose model offers no switch, and said so, rather than
-    stored and ignored: a request that changes nothing should not come back
-    looking as though it worked.
-
-    Unlike moving a seat, this keeps any failure recorded against it. Thinking
-    fixes no credit balance, rate limit or unreachable daemon, and clearing
-    the chip here would let a dead seat be made to look live by clicking a box.
+    Refused for a model with no switch, rather than stored and ignored. A failure
+    recorded against the seat stays: thinking fixes no credit balance.
     """
     info = get_agent_model_info(cast("AgentName", agent))
     support, reason = thinking_support(info["provider"], info["model"])
@@ -741,34 +752,25 @@ def set_agent_thinking(agent: str, on: bool) -> None:
 def _thinking_for_call(agent: str) -> bool | None:
     """The thinking flag the seat's next call sends, or None to send none.
 
-    Only a switchable model gets a flag. Ollama refuses `think` for a tag
-    without the capability, so sending the default to one would fail every
-    call; and when the capability is unknown, leaving the model to its own
-    default is exactly what every call did before the switch existed.
+    Only a switchable model gets a flag: Ollama refuses `think` for a tag without
+    the capability, and an unknown one is left to its own default.
     """
     info = get_agent_model_info(cast("AgentName", agent))
     support, _ = thinking_support(info["provider"], info["model"])
     return get_agent_thinking(agent) if support == "switch" else None
 
 
-# Runtime per-agent LLM selections set from the console. These override the
-# environment-variable defaults for the lifetime of the process.
+# Per-seat model choices from the console, for the life of the process; they
+# win over the environment.
 _agent_llm_overrides: dict[str, dict[str, str]] = {}
 
 
 def set_agent_llm(agent: str, provider: str, model: str) -> None:
-    """Set the LLM for an agent at runtime.
+    """Seat `provider`/`model` on `agent`, in memory, for the life of the process.
 
-    The selection is stored in memory only; it does not modify environment
-    variables or persist across server restarts.
-
-    Moving a seat clears any failure recorded against it. A recorded failure
-    describes the seat that produced it, so leaving it in place made the new
-    seat inherit the old one's verdict -- an Architect moved off Anthropic
-    still read "Anthropic credit balance too low", which is exactly the
-    reading that sends someone to buy credits they do not need. Re-selecting
-    the seat it already has is not a move and keeps the failure, so a dead
-    seat cannot be made to look live by picking it again.
+    Moving a seat clears its recorded failure -- that described the old seat --
+    but re-selecting the seat it already has does not, so a dead seat cannot be
+    made to look live by picking it again.
     """
     current = get_agent_model_info(cast("AgentName", agent))
     if (current["provider"], current["model"]) != (provider, model):
@@ -787,66 +789,45 @@ def get_llm(
     thinking: bool | None = None,
     force_gpu: bool = True,
 ) -> Any:
-    """Get an LLM instance.
+    """Get a chat model.
 
     Args:
-        provider: LLM provider ("anthropic", "ollama" or "openai").
-                  Auto-detected from model name/env if not specified.
-        model: Model name (default from provider-specific env var).
+        provider: "ollama", "anthropic" or "openai"; detected from the model
+            name, then the environment, when omitted. Anything else is refused.
+        model: The model; the provider's default when omitted.
         temperature: Sampling temperature, where the model accepts one.
         base_url: Optional API base URL override.
         api_key: Optional API key override.
-        timeout: Seconds one call may take; `LLM_TIMEOUT_SECONDS` if omitted.
-                 Each provider spells this differently, hence the three
-                 separate keyword names below.
-        force_gpu: Whether a locally-run Ollama tag is told to put every
-                   layer on the cards (`OLLAMA_SEAT_GPU_OPTIONS`). Ignored by
-                   every other provider and by `:cloud` tags. `_SeatLLM` turns
-                   it off to rebuild a seat whose forced load did not fit.
-        thinking: Whether the model thinks before answering. `None` sends no
-                  flag and leaves it to the model, which is what every call
-                  did before the console could switch it. Pass a bool only for
-                  a model `thinking_support` calls switchable. Not wired for
-                  OpenAI, whose reasoning is set by effort, not on and off.
+        timeout: Seconds one call may wait at the socket; `LLM_TIMEOUT_SECONDS`
+            when omitted. Each provider spells this differently.
+        thinking: Whether the model thinks first; None sends no flag. Pass a bool
+            only for a model `thinking_support` calls switchable.
+        force_gpu: Whether a local Ollama tag gets `OLLAMA_SEAT_GPU_OPTIONS`;
+            `_SeatLLM` turns it off to rebuild a seat whose load did not fit.
 
     Returns:
-        Chat model instance, or `StubLLM` when the provider needs a key and
-        none is configured. Callers that need to know which of the two they
-        got should ask `get_agent_status()` rather than inspect the result.
-
-    Environment variables:
-        ANTHROPIC_API_KEY, ANTHROPIC_MODEL
-        OLLAMA_BASE_URL, OLLAMA_MODEL
-        OPENAI_API_KEY, OPENAI_MODEL  (optional)
+        The chat model, or `StubLLM` when the provider needs a key and has none
+        -- `get_agent_status()` is what says which.
     """
     provider = provider or _detect_provider(model)
+    if provider not in PROVIDERS:
+        raise ValueError(f"Unknown provider {provider!r}: expected one of {', '.join(PROVIDERS)}.")
     timeout = LLM_TIMEOUT_SECONDS if timeout is None else timeout
 
     if provider == "ollama":
         from langchain_ollama import ChatOllama
 
         # No key: the daemon holds the ollama.com credentials for `:cloud`
-        # tags, so there is nothing for this process to authenticate with.
-        # `client_kwargs` reaches the httpx client the ollama SDK builds; there
-        # is no `timeout` field on ChatOllama itself.
-        #
-        # `reasoning=True` rather than the model's own default when thinking
-        # is on: both think, but under the default langchain_ollama drops the
-        # daemon's `thinking` field, so the reasoning is paid for and thrown
-        # away. True keeps it in `additional_kwargs`, where the Builder's tool
-        # loop hands it back to the model on the next turn.
-        tag = str(model or os.getenv(
-            "OLLAMA_MODEL", "hf.co/mradermacher/dolphin-2.9.1-yi-1.5-9b-GGUF:Q4_K_M"
-        ))
+        # tags. `client_kwargs` reaches the httpx client underneath.
+        # `reasoning=True` rather than the model's default when thinking is on:
+        # the default discards the daemon's `thinking` field, which the
+        # Builder's tool loop hands back.
+        tag = str(model or os.getenv("OLLAMA_MODEL", _PROVIDER_DEFAULT_MODELS["ollama"]))
 
-        # A locally-run tag is told to put every layer on the cards; a
-        # `:cloud` tag is sent nothing, since the options would be forwarded
-        # to ollama.com to describe hardware that is not theirs. `force_gpu`
-        # is how `_SeatLLM` rebuilds this seat unforced after a load that did
-        # not fit -- see `_is_gpu_fit_failure`.
-        # None rather than a missing keyword: langchain_ollama builds the
-        # daemon's `options` from the fields that are not None, so the two are
-        # the same request and this one type-checks.
+        # A local tag is told to put every layer on the cards; a `:cloud` tag
+        # gets nothing, since the options would describe hardware that is not
+        # ollama.com's. None, not a missing keyword: langchain_ollama sends
+        # only the fields that are set.
         num_gpu = (
             OLLAMA_SEAT_GPU_OPTIONS["num_gpu"]
             if force_gpu and is_local_ollama_model(tag)
@@ -856,7 +837,7 @@ def get_llm(
         return ChatOllama(
             model=tag,
             temperature=temperature,
-            base_url=base_url or _ollama_base_url(),
+            base_url=base_url or ollama_base_url(),
             client_kwargs={"timeout": timeout},
             reasoning=thinking,
             num_gpu=num_gpu,
@@ -865,7 +846,7 @@ def get_llm(
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
 
-        model_name = str(model or os.getenv("ANTHROPIC_MODEL", "claude-opus-5"))
+        model_name = str(model or os.getenv("ANTHROPIC_MODEL", _PROVIDER_DEFAULT_MODELS["anthropic"]))
         key = api_key or os.getenv("ANTHROPIC_API_KEY")
         if not key:
             return StubLLM()
@@ -879,8 +860,7 @@ def get_llm(
         )
         if thinking_param is not None:
             kwargs["thinking"] = thinking_param
-        # A model that is thinking takes no temperature: the families that
-        # still accept one reject anything but the default once thinking is on.
+        # A model that is thinking takes no temperature.
         thinks = thinking_param is not None and thinking_param["type"] not in (
             "disabled", "between_tools"
         )
@@ -893,7 +873,7 @@ def get_llm(
     # openai (optional cloud provider)
     from langchain_openai import ChatOpenAI
 
-    model_name = str(model or os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    model_name = str(model or os.getenv("OPENAI_MODEL", _PROVIDER_DEFAULT_MODELS["openai"]))
     key = api_key or os.getenv("OPENAI_API_KEY")
     if not key:
         return StubLLM()
@@ -909,19 +889,11 @@ def get_llm(
 
 
 def _detect_provider(model: str | None) -> Provider:
-    """Detect a provider from the model's name, then from the environment.
+    """The provider for a model name, then for the environment.
 
-    The name is read first because it is the more specific fact. `gpt-4o` is an
-    OpenAI model whatever keys the environment happens to hold, and consulting
-    the keys first sent `BUILDER_MODEL=gpt-4o` to Anthropic on any machine with
-    an ANTHROPIC_API_KEY -- a seat that then failed every call with a model
-    Anthropic does not have. The environment decides only for a name no
-    provider's naming claims, or no name at all: Anthropic's key or model
-    first, then OpenAI's, then Anthropic for no name and OpenAI otherwise.
-
-    An Ollama tag is recognised by its colon (`qwen3.8:latest`). A bare name
-    without one cannot be told from anything else by its spelling, so name the
-    provider for such a seat: `{ROLE}_PROVIDER=ollama`.
+    The name decides first: `gpt-4o` is OpenAI's whatever keys are set. An Ollama
+    tag has a colon (`qwen3.8:latest`); a bare name that is not recognisably
+    Claude or GPT needs `{ROLE}_PROVIDER=ollama`.
     """
     if model:
         lowered = model.lower()
@@ -942,15 +914,9 @@ def _detect_provider(model: str | None) -> Provider:
 def _resolve_seat(agent: str) -> dict[str, str | None]:
     """Resolve one agent's provider, model, base URL and key.
 
-    Precedence: a console override, then per-agent environment variables, then
-    the agent's default seat. `get_agent_llm`, `get_agent_model_info` and
-    `get_agent_status` all route through here -- if they resolved seats
-    independently the console could name one model while the run used another,
-    which is the failure this function exists to prevent.
-
-    Per-agent environment variables, for each of ARCHITECT, PLANNER,
-    RESEARCHER and BUILDER:
-        {ROLE}_PROVIDER, {ROLE}_MODEL, {ROLE}_BASE_URL, {ROLE}_API_KEY
+    A console override wins, then `{ROLE}_PROVIDER` / `{ROLE}_MODEL` /
+    `{ROLE}_BASE_URL` / `{ROLE}_API_KEY`, then the default seat. Every reader of a
+    seat routes through here, so the console and the run cannot disagree.
     """
     override = _agent_llm_overrides.get(agent)
     if override:
@@ -958,8 +924,7 @@ def _resolve_seat(agent: str) -> dict[str, str | None]:
         return {
             "provider": chosen,
             "model": override["model"],
-            # A console selection carries no key of its own, so the provider's
-            # own credentials apply -- the same ones the default seat uses.
+            # A console selection uses the provider's own credentials.
             "base_url": os.getenv(f"{chosen.upper()}_BASE_URL"),
             "api_key": None,
         }
@@ -969,14 +934,15 @@ def _resolve_seat(agent: str) -> dict[str, str | None]:
     model: str | None = os.getenv(f"{prefix}_MODEL")
 
     if not provider and not model:
-        # Deliberately not consulting a provider-wide {PROVIDER}_MODEL here:
-        # the four seats run four different models on purpose, and a single
-        # OLLAMA_MODEL would silently collapse three of them onto one. Retune
-        # a seat with {ROLE}_MODEL or the console dropdown instead.
-        seat = DEFAULT_SEATS.get(agent, DEFAULT_SEATS["builder"])
+        # Not a provider-wide {PROVIDER}_MODEL: the four seats run four
+        # different models on purpose.
+        seat = DEFAULT_SEATS[cast("AgentName", agent)]
         provider, model = seat["provider"], seat["model"]
     elif provider and not model:
-        model = _DEFAULT_AGENT_MODELS.get((provider, agent))
+        # An unknown provider has no default model; `get_agent_status` says so.
+        model = _DEFAULT_AGENT_MODELS.get(cast("Provider", provider), {}).get(
+            cast("AgentName", agent)
+        )
     elif model and not provider:
         provider = _detect_provider(model)
 
@@ -989,21 +955,11 @@ def _resolve_seat(agent: str) -> dict[str, str | None]:
 
 
 def get_agent_llm(agent: AgentName, temperature: float = 0.1) -> Any:
-    """Get the LLM configured for a specific agent role.
-
-    Default seats (local first -- see DEFAULT_SEATS):
-        Architect  -> Ollama    dolphin-2.9.1 9B (leading authority)
-        Planner    -> Ollama    dolphin-2.9.1 9B
-        Researcher -> Ollama    dolphin-2.9.1 9B
-        Builder    -> Ollama    qwen3.8:latest (the local tag with tools)
-    """
+    """The chat model holding `agent`'s seat (see `_resolve_seat`), wrapped in `_SeatLLM`."""
     seat = _resolve_seat(agent)
 
-    # The seat is built through a factory rather than once, so `_SeatLLM` can
-    # build it again unforced when a forced offload does not fit the cards.
-    # Everything but the placement is captured here, which is what keeps the
-    # rebuilt seat identical in every other respect -- same model, same
-    # thinking flag, same key.
+    # Built through a factory, so `_SeatLLM` can rebuild it unforced with
+    # everything else -- model, thinking, key -- the same.
     def build(force_gpu: bool) -> Any:
         return get_llm(
             provider=seat["provider"],  # type: ignore[arg-type]
@@ -1019,36 +975,35 @@ def get_agent_llm(agent: AgentName, temperature: float = 0.1) -> Any:
 
 
 def get_agent_model_info(agent: AgentName) -> dict[str, str]:
-    """Resolve an agent's provider/model without instantiating an LLM."""
+    """Resolve an agent's provider/model without instantiating an LLM.
+
+    `model` is empty only for a provider this project does not know, which
+    `get_agent_status` reports and `get_llm` refuses.
+    """
     seat = _resolve_seat(agent)
-    return {
-        "provider": seat["provider"] or "anthropic",
-        "model": seat["model"] or "claude-opus-5",
-    }
+    return {"provider": seat["provider"] or DEFAULT_PROVIDER, "model": seat["model"] or ""}
 
 
 def get_agent_status(agent: AgentName) -> dict[str, Any]:
     """Resolve an agent's seat and say whether it can actually run.
 
-    `get_llm` falls back to `StubLLM` when a key is missing, while
-    `get_agent_model_info` keeps reporting the configured model either way --
-    so without this the console shows a model name while canned text comes out
-    of the run. `live` is the field that tells the truth about that, and it is
-    what drives the NO KEY chip and the offline banner.
+    `get_llm` falls back to `StubLLM` without a key while the configured model
+    name stays the same, so `live` is what says whether the seat runs -- it drives
+    the console's chips and offline banner.
     """
     info = get_agent_model_info(agent)
     provider, model = info["provider"], info["model"]
 
-    # `stubbed` and `live` are different failures and must not be conflated.
-    # A seat with no key at all silently becomes StubLLM and the run completes
-    # with canned text; a seat with a key that does not work fails the run
-    # outright. The console words those two cases differently.
+    # `stubbed` (no key: the run completes on canned text) and not `live` (a
+    # key that does not work: the run fails) are worded apart in the console.
     live, reason, badge, stubbed = True, "", "", False
 
-    # A real failure from the last call outranks every static check: the key
-    # can be present and correct and the seat still unable to run.
     failure = _seat_failures.get(agent)
-    if failure:
+    if provider not in PROVIDERS:
+        live, reason, badge = False, (
+            f"{agent.upper()}_PROVIDER={provider!r} is not one of {', '.join(PROVIDERS)}"
+        ), "BAD PROVIDER"
+    elif failure:
         live, reason, badge = False, failure, "FAILING"
     elif provider == "anthropic" and not os.getenv("ANTHROPIC_API_KEY"):
         live, reason, badge, stubbed = False, "ANTHROPIC_API_KEY not set", "NO KEY", True
@@ -1058,19 +1013,15 @@ def get_agent_status(agent: AgentName) -> dict[str, Any]:
         tags = list_ollama_models()
         if not tags:
             live, reason, badge = False, "Ollama daemon unreachable", "OFFLINE"
-        # Compared as tags, not strings: the daemon lists `qwen3.8:latest`, and
-        # a seat configured as `qwen3.8` is that model, not a missing one.
+        # Compared as tags: `qwen3.8` is `qwen3.8:latest`.
         elif not any(_same_ollama_tag(model, tag) for tag in tags):
             live, reason, badge = False, f"{model} not pulled", "NOT PULLED"
 
-    # Where the prompt goes, read off the seat rather than guessed: an Ollama
-    # tag ending `:cloud` is proxied to ollama.com by the local daemon, so the
-    # transport is local but the prompt still leaves the machine.
+    # Where the prompt goes: a `:cloud` tag's transport is local, but the
+    # prompt leaves the machine.
     remote = provider in ("anthropic", "openai") or model.endswith((":cloud", "-cloud"))
 
-    # `thinking` is what the next call will do, not what was asked for: a
-    # switchable model is always sent the flag, so the box cannot disagree
-    # with the seat. None when nobody can say -- see `thinking_support`.
+    # What the next call will do; None when nobody can say.
     support, thinking_note = thinking_support(provider, model)
     thinking = {
         "switch": get_agent_thinking(agent),
@@ -1078,10 +1029,7 @@ def get_agent_status(agent: AgentName) -> dict[str, Any]:
         "never": False,
     }.get(support)
 
-    # Reported for every seat, but only the Builder is warned: the other three
-    # are offered no tools at all, so a model without them is the right seat
-    # for them rather than a defect. False and None are kept apart -- a daemon
-    # that could not be asked must not accuse a model of anything.
+    # Only the Builder is warned: the other seats are offered no tools.
     tools, _ = tool_support(provider, model)
     tools_note = (
         f"{model} cannot call tools, so this Builder would report its work and "
@@ -1107,21 +1055,14 @@ def get_agent_status(agent: AgentName) -> dict[str, Any]:
 
 
 class StubLLM:
-    """Stub LLM for testing without API key.
-
-    Returns responses in the 4-Agent System format.
-    """
+    """Canned, parser-friendly answers in each seat's format, for tests and keyless seats."""
 
     def invoke(self, messages: list[Any]) -> Any:
         """Return canned responses for testing."""
         from langchain_core.messages import AIMessage
 
-        # Role comes from the system message; everything else is data.
-        # The Researcher injects retrieved documents into the Builder's prompt,
-        # and a retrieved document can say anything -- an uploaded copy of a
-        # prompt file puts "You are the Architect" inside a Builder call.
-        # Reading the role off user content makes the stub answer as the wrong
-        # agent.
+        # The role comes from the system message: retrieved documents in the
+        # user message can say anything, "You are the Architect" included.
         system_content = ""
         all_content = ""
         last_content = ""
@@ -1137,11 +1078,9 @@ class StubLLM:
         # Fall back to the whole prompt only when no system message was given.
         role_source = system_content.lower() or all_lower
 
-        # Detect which agent is being called. Every prompt names the other
-        # roles in order to route between them, so a bare role keyword matches
-        # all four -- the Builder's prompt says "Planner" twice. Identify on
-        # the self-identifying opening instead, and only fall back to the
-        # looser phrases when a caller supplied its own prompt.
+        # Every prompt names the other roles in order to route between them, so
+        # the role is read off the self-identifying opening, with looser
+        # phrases only when a caller wrote its own prompt.
         roles = ("architect", "planner", "researcher", "builder")
         identified = next(
             (role for role in roles if f"you are the {role}" in role_source), None
@@ -1158,8 +1097,8 @@ class StubLLM:
             is_researcher = "gather high-quality" in role_source
             is_builder = "implement the plan" in role_source
 
-        # For the Planner, decide whether the *user goal* asks for research.
-        # Ignore the state-injection block, which contains a "Research:" label.
+        # For the Planner: does the *user goal* ask for research? (The state
+        # block has a "Research:" label of its own.)
         user_goal_match = re.search(
             r"User goal:\s*(.+)", last_content, re.IGNORECASE | re.DOTALL
         )
@@ -1167,9 +1106,8 @@ class StubLLM:
         needs_research = "research" in user_goal
 
         if is_architect:
-            # The Architect runs twice per cycle: once to set direction, and
-            # again as the approval gate. A populated builder report is what
-            # separates the two.
+            # The Architect sets direction and then rules on the report; a
+            # populated builder report is what separates the two.
             reviewing = (
                 "builder report:" in all_lower
                 and "builder report: (empty)" not in all_lower

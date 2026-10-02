@@ -1,32 +1,14 @@
 """HTML to text, ours rather than a library's.
 
-A fetched page is mostly not the page. Navigation, cookie banners, related-post
-rails and footers are the bulk of the markup, and embedding them is not a
-cosmetic problem here: a chunk of link text scores against queries the way any
-other chunk does, so boilerplate does not sit inertly in the corpus, it
-*competes* with the passage that answers the question. The corpus already
-learned this once from the other direction -- a document embedded in one
-`encode()` call was represented by its preamble, and the file that answered the
-query lost to a shorter one that merely mentioned it.
+Navigation, banners and footers are most of a page's markup, and embedded they
+compete with the passage that answers the question. A block is dropped as
+chrome when it is *both* short and link-dominated -- neither test alone works:
+a heading is short prose, and a paragraph citing sources is link-heavy -- and
+headings are exempt from the length test.
 
-The technique is **link density plus block length**, which is what separates
-prose from chrome without knowing anything about the site. A navigation strip
-is short blocks that are almost entirely anchor text; an article is long blocks
-that are almost entirely not. Neither test works alone -- a heading is short
-prose, and a paragraph citing three sources is long and link-heavy -- so a
-block is dropped only when it is *both* short and link-dominated, and headings
-are exempt from the length test entirely because a heading is short by nature
-and is the one short thing worth keeping.
-
-Written here rather than taken from a library for two reasons. The obvious one
-is that it costs nothing and adds no dependency tree. The one that matters more
-is that this is a *measurement surface*: `ExtractedPage` reports how many blocks
-it kept, how many it dropped and whether it fell back, so a page that came back
-thin says so and can be graded, rather than being an empty string out of a
-black box. Everything else in this project that decides what enters the corpus
--- the relevance floor, the chunker, the duplicate scan -- was tuned against
-numbers it printed, and an extractor that cannot be tuned the same way would be
-the one unmeasured link in that chain.
+Written here rather than taken from a library because it is a measurement
+surface: `ExtractedPage` says how many blocks it kept and dropped and whether
+it fell back, so a thin page says so and can be graded.
 """
 
 from __future__ import annotations
@@ -35,9 +17,8 @@ import re
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 
-# Everything inside these is never prose, whatever it contains. `head` matters
-# as much as `script`: a page's metadata and JSON-LD would otherwise arrive as
-# a wall of tokens attached to a real URL.
+# Never prose, whatever they contain -- `head` included, or a page's metadata
+# and JSON-LD arrive as text.
 SKIP_TAGS = frozenset(
     {
         "script", "style", "noscript", "template", "svg", "head", "form",
@@ -45,15 +26,12 @@ SKIP_TAGS = frozenset(
     }
 )
 
-# Chrome by role rather than by content. Kept apart from SKIP_TAGS because a
-# page that wraps its article in <aside> loses everything if these are treated
-# as certainties -- so their text is dropped from the *filtered* pass and comes
-# back if the fallback fires.
+# Chrome by role. Not certainties like SKIP_TAGS -- some pages wrap their
+# article in <aside> -- so their text comes back if the fallback fires.
 CHROME_TAGS = frozenset({"nav", "header", "footer", "aside", "menu"})
 
-# Tags that end a block of text. A block is the unit the density test judges,
-# so this list decides how coarse that judgement is: too few and an entire page
-# is one block that always passes, too many and every sentence is judged alone.
+# Tags that end a block, the unit the density test judges: too few and a page is
+# one block that always passes, too many and every sentence is judged alone.
 BLOCK_TAGS = frozenset(
     {
         "p", "div", "li", "tr", "td", "th", "section", "article", "blockquote",
@@ -64,16 +42,13 @@ BLOCK_TAGS = frozenset(
 
 HEADING_TAGS = frozenset({"h1", "h2", "h3", "h4", "h5", "h6"})
 
-# A block shorter than this, and link-dominated, is chrome. Both tests have to
-# fail it -- see the module docstring for why neither is sufficient alone.
+# A block shorter than this *and* link-dominated is chrome.
 MIN_BLOCK_WORDS = 8
 MAX_LINK_DENSITY = 0.5
 
-# Below this the filtered pass is assumed to have eaten the article -- a page
-# built entirely from <div>s inside an <aside>, or markup broken enough that
-# the skip stack never unwound. The unfiltered text is returned instead, and
-# `fell_back` says so, because a silently empty extraction is exactly the
-# failure this module exists to make visible.
+# Below this the filtered pass is assumed to have eaten the article -- markup
+# broken enough that the skip stack never unwound, say -- and the unfiltered
+# text is returned instead, with `fell_back` saying so.
 MIN_DOCUMENT_WORDS = 40
 
 _WHITESPACE = re.compile(r"[ \t\r\f\v]+")
@@ -109,11 +84,7 @@ class _Block:
 
 @dataclass
 class ExtractedPage:
-    """What came out, and enough about how to grade it.
-
-    `kept`/`dropped`/`fell_back` are the point: they turn "this page came back
-    thin" from a guess into a reading. See the module docstring.
-    """
+    """What came out, with `kept`, `dropped` and `fell_back` to grade it by."""
 
     title: str
     text: str
@@ -130,26 +101,21 @@ class _Extractor(HTMLParser):
     """Collect text into blocks, tracking what is skipped and what is a link."""
 
     def __init__(self) -> None:
-        # convert_charrefs is the default and is wanted: entities become text
-        # before we ever count a word, so `&amp;` is one token and not three.
+        # Entities become text before a word is counted.
         super().__init__(convert_charrefs=True)
         self.blocks: list[_Block] = []
         self.chrome_blocks: list[_Block] = []
         self.title = ""
         self._block = _Block()
-        # Counters rather than a boolean: nested <div> inside <nav> inside
-        # <aside> has to unwind exactly, and malformed markup that never closes
-        # a tag is why this can get stuck -- which is what MIN_DOCUMENT_WORDS
-        # catches downstream.
+        # Counters, so nested tags unwind exactly. Markup that never closes a
+        # tag can still leave one stuck, which MIN_DOCUMENT_WORDS catches.
         self._skip = 0
         self._chrome = 0
         self._anchor = 0
         self._pre = 0
         self._in_title = False
-        # Only the first <title> names the page. An inline <svg> carries its
-        # own for accessibility -- "Search", "Close", "Menu" -- and each one
-        # used to be appended to the page's, so the provenance header of a
-        # stored page read "Real Title Search Menu Close".
+        # Only the first <title> names the page: an inline <svg> carries its own
+        # ("Search", "Close").
         self._title_done = False
 
     # -- block bookkeeping --------------------------------------------------
@@ -162,10 +128,7 @@ class _Extractor(HTMLParser):
     # -- HTMLParser hooks ---------------------------------------------------
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        # `title` is checked before the skip stack, never after: it lives inside
-        # `head`, `head` is skipped wholesale, and a check below the skip guard
-        # can therefore never fire. It is the one thing worth taking from there,
-        # and it is what names the document when a page has no usable <h1>.
+        # Before the skip stack: `title` lives inside the skipped `head`.
         if tag == "title":
             self._in_title = not self._title_done
             return
@@ -212,8 +175,6 @@ class _Extractor(HTMLParser):
         if self._in_title:
             self.title += data
             return
-        # `head` is skipped wholesale, so this is the only way title text
-        # arrives; everything else inside a skipped tag is discarded.
         if self._skip:
             return
         if not data.strip():
@@ -226,7 +187,7 @@ class _Extractor(HTMLParser):
         if self._anchor:
             self._block.link_words += count
 
-    def close(self) -> None:  # noqa: D102 - inherited contract
+    def close(self) -> None:
         super().close()
         self._flush()
 
@@ -250,20 +211,15 @@ def _render(blocks: list[_Block]) -> str:
 def extract(html: str) -> ExtractedPage:
     """Pull the readable article out of a page.
 
-    Never raises on malformed markup -- `HTMLParser` is lenient by design, and
-    a page that breaks the skip stack is caught by the fallback rather than by
-    an exception. A caller gets thin text and the counters saying it is thin,
-    which is a thing it can act on; an exception here would only turn a bad
-    page into a lost one.
+    Never raises on malformed markup: a bad page comes back thin, with the
+    counters saying so, rather than lost.
     """
     parser = _Extractor()
     try:
         parser.feed(html)
         parser.close()
     except Exception:
-        # Nothing HTMLParser raises is worth losing the partial parse over:
-        # whatever blocks it had collected before the malformed byte are still
-        # the page, and the fallback below decides whether they are enough.
+        # The blocks collected before the malformed byte are still the page.
         pass
 
     kept = [block for block in parser.blocks if not block.is_chrome()]
@@ -272,9 +228,7 @@ def extract(html: str) -> ExtractedPage:
 
     fell_back = False
     if len(text.split()) < MIN_DOCUMENT_WORDS:
-        # The filter ate the page. Take everything that was not inside a
-        # SKIP_TAG, chrome included -- a noisy document is worth more than an
-        # empty one, and `fell_back` is what tells the caller which it got.
+        # The filter ate the page: a noisy document beats an empty one.
         everything = parser.blocks + parser.chrome_blocks
         fallback = _render(everything)
         if len(fallback.split()) > len(text.split()):

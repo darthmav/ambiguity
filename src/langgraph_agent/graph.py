@@ -1,9 +1,7 @@
-"""LangGraph graph definition.
+"""The LangGraph wiring: Architect → Planner → (Researcher | Builder) → Architect.
 
-Implements the 4-Agent System architecture:
-- Architect → Planner → Researcher → Builder → Architect flow
-- The Architect is the leading authority: it opens the run and holds the gate
-- Step count limit to prevent infinite loops
+The Architect opens the run and holds the gate; `MAX_STEPS` passes through the
+gate end a run that never converges.
 """
 
 from typing import Any, Literal, Protocol
@@ -21,22 +19,16 @@ from langgraph_agent.nodes import (
 )
 from langgraph_agent.state import AgentState, ResearchStatus, Verdict
 
-# Maximum cycles through the Architect gate before escalation
+# Cycles through the Architect gate before a run ends unapproved.
 MAX_STEPS = 8
 
-# Supersteps LangGraph will run before it gives up. A counted step costs at
-# most four supersteps (architect, planner, researcher, builder), but a
-# Researcher that asks for a replan bounces back to the Planner without passing
-# the gate, so the true cost per step is higher than four. At exactly 4 *
-# MAX_STEPS the recursion limit fired before the gate ever reached MAX_STEPS,
-# which meant the run always died by exception instead of ending on its own
-# terms. The gate is the intended stop; this is only the backstop behind it.
+# Supersteps LangGraph runs before giving up: the backstop behind the gate. A
+# step costs four supersteps, more when the Researcher sends the Planner back,
+# so 4 * MAX_STEPS would fire before the gate could end the run itself.
 RECURSION_LIMIT = 6 * MAX_STEPS + 4
 
 
-# The routing functions live at module scope rather than inside the factory:
-# they are pure functions of state, and as closures they could only be
-# exercised by running the whole graph.
+# Module-level, not closures, so they can be tested without running the graph.
 def _route_from_architect(state: AgentState) -> Literal["planner", "researcher", "__end__"]:
     """Route on the Architect's verdict. Opening move and terminating gate."""
     # The step ceiling is checked first so a stuck loop cannot outvote it.
@@ -58,47 +50,22 @@ def _route_from_architect(state: AgentState) -> Literal["planner", "researcher",
 def _route_from_planner(state: AgentState) -> Literal["researcher", "builder"]:
     """Respect the Planner's routing, except for the first hop of a run.
 
-    The Planner chooses Researcher when knowledge is needed and Builder when
-    the task is already fully specified -- and on every later cycle that choice
-    stands. The opening cycle is different: the run retrieves once before the
-    Builder ever acts, whatever the Planner asked for.
+    The opening cycle always retrieves once before the Builder acts: otherwise
+    a confident plan naming the Builder means a run that rebuilt its corpus and
+    never read it. Where the corpus answers, the hop costs a search and no model
+    call (`_gather_research`).
 
-    That override exists because the alternative was measured and it is the
-    corpus never being read at all. Nothing else forces retrieval: a run
-    rebuilds the corpus before the Architect opens, the web phase may embed
-    pages into it, and then the Researcher runs only if the Planner's reply
-    happens to name it. A seat that writes a confident plan names the Builder
-    instead, so on the run of 2026-09-12 -- 77 documents and 1,659 passages
-    built in 77.3s, 8 fetched pages embedded in 25.8s -- both cycles went
-    Planner -> Builder and the run ended with `research` empty and
-    `research_status` unset. Every seat worked; the knowledge base was simply
-    never consulted, and nothing in the record said so.
-
-    It is close to free where it is redundant, which is why it can be
-    unconditional: `_gather_research` calls GraphRAG first and returns those
-    chunks without invoking the Researcher's model at all whenever the top hit
-    clears the measured relevance floor -- so on a goal the corpus answers, the
-    hop costs a search. It is the goal the corpus *cannot* answer that reaches
-    the seat, and that case routes on to the Builder anyway.
-
-    Two states are exempt, and both are the Planner having failed rather than
-    chosen. `plan_is_placeholder` catches them: a plan nobody wrote is not a
-    query worth searching on -- `_gather_research` searches on `plan`, and
-    retrieval that thin is exactly what falls through to the Researcher's own
-    model -- and those paths pick the Builder precisely because it is the
-    shorter way back to the Architect, which is the only node that can end a
-    run whose seats are already stalling.
+    A placeholder plan is exempt (`plan_is_placeholder`): it is the Planner
+    having failed, nothing worth searching on, and the Builder is the shorter
+    way back to the Architect.
     """
     next_agent = state.get("next_agent", "Researcher")
     if next_agent.lower() != "builder":
         return "researcher"
 
-    # `research_status` is the marker for "the Researcher has run", not
-    # `research`: the seat can legitimately come back with nothing to say, and
-    # a run forced round again on an empty findings string would ask the same
-    # question of the same corpus every cycle. Every exit from
-    # `researcher_node` sets a status except the emergency stop, which is
-    # ending the run regardless.
+    # `research_status` marks "the Researcher has run" -- not `research`, which
+    # can legitimately come back empty. Every exit from `researcher_node` sets
+    # it except the emergency stop, which ends the run anyway.
     if state.get("research_status"):
         return "builder"
     if plan_is_placeholder(state.get("plan", "")):
@@ -118,10 +85,7 @@ def _route_from_researcher(state: AgentState) -> Literal["planner", "builder"]:
 class _NodeFn(Protocol):
     """A graph node: `(state) -> state`, with the parameter named `state`.
 
-    Spelled out rather than written as `Callable[[AgentState], AgentState]`
-    because LangGraph's own node protocol names its parameter, and a bare
-    `Callable` -- whose parameter is positional and nameless -- does not
-    satisfy it. `add_node` then rejects a perfectly good wrapper.
+    A `Callable` will not do: LangGraph's node protocol names its parameter.
     """
 
     def __call__(self, state: AgentState) -> AgentState: ...
@@ -130,10 +94,9 @@ class _NodeFn(Protocol):
 def _tracked(name: str, node: _NodeFn) -> _NodeFn:
     """Mark a seat as working for exactly as long as its node is on the stack.
 
-    This is the only honest source for "is this seat doing work": the graph's
-    stream reports a node when it *ends*, so a light driven from there is always
-    one seat behind. The `finally` is what makes it safe -- a node that raises,
-    times out, or returns early on the emergency stop still puts its light out.
+    The graph's stream reports a node when it *ends*, so this is the only honest
+    source for a seat light; the `finally` puts the light out however the node
+    leaves.
     """
 
     def run(state: AgentState) -> AgentState:
@@ -170,8 +133,7 @@ def create_agent_graph() -> CompiledStateGraph[AgentState, Any, AgentState, Agen
     graph_builder.add_node("researcher", _tracked("researcher", researcher_node))
     graph_builder.add_node("builder", _tracked("builder", builder_node))
 
-    # The Architect is the entry point: nothing is planned before the
-    # architectural direction and its constraints exist.
+    # Nothing is planned before the architectural direction exists.
     graph_builder.set_entry_point("architect")
 
     graph_builder.add_conditional_edges(
@@ -202,9 +164,8 @@ def create_agent_graph() -> CompiledStateGraph[AgentState, Any, AgentState, Agen
         },
     )
 
-    # The Builder always reports to the Architect. It no longer decides that the
-    # run is over -- that ruling belongs to the authority that set the
-    # constraints, and routing back through the gate is also what counts a step.
+    # The Builder reports to the Architect, which rules on the work and counts
+    # the step.
     graph_builder.add_edge("builder", "architect")
 
     return graph_builder.compile()

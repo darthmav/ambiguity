@@ -1,7 +1,3 @@
-# Declared explicitly rather than left to pip's legacy fallback. Without this
-# section pip infers a setuptools build; that works today and is an implicit
-# default nobody chose. Naming it also lets the discovery config below be read
-# as the deliberate thing it is.
 [build-system]
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
@@ -10,86 +6,59 @@ build-backend = "setuptools.build_meta"
 name = "langgraph-agent"
 version = "0.2.0"
 description = "4-Agent AI System: Architect, Planner, Researcher, Builder"
-# 3.12, not the 3.10 this claimed. Nothing tested 3.10, and the stack this
-# actually resolves against cannot run there: numpy 2.5.2 and scipy 1.18.1 both
-# require >= 3.12, and networkx 3.6.1 requires >= 3.11. A 3.10 install would
-# have to fall back to an older scientific stack than anyone here runs, which
-# is a configuration that has never been exercised. Declaring support for a
-# version nothing checks is the same kind of claim as a report that says a
-# thing works without having run it.
+# numpy 2.5 and scipy 1.18 require 3.12; nothing older is tested.
 requires-python = ">=3.12"
+# Everything the package imports directly is declared here, even when it would
+# arrive transitively: a dependency left implicit breaks the day the one that
+# carries it moves. Floors mark where each API in use begins.
 dependencies = [
     "langgraph>=0.2.0",
     "langchain-core>=0.3.0",
-    "langchain-community>=0.3.0",
-    # Every seat in DEFAULT_SEATS is an ollama seat, so this is the one
-    # provider the shipped configuration cannot start without. It was undeclared
-    # until 2026-09-10 and nothing said so: a seat whose provider will not
-    # import becomes StubLLM, so a fresh install ran the whole four-agent loop
-    # on canned text and reported success. CI found it on its first run, on a
-    # machine that had never had it installed by hand.
+    # A seat whose provider will not import silently becomes StubLLM, so every
+    # provider a seat can be pointed at is declared.
     "langchain-ollama>=0.2.0",     # every default seat
-    # The daemon's own client, which `ollama_client.py` imports directly. It
-    # arrives transitively under langchain-ollama anyway; named here for the
-    # reason httpx is -- a direct dependency left implicit breaks the day a
-    # transitive one moves, and this one breaks it at module load.
-    "ollama>=0.4.0",
-    "langchain-openai>=0.2.0",     # optional; no seat uses it by default
-    "langchain-anthropic>=0.2.0",  # optional; no seat uses it by default
-    "mcp>=0.5.0",
+    "langchain-openai>=0.2.0",
+    "langchain-anthropic>=0.2.0",
+    "ollama>=0.4.0",               # ollama_client.py
+    "pydantic>=2.0",               # SecretStr for provider keys
     "python-dotenv>=1.0.0",
-    # Online research. It arrives transitively with langchain and chromadb
-    # anyway; named here because `web_research` imports it directly, and a
-    # direct dependency left implicit breaks the day a transitive one moves.
-    "httpx>=0.27.0",
-    # GraphRAG dependencies
+    "httpx>=0.27.0",               # online research
     "chromadb>=0.5.0",
-    # The chunker cuts passages with the embedding model's own tokenizer
-    # (Qwen/Qwen3-Embedding-8B), loaded through this. Nothing embeds in-process:
-    # qwen3-embedding:latest runs under the local Ollama daemon.
+    # The chunker cuts with the embedding model's own tokenizer; nothing embeds
+    # in-process.
     "transformers>=4.51.0",
     "networkx>=3.0",
-    # The scientific stack the spectral half runs on, undeclared until
-    # 2026-09-18 and arriving by luck: numpy comes in transitively under
-    # chromadb, and scipy came in under nothing at all -- so CI's clean install
-    # could not import `tests/test_spectral_graph.py` and three commits on
-    # master were red for it. This is the third instance of the failure httpx
-    # and ollama are declared against, and the worst-placed of them: the
-    # comment on `requires-python` above names "numpy 2.5.2 and scipy 1.18.1"
-    # as the stack this resolves against, so the file knew about both while
-    # declaring neither.
-    #
-    # Both are runtime dependencies of the installed distribution rather than
-    # dev extras. `corpus_spectral.py` imports numpy and is inside the package;
-    # `graphrag_server` imports `spectral_graph` from inside `connectivity()`,
-    # `topics()` and `bottleneck()`, so scipy is what the console's own header
-    # poll ends up needing. Floors are where the numpy-2 stack begins rather
-    # than a tested minimum, which is this list's convention -- and stated as
-    # such, because a floor nobody exercised is the same unfounded claim as the
-    # 3.10 that comment retired.
+    # spectral_graph and the corpus diagnostics built on it.
     "numpy>=2.0",
     "scipy>=1.14",
-    # Self-healing (retry / circuit breaker)
+    # self_healing: retries with backoff, and circuit breakers.
     "tenacity>=8.2.0",
     "pybreaker>=1.2.0",
 ]
 
 [project.optional-dependencies]
-dev = [
+# Run by the Builder's own belt under the console's interpreter: the lint pass
+# is `ruff check` and the test tools are pytest. The container installs this.
+tools = [
     "pytest>=7.0",
-    "pytest-asyncio>=0.21",
-    "pytest-cov>=4.0",
-    "ruff>=0.5.0",
+    "ruff==0.16.9",                # the version CI lints with; bump both together
+]
+dev = [
+    "langgraph-agent[tools]",
     "mypy>=1.10",
-    "langsmith>=0.1.0",
 ]
 
-# Discovery is pinned to src/ rather than inferred. The repo has
-# `spectral_graph`, `tests` and `scripts` sitting at the root next to `src/`,
-# and setuptools' auto-discovery reads that as an ambiguous multi-package
-# layout. Naming the one place packages live keeps those root directories out
-# of the distribution -- which is what they have always been: `spectral_graph`
-# is imported by project-root scripts, never installed, and `graphrag_server`
-# imports it inside a function for exactly that reason.
+[tool.pytest.ini_options]
+# Collection starts at tests/ alone: a bare `pytest` from the root must never
+# import a root-level script.
+testpaths = ["tests"]
+# The root on the path for a bare `pytest` as for `python -m pytest`: the tests
+# import `serve` and `spectral_graph`, which live there uninstalled.
+pythonpath = ["."]
+
+# Packages live under src/ alone. `spectral_graph`, `tests` and `scripts` sit
+# at the root and stay out of the distribution; `spectral_graph` is importable
+# with the project root on sys.path, which is why the package imports it
+# inside the functions that need it.
 [tool.setuptools.packages.find]
 where = ["src"]

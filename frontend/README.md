@@ -145,22 +145,36 @@ request, so both come back 200.
 
 | Method | Params | Returns |
 |---|---|---|
-| `status` | — | seats, embedding model, corpus state, degraded seats |
-| `rag_stats` | — | documents, chunks, nodes, edges |
+| `status` | — | embedding model and device, corpus state, whether a rebuild or a run is in flight |
+| `rag_stats` | — | documents, chunks, nodes, edges, graph health, staleness |
 | `list_documents` | — | every document node |
-| `query_graph` | `node_id`, `max_depth`, `min_degree` | `center_node`, `related_nodes`, `edges` |
+| `query_graph` | `node_id`, `max_depth`, `min_degree`, `split` | `center_node`, `related_nodes`, `edges` |
+| `graph_overview` | `min_degree`, `include_isolated` | the whole corpus as one drawable graph |
 | `search_documents` | `query`, `top_k` | ranked results |
-| `reindex` | — | indexed / skipped / errors plus fresh stats |
+| `bottleneck` | `limit` | the narrowest cut and the nodes bridging it |
+| `topics` | `k` (optional: the eigengap chooses) | topic communities, or `no_clear_structure` |
+| `duplicate_entities` | `limit`, `name_similarity`, `containment` | entities that are candidates to merge |
 | `upload_document` | `name`, `content` | where it was stored, its passage count, fresh stats |
+| `export_corpus` | — | the graph and every chunk, without embeddings |
+| `clear_corpus` | — | what was removed, and fresh stats |
+| `list_projects` | — | generated projects under `projects/` and whether each is embedded |
+| `embed_project` | `name`, `embed` | the choice, and whether a rebuild started |
 | `list_seats` | — | the four seats and whether each can run |
 | `set_seat` | `agent`, `provider`, `model` | the updated seat |
 | `set_thinking` | `agent`, `thinking` (a JSON boolean) | the updated seat; refused for a model with no switch |
 | `llm_options` | — | the seat models the console offers (`ollama ls` minus embedders) |
-| `run_goal` | `goal` | the final `AgentState` |
+| `embedding_options` | — | the embedding model, its corpus and its relevance floor |
+| `run_goal` | `goal`, `project`, `research_web`, `expect_failures`, `discuss_only` | the final `AgentState`, plus how the run ended |
+| `run_progress` | — | the run in flight: active seat, turns, messages |
+| `embedding_activity` | — | whether the embedder is working |
+| `stop_run` | `run_id`, `reason` | whether a stop was armed |
+| `last_run` | — | the last run's snapshot |
+| `healing` | `since` | circuits, service health, and the healing journal after `since` |
+| `reset_circuit` | `name` | the circuits after closing `name` |
+| `shutdown` | `stop_first` | whether the server is exiting |
 
-`/api/status`, `/api/llm-options`, `/api/run`, `/api/search` and `/api/set-llm`
-remain as compatibility wrappers over the same functions; `launch_console.sh`
-polls `/api/status` as its readiness check.
+`GET /api/status` answers the same payload as `status`: `launch_console.sh`
+polls it as its readiness check, and the container's health check uses it.
 
 ## Customization
 
@@ -183,9 +197,14 @@ Port: `PORT=3000 python serve.py`.
 
 ## Troubleshooting
 
-**Graph tab is empty** — nothing has been indexed here yet. Start a run: the
-corpus is built before the Architect opens. Check `rag_stats` reports non-zero
-nodes afterwards.
+**Graph tab is empty** — nothing has been indexed here yet: the corpus holds
+what online research kept, uploads and opted-in projects, and a fresh machine
+has none of them. Upload a document, or start a run with *Research online*
+ticked. Check `rag_stats` reports non-zero nodes afterwards.
+
+**The header shows `ollama-daemon down`** — the daemon stopped answering and its
+circuit opened. It closes on its own once a trial call succeeds; click the chip
+to send one now.
 
 **A seat shows NO KEY** — it is pointed at Anthropic or OpenAI and that
 provider's key is unset. The default seats are all local Ollama models; if

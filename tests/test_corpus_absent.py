@@ -144,7 +144,6 @@ def test_a_search_with_nothing_to_search_leaves_the_embedder_idle(nowhere, monke
 def test_the_reads_report_the_absence_rather_than_zeros(nowhere):
     """Four zeros read as a knowledge base that happens to be empty."""
     assert serve.rpc_status({})["corpus"] == "absent"
-    assert serve.rpc_status({})["graphrag"] is False
 
     stats = serve.rpc_rag_stats({})
     assert stats["corpus"] == "absent"
@@ -189,28 +188,24 @@ def test_export_and_clear_refuse_rather_than_create_one_to_act_on(nowhere):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_the_researcher_is_told_there_is_no_corpus(nowhere):
+def test_the_researcher_is_told_there_is_no_corpus(nowhere):
     """It used to be handed `[GraphRAG not indexed]` at score 0.0 -- a made-up
     retrieval hit sitting in the field real ones arrive in."""
     from langgraph_agent.mcp_client import MCPClient
 
     client = MCPClient()
-    await client.connect()
-    result = await client.call_tool("search_knowledge_graph", {"query": "the planner"})
+    result = client.call_tool("search_knowledge_graph", {"query": "the planner"})
 
     assert result["results"] == []
     assert result["source"] == "no_corpus"
     assert _touched(nowhere) == []
 
 
-@pytest.mark.asyncio
-async def test_a_graph_query_with_no_corpus_is_empty_not_stubbed(nowhere):
+def test_a_graph_query_with_no_corpus_is_empty_not_stubbed(nowhere):
     from langgraph_agent.mcp_client import MCPClient
 
     client = MCPClient()
-    await client.connect()
-    result = await client.call_tool("query_knowledge_graph", {"entity": "Planner"})
+    result = client.call_tool("query_knowledge_graph", {"entity": "Planner"})
 
     assert result["neighbors"] == []
     assert result["source"] == "no_corpus"
@@ -223,7 +218,7 @@ async def test_a_graph_query_with_no_corpus_is_empty_not_stubbed(nowhere):
 
 
 def _fake_index(calls, report=None):
-    """Stand in for `index_project_files`, recording the corpus it was given."""
+    """Stand in for `index_corpus_files`, recording the corpus it was given."""
     def index(kb, **kwargs):
         calls.append(kb)
         return dict(report or {"indexed": 2, "embedded": 2, "reused": 0,
@@ -244,9 +239,9 @@ def test_a_first_run_builds_the_corpus_it_is_about_to_search(nowhere, monkeypatc
     (nowhere / "notes.md").write_text("the planner interprets goals", encoding="utf-8")
     built = object()  # stands in for a corpus that did not exist a moment ago
     indexed = []
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", True)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
     monkeypatch.setattr(serve, "get_knowledge_base", lambda: built)
-    monkeypatch.setattr(serve, "index_project_files", _fake_index(indexed))
+    monkeypatch.setattr(serve, "index_corpus_files", _fake_index(indexed))
 
     result = serve.rpc_run_goal({"goal": "Do a thing"})
 
@@ -267,10 +262,10 @@ def test_an_emptied_corpus_is_rebuilt_too_not_only_a_missing_one(nowhere, monkey
     """
     (nowhere / "notes.md").write_text("x", encoding="utf-8")
     indexed = []
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", True)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
     monkeypatch.setattr(serve, "corpus_state", lambda: ("empty", "m"))
     monkeypatch.setattr(serve, "get_knowledge_base", lambda: object())
-    monkeypatch.setattr(serve, "index_project_files", _fake_index(indexed))
+    monkeypatch.setattr(serve, "index_corpus_files", _fake_index(indexed))
 
     result = serve.rpc_run_goal({"goal": "Do a thing"})
 
@@ -278,7 +273,7 @@ def test_an_emptied_corpus_is_rebuilt_too_not_only_a_missing_one(nowhere, monkey
     assert any("was empty" in message for message in result["messages"])
 
 
-def test_a_run_brings_a_corpus_that_is_behind_the_project_up_to_date(nowhere, monkeypatch):
+def test_a_run_brings_a_corpus_that_is_behind_the_archive_up_to_date(nowhere, monkeypatch):
     """Drift used to be the operator's job, and the failure is silent.
 
     A corpus that holds documents reports `indexed` with every counter
@@ -289,9 +284,9 @@ def test_a_run_brings_a_corpus_that_is_behind_the_project_up_to_date(nowhere, mo
     """
     (nowhere / "notes.md").write_text("x", encoding="utf-8")
     indexed = []
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", True)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
     monkeypatch.setattr(serve, "corpus_state", lambda: ("indexed", "m"))
-    monkeypatch.setattr(serve, "index_project_files", _fake_index(
+    monkeypatch.setattr(serve, "index_corpus_files", _fake_index(
         indexed, {"indexed": 9, "embedded": 2, "reused": 7, "dropped": 1,
                   "skipped": 0, "errors": []}))
 
@@ -299,7 +294,7 @@ def test_a_run_brings_a_corpus_that_is_behind_the_project_up_to_date(nowhere, mo
 
     assert len(indexed) == 1
     line = next(m for m in result["messages"] if m.startswith("[Corpus]"))
-    assert "2 document(s) re-read" in line and "1 no longer in the project" in line
+    assert "2 document(s) re-read" in line and "1 no longer in the archive" in line
 
 
 def test_a_rebuild_that_changed_nothing_still_says_so(nowhere, monkeypatch):
@@ -316,9 +311,9 @@ def test_a_rebuild_that_changed_nothing_still_says_so(nowhere, monkeypatch):
     """
     (nowhere / "notes.md").write_text("x", encoding="utf-8")
     indexed = []
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", True)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
     monkeypatch.setattr(serve, "corpus_state", lambda: ("indexed", "m"))
-    monkeypatch.setattr(serve, "index_project_files", _fake_index(
+    monkeypatch.setattr(serve, "index_corpus_files", _fake_index(
         indexed, {"indexed": 9, "embedded": 0, "reused": 9, "dropped": 0,
                   "skipped": 0, "errors": []}))
 
@@ -326,20 +321,20 @@ def test_a_rebuild_that_changed_nothing_still_says_so(nowhere, monkeypatch):
 
     assert len(indexed) == 1  # it still ran; it just had nothing to do
     line = next(m for m in result["messages"] if m.startswith("[Corpus]"))
-    assert "already matched the project" in line
+    assert "already matched the archive" in line
     assert "9 document(s)" in line
 
 
 def test_indexing_switched_off_is_the_one_state_that_says_nothing(nowhere, monkeypatch):
-    """`INDEX_PROJECT_BEFORE_RUN=0` is the operator's own machine-level choice,
+    """`REBUILD_CORPUS=0` is the operator's own machine-level choice,
     reported by the console header on every poll rather than by a run. It is
     also the one state where the phase genuinely did not run, so the line above
     would be false here -- nothing was checked and nothing matched."""
     (nowhere / "notes.md").write_text("x", encoding="utf-8")
     indexed = []
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", False)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", False)
     monkeypatch.setattr(serve, "corpus_state", lambda: ("indexed", "m"))
-    monkeypatch.setattr(serve, "index_project_files", _fake_index(indexed, {}))
+    monkeypatch.setattr(serve, "index_corpus_files", _fake_index(indexed, {}))
 
     result = serve.rpc_run_goal({"goal": "Do a thing"})
 
@@ -357,7 +352,7 @@ def test_the_corpus_is_built_before_the_online_phase_and_not_after(nowhere, monk
     """
     (nowhere / "notes.md").write_text("x", encoding="utf-8")
     order: list[str] = []
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", True)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
     monkeypatch.setattr(serve, "get_knowledge_base", lambda: object())
 
     def index(kb, **kwargs):
@@ -368,7 +363,7 @@ def test_the_corpus_is_built_before_the_online_phase_and_not_after(nowhere, monk
         order.append("web")
         return {"source": "duckduckgo", "documents": 0, "considered": 0}
 
-    monkeypatch.setattr(serve, "index_project_files", index)
+    monkeypatch.setattr(serve, "index_corpus_files", index)
     monkeypatch.setattr(serve, "research_online", research)
 
     serve.rpc_run_goal({"goal": "Do a thing", "research_web": True})
@@ -399,7 +394,7 @@ def test_a_run_leaves_no_corpus_behind_when_there_is_nothing_to_put_in_one(
     `rag_stats` would otherwise read `empty` from then on where the truth is
     `absent`, and only one of those two means "press Reindex".
     """
-    monkeypatch.setattr(serve, "INDEX_PROJECT_BEFORE_RUN", True)
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
 
     serve.rpc_run_goal({"goal": "Do a thing"})
 

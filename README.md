@@ -2,7 +2,7 @@
 
 **Architect · Planner · Researcher · Builder**
 
-A multi-agent system for software development experiments, powered by LangGraph + GraphRAG + MCP.
+A multi-agent system for software development experiments, powered by LangGraph and GraphRAG.
 
 Inference is **local by default**. Three of the four seats run a model the
 local Ollama daemon serves from its own weights; the Builder runs a different
@@ -23,10 +23,19 @@ python serve.py
 ```
 
 Five tabs: **Engineer** (give the Architect a goal, watch the stages),
-**Graph** (the knowledge graph as a force-directed map — press *Sweep all*),
-**Retrieval** (semantic search plus an RPC telemetry log), **Corpus**
+**Graph** (the knowledge graph as a force-directed map), **Retrieval**
+(semantic search plus a telemetry log of RPCs and healing events), **Corpus**
 (the indexed documents, and buttons to upload, export or clear them),
-and **State** (the raw `AgentState`).
+and **State** (self-healing status, then the raw `AgentState`).
+
+**The console heals what it can by itself.** A dead Ollama daemon or search
+backend opens a *circuit*: calls to it fail at once instead of each waiting it
+out, the header shows a red `… down` chip, and the first call after a short
+cooldown tests whether it is back (click the chip to test now). A seat call or
+an embed that meets a daemon mid-restart is retried briefly; a corpus rebuild
+the daemon interrupted is redone once it answers again. The State tab lists
+each service's health, every circuit, and the healing journal; a run's
+snapshot carries its own healing events.
 
 *Attach* — in the Engineer tab, beside Run — puts a document of your own into
 the corpus, and so does *Upload documents* on the Corpus tab; they are the same
@@ -67,7 +76,7 @@ whatever has changed in those three places and prune whatever has left them. A
 document whose text has not changed keeps the vectors it already has, so a
 rebuild with nothing to do costs well under a second and never loads the
 embedding model.
-Set `INDEX_PROJECT_BEFORE_RUN=0` for a machine that wants its corpus frozen.
+Set `REBUILD_CORPUS=0` for a machine that wants its corpus frozen.
 Indexing being the only act that creates the store is why the header keeps
 three states apart: *absent* (nobody has indexed here),
 *empty* (a corpus that exists and holds nothing — what *Clear corpus* leaves),
@@ -156,8 +165,8 @@ Later cycles route as the Planner asks.
 |---|---|---|---|
 | **Architect** | Sets direction and constraints; rules `approved` / `revise` / `need_research` | Dolphin 2.9.1 9B (ollama, local) | None (reasoning only) |
 | **Planner** | Turns goals into structured plans, routes next | Dolphin 2.9.1 9B (ollama, local) | None (reasoning only) |
-| **Researcher** | Gathers deep, relationship-aware knowledge | Dolphin 2.9.1 9B (ollama, local) | GraphRAG MCP only |
-| **Builder** | Implements the plan (writes code, edits files) | `qwen3.8:latest` (ollama, local) | Filesystem, Git, Terminal |
+| **Researcher** | Gathers deep, relationship-aware knowledge | Dolphin 2.9.1 9B (ollama, local) | GraphRAG search (read-only) |
+| **Builder** | Implements the plan (writes code, edits files) | `qwen3.8:latest` (ollama, local) | Filesystem, Git, Terminal, Tests |
 
 Every seat is reassignable live from its dropdown in the console, which lists
 exactly what `ollama ls` reports (embedders excluded), so a tag you pull appears
@@ -165,13 +174,14 @@ on the next poll; selections last for the life of the process. `qwen3-embedding:
 is the embedder's, not a seat's: it cannot chat. Only `qwen3.8:latest`
 reports `tools`, which is why it -- not either dolphin -- holds the Builder.
 
-### The Three Technologies
+### Building blocks
 
-| Technology   | Role                                                |
-|--------------|-----------------------------------------------------|
-| **LangGraph** | Orchestration: control flow, shared state, loops   |
-| **GraphRAG**  | Intelligent retrieval using knowledge graph        |
-| **MCP**       | Universal connector for tools and data sources     |
+| Part | Role |
+|---|---|
+| **LangGraph** | Orchestration: control flow, shared state, loops |
+| **GraphRAG** | Retrieval: hybrid search over a chunked corpus, beside an entity graph |
+| **Tool belts** | Each seat's tools, served in-process under MCP-style names |
+| **Self-healing** | Retries, circuit breakers and a healing journal around every external call |
 
 ## Installation
 
@@ -354,58 +364,35 @@ OPENAI_MODEL=gpt-4o-mini
 ### Basic Example
 
 ```python
-from langgraph_agent import AgentState, create_agent_graph
+from langgraph_agent import create_agent_graph, initial_state
+from langgraph_agent.graph import RECURSION_LIMIT
 
 graph = create_agent_graph()
-
-state: AgentState = {
-    "goal": "Create a hello.txt file containing 'Hello World'",
-    "messages": [],
-    "plan": "",
-    "research": "",
-    "builder_report": "",
-    "next_agent": "Researcher",
-    "research_status": "",
-    "blockers": "",
-    "files_changed": [],
-    "step_count": 0,
-}
-
-result = graph.invoke(state)
+result = graph.invoke(
+    initial_state("Create a hello.txt file containing 'Hello World'"),
+    {"recursion_limit": RECURSION_LIMIT},
+)
 print(result["plan"])
 print(result["builder_report"])
 ```
 
-### With Anthropic
+`initial_state(goal, expect_failures=..., discuss_only=..., output_dir=...)`
+takes the three per-run flags the console offers; `output_dir="projects/<name>"`
+confines the Builder's writes to a generated project.
 
-```python
-import os
+### On a cloud provider
 
-os.environ["ANTHROPIC_API_KEY"] = "sk-ant-..."
-os.environ["ANTHROPIC_MODEL"] = "claude-3-5-sonnet-20241022"
-
-result = graph.invoke(state)
-```
-
-### With OpenAI
-
-```python
-import os
-
-os.environ["OPENAI_API_KEY"] = "sk-..."
-os.environ["OPENAI_MODEL"] = "gpt-4o-mini"
-
-result = graph.invoke(state)
-```
+Every seat defaults to a local model, so a key alone moves nothing. Point a seat
+at a provider in `.env` -- `ARCHITECT_PROVIDER=anthropic`, optionally
+`ARCHITECT_MODEL=...` -- or from its dropdown in the console.
+`python scripts/cloud_smoke.py` runs one goal with every seat moved onto
+whichever of `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` is set.
 
 ## Running Tests
 
 ```bash
-# With stub LLM (fast, no API key needed)
+# With the stub LLM: fast, offline, no daemon or key needed
 python -m pytest tests/ -v
-
-# With test coverage
-pytest --cov=langgraph_agent tests/
 ```
 
 ## Diagnosing the seats
@@ -464,30 +451,18 @@ point against non-deterministic models, not a ranking.
 
 ## Development Tools
 
+The same checks CI runs:
+
 ```bash
-# Linting
-ruff check src/ tests/
-
-# Auto-fix linting issues
-ruff check --fix src/ tests/
-
-# Formatting
-ruff format src/ tests/
-
-# Type checking
-mypy src/langgraph_agent/
-
-# Test coverage
-pytest --cov=langgraph_agent tests/
+ruff check src/ tests/ serve.py scripts/ spectral_graph/ example_usage.py ollama_client.py
+mypy src/langgraph_agent/ serve.py ollama_client.py spectral_graph/
+python -m pytest tests/ -v
 ```
 
 ## Example
 
 ```bash
-# Run with stub LLM (no API key needed)
-python example_usage.py
-
-# Run with Anthropic (ensure ANTHROPIC_API_KEY is set)
+# Two goals on the default local seats, written into projects/example/
 python example_usage.py
 ```
 
@@ -507,13 +482,22 @@ Per the 4-Agent System specification:
 | `next_agent`       | Planner     | Which agent runs next                          |
 | `research_status`  | Researcher  | `ready_for_builder` \| `need_replan` \| `no_relevant_knowledge` |
 | `blockers`         | Builder     | What's blocking progress                       |
-| `files_changed`    | Builder     | List of modified file paths                    |
-| `step_count`       | Architect   | Cycles through the gate (loop limit, max 8)    |
+| `files_changed`    | Builder     | Files a write tool reported writing            |
+| `failed_verification` | Builder  | Written files that failed to run, or were never run |
+| `unverified`       | Builder     | The part of `failed_verification` nobody ran   |
+| `builder_cut_off`  | Builder     | `turn_cap` \| `deadline` when a pass ended early |
+| `lint_failed`      | Builder     | Written Python files that still fail `ruff check` |
+| `expect_failures`  | Caller      | A file that runs and fails stops blocking approval |
+| `discuss_only`     | Caller      | No tools at all; the run proposes and changes nothing |
+| `output_dir`       | Caller      | `projects/<name>`, the one directory the Builder may write |
+| `step_count`       | Architect   | Cycles through the gate (`MAX_STEPS` is the ceiling) |
 
-## MCP Integration
+`initial_state()` builds the starting state; see `AgentState` in `state.py`.
 
-The `mcp_client.py` module exposes the documented agent tool belts through a
-unified MCP-style interface:
+## Tool belts
+
+`mcp_client.py` serves every tool in-process under an MCP-style name, each
+taking a dict of arguments and returning a JSON-serialisable dict:
 
 | Tool | Agent | Purpose |
 |------|-------|---------|
@@ -535,37 +519,24 @@ the documented specialization:
 - Researcher → GraphRAG read-only tools only
 - Builder → filesystem / git / terminal / test tools only
 
-To switch from the bundled tool implementations to external MCP servers,
-update `MCPClient._discover_tools()` to connect over stdio or HTTP and route each
-tool name to the external server.
+None of them is retried except a `git push` that never reached the remote: every
+other tool has effects, and running one twice is not a recovery.
 
 ## Project Structure
 
 ```
-├── pyproject.toml              # Dependencies
-├── src/langgraph_agent/
-│   ├── __init__.py
-│   ├── state.py                # AgentState, ResearchStatus
-│   ├── config.py               # LLM setup (Anthropic primary, OpenAI optional)
-│   ├── nodes.py                # Architect, Planner, Researcher, Builder
-│   ├── graph.py                # StateGraph wiring
-│   ├── graphrag_server.py      # GraphRAG MCP server
-│   └── mcp_client.py           # MCP client / tool bindings
-├── prompts/
-│   ├── planner.txt             # Planner system prompt
-│   ├── researcher.txt          # Researcher system prompt
-│   └── builder.txt             # Builder system prompt
-├── tests/
-│   └── test_graph.py           # Graph tests
-├── scripts/
-│   └── diagnose_seats.py       # Which model works in which seat
-├── example_usage.py            # Demo script
-├── test_cloud.py               # Cloud LLM end-to-end test
-├── README.md
-├── .env.example                # Environment variables template
-├── ruff.toml                   # Linter config
-└── mypy.ini                    # Type checker config
+├── src/langgraph_agent/   # the package: graph, nodes, seats, GraphRAG, tools, self_healing
+├── prompts/               # one system prompt per seat
+├── frontend/              # the web console
+├── spectral_graph/        # spectral graph theory behind the corpus diagnostics
+├── scripts/               # the seat diagnostic, the cloud smoke run, benchmarks
+├── tests/                 # the suite; runs offline on the stub LLM
+├── serve.py               # the console's server and its self-healing monitor
+├── install.sh             # Arch / Omarchy: everything, from nothing to a running console
+└── example_usage.py       # two goals through the loop
 ```
+
+CLAUDE.md carries the full tree, file by file.
 
 ## Hardware Requirements
 
@@ -580,11 +551,5 @@ weights locally at all.
 
 ## Next Steps
 
-1. **Configure cloud LLM** — Set `ANTHROPIC_API_KEY` in `.env`
-2. **MCP Servers** — Connect to actual GraphRAG and filesystem MCP servers
-3. **Human-in-the-loop** — Add approval gates before Builder executes
-4. **Persistence** — Add checkpointing for long-running agents
-
-## Documentation
-
-Based on the [3-Agent System Full Guide](../Downloads/3-Agent-System-Full-Consolidated-Guide.md).
+1. **Human-in-the-loop** — Add approval gates before the Builder executes
+2. **Persistence** — Add LangGraph checkpointing for long-running agents

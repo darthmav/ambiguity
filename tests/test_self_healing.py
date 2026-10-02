@@ -1,14 +1,20 @@
 """Tests for the self_healing package: logger, retry, and circuit breaker."""
 
+import threading
 import time
 
 import pybreaker
 import pytest
 
 from langgraph_agent.self_healing import (
+    Circuit,
+    CircuitOpenError,
     SelfHealingLogger,
+    call_with_retry,
     circuit_breaker,
+    circuit_states,
     get_healing_logger,
+    reset_circuit,
     retry_with_backoff,
     self_healing_wrapper,
 )
@@ -174,3 +180,164 @@ def test_each_logger_name_gets_its_own_logger():
     assert first is not second
     assert second.logger.name == "healing_b"
     assert get_healing_logger("healing_a") is first
+
+
+# ---------------------------------------------------------------------------
+# The policy decides what is retried, and when to stop
+# ---------------------------------------------------------------------------
+
+
+def test_only_what_the_policy_calls_transient_is_retried():
+    calls = [0]
+
+    def refused() -> str:
+        calls[0] += 1
+        raise ValueError("a refusal, not an outage")
+
+    with pytest.raises(ValueError):
+        call_with_retry(refused, max_attempts=5, min_wait=0, max_wait=0,
+                        retry_if=lambda exc: isinstance(exc, ConnectionError))
+    assert calls[0] == 1
+
+
+def test_give_up_ends_the_wait_and_raises_the_last_failure(caplog):
+    calls = [0]
+    stop = threading.Event()
+
+    def failing() -> str:
+        calls[0] += 1
+        stop.set()  # asked to stop while the first wait is under way
+        raise ConnectionError(f"down {calls[0]}")
+
+    started = time.monotonic()
+    with caplog.at_level("WARNING", logger=get_healing_logger().logger.name):
+        with pytest.raises(ConnectionError, match="down 1"):
+            call_with_retry(failing, max_attempts=5, min_wait=30, max_wait=30,
+                            give_up=stop.is_set, name="gives_up")
+    assert time.monotonic() - started < 5
+    assert calls[0] == 1
+    assert any("Gave up retrying 'gives_up'" in r.getMessage() for r in caplog.records)
+
+
+def test_a_refused_circuit_is_never_retried():
+    calls = [0]
+
+    def refused() -> str:
+        calls[0] += 1
+        raise CircuitOpenError("svc", 10)
+
+    with pytest.raises(CircuitOpenError):
+        call_with_retry(refused, max_attempts=5, min_wait=0, max_wait=0)
+    assert calls[0] == 1
+
+
+# ---------------------------------------------------------------------------
+# Circuits: what counts, what opens, what closes
+# ---------------------------------------------------------------------------
+
+
+def _state(name: str) -> dict:
+    return next(c for c in circuit_states() if c["name"] == name)
+
+
+def test_only_failures_the_circuit_trips_on_count_toward_it():
+    circuit = Circuit("trips_on_connection", failure_threshold=2, recovery_timeout=60,
+                      trips_on=lambda exc: isinstance(exc, ConnectionError))
+
+    def refusal() -> None:
+        raise ValueError("the service answered: no")
+
+    for _ in range(5):
+        with pytest.raises(ValueError):
+            circuit.call(refusal)
+    assert _state("trips_on_connection")["state"] == "closed"
+
+    def outage() -> None:
+        raise ConnectionError("unreachable")
+
+    for _ in range(2):
+        with pytest.raises(ConnectionError):
+            circuit.call(outage)
+    assert circuit.is_open
+
+    called = []
+    with pytest.raises(CircuitOpenError, match="trips_on_connection is unavailable") as refused:
+        circuit.call(lambda: called.append(1))
+    assert called == []
+    assert refused.value.circuit == "trips_on_connection"
+    assert 0 < _state("trips_on_connection")["retry_in_s"] <= 60
+
+
+def test_expected_exception_is_what_the_circuit_counts():
+    """It was accepted and ignored: every exception tripped the breaker."""
+    calls = [0]
+
+    @circuit_breaker(failure_threshold=2, recovery_timeout=60,
+                     expected_exception=ConnectionError, name="expects_connection")
+    def service() -> None:
+        calls[0] += 1
+        raise ValueError("not an outage")
+
+    for _ in range(4):
+        with pytest.raises(ValueError):
+            service()
+    assert calls[0] == 4
+    assert _state("expects_connection")["state"] == "closed"
+
+
+def test_an_open_circuit_closes_through_its_trial_call(caplog):
+    circuit = Circuit("recovers_on_trial", failure_threshold=1, recovery_timeout=0.2)
+    with caplog.at_level("INFO", logger=get_healing_logger().logger.name):
+        with pytest.raises(ConnectionError):
+            circuit.call(lambda: (_ for _ in ()).throw(ConnectionError("down")))
+        assert circuit.is_open
+        time.sleep(0.3)
+        assert circuit.call(lambda: "up") == "up"
+    assert _state("recovers_on_trial")["state"] == "closed"
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("OPENED for 'recovers_on_trial'" in m for m in messages)
+    assert any("CLOSED for 'recovers_on_trial'" in m for m in messages)
+
+
+def test_trip_opens_a_circuit_at_once_and_reset_closes_it():
+    circuit = Circuit("tripped_by_hand", failure_threshold=5, recovery_timeout=60)
+    circuit.trip("a bot check answered instead of results")
+    assert circuit.is_open
+
+    assert reset_circuit("tripped_by_hand") == ["tripped_by_hand"]
+    assert not circuit.is_open
+    with pytest.raises(KeyError):
+        reset_circuit("no_such_circuit")
+
+
+def test_one_name_is_one_circuit_whoever_calls_it():
+    first = Circuit("shared_service", failure_threshold=2, recovery_timeout=60)
+    second = Circuit("shared_service", failure_threshold=99, recovery_timeout=1)
+
+    for circuit in (first, second):
+        with pytest.raises(ConnectionError):
+            circuit.call(lambda: (_ for _ in ()).throw(ConnectionError("down")))
+    assert first.is_open and second.is_open
+    assert _state("shared_service")["threshold"] == 2
+
+
+# ---------------------------------------------------------------------------
+# The journal
+# ---------------------------------------------------------------------------
+
+
+def test_the_journal_tags_a_session_and_reads_from_a_sequence_number():
+    logger = SelfHealingLogger(name="journal_test")
+    logger.info("before any session")
+    mark = logger.events()[-1]["seq"]
+
+    logger.start_healing_session("run-1")
+    logger.log_health_check("ollama-daemon", "unhealthy", "refused")
+    logger.end_healing_session()
+    logger.info("after the session")
+
+    later = logger.events(since=mark)
+    assert [e["message"] for e in later][-1] == "after the session"
+    session = logger.events(session_id="run-1")
+    assert any(e.get("action") == "health_check" and e["level"] == "WARNING" for e in session)
+    assert all(e["session_id"] == "run-1" for e in session)

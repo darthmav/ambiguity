@@ -6,8 +6,8 @@ This is **langgraph-agent**, a local-first 4-Agent AI system for software develo
 
 - **Architect** — the leading authority. Sets architectural direction before planning, then holds the approval gate: the run ends on its `approved` verdict, not the Builder's say-so. No tools.
 - **Planner** — interprets goals, creates structured plans, routes to next agent.
-- **Researcher** — gathers context via the GraphRAG MCP tool (`search_knowledge_graph`).
-- **Builder** — implements plans using filesystem, git, terminal, and test MCP tools.
+- **Researcher** — gathers context through the GraphRAG search tool (`search_knowledge_graph`).
+- **Builder** — implements plans using filesystem, git, terminal, and test tools.
 
 Inference defaults to local: every seat runs a model the Ollama daemon on this
 machine serves from its own weights, so a fresh checkout needs no API key and
@@ -17,7 +17,7 @@ runs locally through the same daemon, serving `qwen3-embedding:latest` -- the
 daemon owns every model's placement, so nothing in this project touches torch
 or a card itself. The embedding belongs to GraphRAG, not to a seat.
 
-Tech stack: Python 3.12+, LangGraph, Chroma + NetworkX, MCP (local stdio-compatible tool binding).
+Tech stack: Python 3.12+, LangGraph, Chroma + NetworkX, tools served in-process under MCP-style names.
 
 ## Quick Reference
 
@@ -31,8 +31,8 @@ Tech stack: Python 3.12+, LangGraph, Chroma + NetworkX, MCP (local stdio-compati
 pip install -e ".[dev]"
 
 # Run all checks
-ruff check src/ tests/ serve.py scripts/ example_usage.py test_cloud.py ollama_client.py
-mypy src/langgraph_agent/ serve.py ollama_client.py
+ruff check src/ tests/ serve.py scripts/ spectral_graph/ example_usage.py ollama_client.py
+mypy src/langgraph_agent/ serve.py ollama_client.py spectral_graph/
 python -m pytest tests/ -v
 
 # Start the web console
@@ -53,34 +53,31 @@ python example_usage.py
 
 ```
 ├── src/langgraph_agent/
-│   ├── __init__.py            # create_agent_graph, AgentState, ResearchStatus, Verdict
-│   ├── state.py               # AgentState schema + ResearchStatus / Verdict enums
-│   ├── config.py              # Seats, LLM setup (Anthropic + Ollama Cloud) + StubLLM
+│   ├── __init__.py            # create_agent_graph, initial_state, AgentState, ResearchStatus, Verdict
+│   ├── state.py               # AgentState schema, initial_state() + ResearchStatus / Verdict enums
+│   ├── config.py              # Seats and model tags, LLM setup, the daemon's circuit + StubLLM
 │   ├── nodes.py               # Architect, Planner, Researcher, Builder nodes + prompt loading
 │   ├── graph.py               # StateGraph wiring + conditional edges
-│   ├── control.py             # RUN_CONTROL: the emergency stop signal
-│   ├── graphrag_server.py     # GraphRAG MCP server (knowledge graph + vector store)
+│   ├── control.py             # RUN_CONTROL (the emergency stop), GPU_ARBITER, activity meters
+│   ├── graphrag_server.py     # GraphRAG knowledge base: entity graph + chunked vector store
 │   ├── embedding_calibration.json # Floor questions for a new embedding model (JSON: never indexed)
-│   ├── mcp_client.py          # MCP client / local tool bindings
+│   ├── mcp_client.py          # The agents' tool belts, served in-process
 │   ├── lexical.py             # BM25 + rank fusion: the lexical half of search
 │   ├── web_research.py        # Online research: keyless search, our own selection gate
 │   ├── html_text.py           # HTML → text by link density. No library, no dependency
-│   ├── corpus_health.py       # Is the corpus still the project? missing / extra / oversized
+│   ├── corpus_health.py       # Is the corpus still the archive? missing / extra / oversized
 │   ├── corpus_spectral.py     # connectivity / topics / bottleneck / duplicate_entities (mixin)
 │   ├── projects.py            # Generated projects: where a run writes, and opting one into the corpus
-│   ├── exceptions.py          # Public error surface (re-exports _internal/)
-│   ├── self_healing/          # Opt-in retry / circuit-breaker decorators (see note below)
-│   │   ├── logger.py          # SelfHealingLogger: structured, severity-leveled healing log
-│   │   └── decorators.py      # retry_with_backoff, circuit_breaker, self_healing_wrapper
-│   └── _internal/
-│       └── exceptions.py      # LangGraphAgentError and its five subclasses
+│   └── self_healing/          # Retries, circuit breakers and the healing journal (see Self-healing)
+│       ├── logger.py          # SelfHealingLogger: severity-levelled healing log + event journal
+│       └── decorators.py      # call_with_retry, Circuit, retry_with_backoff, circuit_breaker
 ├── prompts/
 │   ├── architect.txt          # System prompt (loaded by nodes.py)
 │   ├── planner.txt
 │   ├── researcher.txt
 │   └── builder.txt
 ├── tests/
-│   ├── conftest.py            # Forces StubLLM; switches the web phase off
+│   ├── conftest.py            # Forces StubLLM; switches the web phase off; closes every circuit
 │   ├── test_git_dwell.py      # The ordered git pipeline, and its two refusals
 │   ├── test_claims.py         # Documentation claims, made executable
 │   ├── test_corpus_absent.py  # The two doors: reading never creates a corpus
@@ -93,9 +90,10 @@ python example_usage.py
 │   ├── test_corpus_admin.py   # Corpus clear / export / reindex guards
 │   ├── test_embedding_device.py # The one embedder, and the light that says when it is working
 │   ├── test_mcp_tools.py      # Builder tool belt
-│   ├── test_imports.py        # Pins the package's public surface
+│   ├── test_imports.py        # Pins the package's public surface, and initial_state
 │   ├── test_lexical.py        # BM25, rank fusion, the relevance floor
-│   ├── test_self_healing.py   # self_healing: logger, retry, circuit breaker
+│   ├── test_self_healing.py   # self_healing: journal, retry policy, circuits
+│   ├── test_healing_integration.py # Self-healing at every seam the application uses it
 │   ├── test_uploads.py        # Uploading a document into the corpus
 │   ├── test_web_research.py   # Fan-out, the selection gate, storage, the empty answers
 │   ├── test_html_text.py      # The from-scratch HTML reader
@@ -108,28 +106,24 @@ python example_usage.py
 │   ├── test_research_length.py # How much retrieved evidence reaches the Builder
 │   ├── test_rpc_params.py     # RPC parameters: typed, bounded, refused by name
 │   ├── test_projects.py       # Generated projects: the held-out walk, the write scope, embedding
-│   └── test_spectral_graph.py # The spectral_graph package
+│   └── test_spectral_graph.py # The spectral_graph package, against closed-form spectra
 ├── scripts/
-│   ├── verify_and_test.py     # Manual verification runner
-│   ├── auto_verify.py         # Silent verification
-│   ├── quick_test.sh          # Bash quick check
-│   ├── full_setup.py          # Automated setup + verification
+│   ├── verify_and_test.py     # Manual verification: dependencies, seats, a search, the suite
+│   ├── cloud_smoke.py         # One run with every seat on Anthropic or OpenAI
 │   ├── spectral_benchmark.py  # Graph-architecture sweep behind the A-numbers
 │   └── diagnose_seats.py      # Role probes + team runs per seating
 ├── frontend/
 │   ├── index.html             # Web console SPA
 │   └── README.md
 ├── .github/workflows/
-│   └── ci.yml                 # ruff, mypy, pytest, root scripts, on every push
-├── spectral_graph/            # the A1-A5 spectral code: at the root, outside the installed package
+│   └── ci.yml                 # ruff, mypy, pytest, on every push
+├── spectral_graph/            # the spectral code: at the root, outside the installed package
 │   ├── laplacian.py           # Laplacian matrix constructions
-│   ├── spectrum.py            # eigenvalues, eigenpairs, algebraic connectivity
-│   ├── fiedler.py             # the Fiedler vector and spectral bipartitioning
+│   ├── spectrum.py            # Laplacian eigenvalues, dense or shift-inverted
+│   ├── fiedler.py             # the Fiedler vector
 │   ├── clustering.py          # spectral clustering, conductance, the Cheeger bounds
-│   ├── embedding.py           # spectral embedding via Laplacian eigenvectors
-│   ├── operations.py          # spectral graph arithmetic
-│   └── stability.py           # numerical stability utilities
-├── experimental/              # an agent run's own notes; out of the corpus (PROJECT_INDEX_EXCLUDES)
+│   └── embedding.py           # spectral embedding via Laplacian eigenvectors
+├── experimental/              # an agent run's own notes; never in the corpus
 ├── docker/
 │   └── entrypoint.sh          # the container's start: git identity, and what it can reach
 ├── dockerfile                 # the console as an Arch image; the daemon stays on the host
@@ -138,15 +132,9 @@ python example_usage.py
 ├── install.sh                 # Arch / Omarchy: everything, from nothing to a running console
 ├── cuda-embed-ollama.sh       # NVIDIA cards below compute 7.5: Ollama's CUDA 12 build, model 100% on the GPU
 ├── launch_console.sh          # starts serve.py and waits on /api/status before opening a browser
-├── serve.py                   # Python HTTP server + API backend
+├── serve.py                   # Python HTTP server + API backend + the self-healing monitor
 ├── example_usage.py           # Demo script
-├── test_cloud.py              # Cloud LLM end-to-end test
 ├── ollama_client.py           # one prompt to the local daemon, bounded by the project's own timeout
-├── test_spectral_graph.py     # imports every spectral_graph module; run from the root by CI
-├── verify_spectrum.py         # spectral_graph.spectrum, run from the root by CI
-├── verify_fiedler.py          # spectral_graph.fiedler, run from the root by CI
-├── verify_clustering.py       # spectral_graph.clustering, run from the root by CI
-├── verify_embedding.py        # spectral_graph.embedding, run from the root by CI
 ├── README.md                  # User-facing documentation
 └── .env.example               # Environment variables template
 ```
@@ -156,7 +144,9 @@ python example_usage.py
 - **Python formatting/linting:** `ruff` configured in `ruff.toml`.
 - **Type checking:** `mypy` configured in `mypy.ini`.
 - **Tests:** `pytest` in `tests/`.
-- **Default seats** (`DEFAULT_SEATS` in `config.py`):
+- **Default seats** (`DEFAULT_SEATS` in `config.py`, derived from
+  `_DEFAULT_AGENT_MODELS` for `DEFAULT_PROVIDER`; every model tag is a named
+  constant there, spelled once):
 
   | Seat | Provider | Model |
   |---|---|---|
@@ -177,11 +167,8 @@ python example_usage.py
   Researcher's node calls GraphRAG read-only tools only, and its seat is handed
   what they returned rather than the tools; the Builder gets filesystem, git,
   terminal and test tools only. Keep GraphRAG out of `BUILDER_TOOLS`.
-- **`self_healing` is a standalone utility, not wired into any node.** Reach
-  for its `retry_with_backoff` / `circuit_breaker` decorators at a *new*
-  integration point, never retrofitted onto the seat or MCP call paths, which
-  have a resilience design of their own (the deadlines below, and the rule that
-  work under a deadline never writes to state).
+- **A run starts from `initial_state(goal, ...)`** (`state.py`); never write the
+  state literal out by hand.
 
 ## State Schema
 
@@ -228,8 +215,8 @@ agent: see the `extend-agent` skill.
 ### The console API
 One `POST /rpc` taking `{method, params}` and returning `{result, elapsed_ms}`
 or `{error: {message}, elapsed_ms}`; methods live in `RPC_METHODS` in
-`serve.py`, and the `/api/*` routes are compatibility wrappers over the same
-functions (`launch_console.sh` polls `/api/status`, so it must keep working).
+`serve.py`. `GET /api/status` is the one other route: `launch_console.sh`, the
+container's health check and the console driver poll it.
 Parameters are typed, bounded and refused by name (`_int_param`, `_float_param`,
 `_bool_param`, `_str_param`), parsed before anything is touched.
 `run_goal` blocks its own thread for the whole run -- hence
@@ -302,7 +289,7 @@ a Builder that runs programs. No CORS header is sent; the page is same-origin.
   `get_knowledge_base()` creates and is reserved for indexing;
   `open_knowledge_base()` returns `None` and is what every read goes through.
   The corpus is rebuilt when the console starts and again before every run
-  (`INDEX_PROJECT_BEFORE_RUN=0` switches off both), `_claim_the_rebuild` holds
+  (`REBUILD_CORPUS=0` switches off both), `_claim_the_rebuild` holds
   an `flock` beside the store so two consoles cannot interleave rebuilds, and a
   reindex rebuilds rather than accumulates while keeping the vectors of
   unchanged documents.
@@ -311,8 +298,8 @@ a Builder that runs programs. No CORS header is sent; the page is same-origin.
   takes nothing away. `clear()` empties Chroma first, then the graph, then the
   floor record, and must reach disk.
 - **An uploaded document is a file first**: `store_uploaded_document` writes
-  under `uploads/` and only then embeds, so `uploads/` must stay *out* of
-  `PROJECT_INDEX_EXCLUDES` or the next rebuild deletes the upload silently.
+  under `uploads/` and only then embeds, so `uploads/` must stay one of
+  `CORPUS_ROOTS` or the next rebuild deletes the upload silently.
 - Fetched pages under `research/web/` and `ENTITY_FREE_SUFFIXES` files are
   retrievable but mint no entities, decided from the path so a reindex cannot
   reverse it. `connectivity()` reports them apart from real isolates.
@@ -320,16 +307,18 @@ a Builder that runs programs. No CORS header is sent; the page is same-origin.
   position-free-capital count when the vocabulary moves -- in either direction,
   since deleting files moves it too -- and the pinned top-twenty in
   `test_claims.py` is what tells you it has.
-- `PROJECT_INDEX_EXCLUDES` entries are matched as plain substrings, not globs.
+- `CORPUS_SKIP_DIRS` are pruned by whole directory name under a corpus root, so
+  an opted-in project's own `src/` and `tests/` are indexed and `rebuild/` is
+  not `build/`.
 - **The corpus is researched archive data, never the checkout.** The walk reads
   `CORPUS_ROOTS` alone -- `research/web/`, `uploads/`, and `projects/<name>`
   once opted in -- so a fresh install has no corpus, and anything else in the
   store is pruned by the next rebuild. An operator who wants a checkout file
   searchable uploads it. The entity census in `test_claims.py` walks the
   checkout explicitly (`roots=("",)`): it audits the extractor, not the corpus.
-- **There is exactly one embedding model** (`EMBEDDING_MODEL_NAME`), a corpus
-  belongs to it, and `set_embedding_model` refuses: vectors from two models
-  share no space. The chunker cuts with that model's own tokenizer.
+- **There is exactly one embedding model** (`EMBEDDING_MODEL_NAME`), and a
+  corpus belongs to it: vectors from two models share no space. The chunker cuts
+  with that model's own tokenizer.
 - **Placement is the daemon's, and only one model is on the cards.**
   `OLLAMA_EMBED_OPTIONS` and `OLLAMA_SEAT_GPU_OPTIONS` force every layer onto
   the GPU, `GPU_ARBITER` (`control.py`) serializes the embedder against the
@@ -364,15 +353,52 @@ a Builder that runs programs. No CORS header is sent; the page is same-origin.
   shares nothing with it), and `docker stop`
   asks for the same exit the console's X does.
 
+## Self-healing
+
+`self_healing` wraps calls rather than living inside them: `call_with_retry`
+retries what its policy calls transient, a named `Circuit` stops calling a
+service that keeps failing until one trial call after its cooldown succeeds,
+and every action lands in the healing journal (`get_healing_logger()`), which
+the console reads and a run's snapshot carries (each run is one healing
+session). Where it is used:
+
+- **The Ollama daemon is one circuit, `OLLAMA_DAEMON`** (`config.py`): seats,
+  the embedder and every status read go through it (`daemon_request`), and only
+  an unreachable daemon trips it (`daemon_unreachable`) -- an HTTP error is the
+  daemon answering. `retry_unreachable` retries a daemon call briefly, since an
+  unreachable daemon ran nothing; the emergency stop ends the wait.
+- **The embedder** retries a failed model load (5xx) on its own longer
+  schedule; a rebuild that meets an open circuit ends as `unavailable` instead
+  of failing document by document.
+- **Cloud seats** get one circuit per provider (`PROVIDER_CIRCUITS`), opened by
+  outages (`provider_unavailable`), never by a 4xx. Their SDKs retry requests
+  themselves, so nothing retries on top.
+- **The GPU fallback** -- a forced load that did not fit, rebuilt unforced -- is
+  journalled as a recovery action.
+- **Online research**: one circuit per search backend; a DuckDuckGo bot check
+  trips it at once. Searches and page fetches retry only failures a second try
+  can fix (refused, dropped, 502-504), never a timeout.
+- **`git_dwell`'s push** is retried when it never reached the remote; nothing
+  else a Builder tool does is ever retried, since every other tool has effects.
+- **The monitor** (`_self_healing_monitor` in `serve.py`) checks the daemon,
+  SearxNG and the corpus every `HEALTH_CHECK_SECONDS`, logs each change of
+  health, re-probes open circuits, and rebuilds a corpus whose last rebuild
+  stopped because the embedder could not be reached. The console shows an open
+  circuit in the header (click it to let the next call through now) and the
+  journal in the telemetry feed and the State tab.
+
+Retrying never extends a deadline's guarantee: work under `_with_deadline`
+still never writes to state, and a retry inside an abandoned seat call ends on
+its own within seconds.
+
 ## Documentation claims are tests
 
 `tests/test_claims.py` exists because prose goes stale silently: **a claim
 worth writing down is a claim worth failing a build over.** Most of its guards
 *recompute* the claim from the repository -- every cited path resolves, the
 Project Structure tree matches disk in both directions, the seat table matches
-`DEFAULT_SEATS`, the documented Python floor matches `pyproject.toml`, no
-walked file exceeds `MAX_INDEXABLE_BYTES` (and none passes
-`INDEXABLE_WARN_RATIO` of it), and CI runs the same commands the Quick
+`DEFAULT_SEATS`, the documented Python floor matches `pyproject.toml`, a bare
+`pytest` collects `tests/` alone, and CI runs the same commands the Quick
 Reference does.
 
 Two are different. A figure quoted in prose is checked against its constant
@@ -388,7 +414,7 @@ every checkout has, so `uploads/`, `projects/` and fetched pages are out.
   header reads `no corpus` when none has been built. One is built when the
   console starts and again before the Architect opens, from the directory the
   server was started in, so the usual causes are a server started somewhere
-  with nothing to index, or `INDEX_PROJECT_BEFORE_RUN=0`.
+  with nothing to index, or `REBUILD_CORPUS=0`.
 - **No LLM output / canned text** -- A seat pointed at Anthropic or OpenAI needs
   that provider's key in `.env`; without one it runs `StubLLM` and the console
   shows a `NO KEY` chip. Ollama seats need the daemon running and signed in
@@ -406,6 +432,11 @@ every checkout has, so `uploads/`, `projects/` and fetched pages are out.
 - **The header reads `stale: N not indexed` right after startup** -- Read the
   `[Corpus]` line in `/tmp/ambiguity-console.log`: it names each file that
   failed and why, usually a model load short of GPU memory.
+- **The header shows `ollama-daemon down`** -- the daemon stopped answering and
+  its circuit opened, so calls fail at once instead of each waiting it out.
+  It closes by itself once the daemon answers a trial call; clicking the chip
+  lets the next call through now. A rebuild it interrupted is redone by the
+  monitor once the daemon is back.
 - **Online research finds nothing, or reports DuckDuckGo's bot check** -- Check
   `SEARXNG_URL` is in `.env` and the instance answers; an HTTP 403 means `json`
   is missing from its `search.formats`.

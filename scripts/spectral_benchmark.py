@@ -43,7 +43,7 @@ from scipy.sparse.linalg import ArpackNoConvergence, eigsh
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from spectral_graph import (  # noqa: E402
+from spectral_graph import (
     cheeger_bounds,
     compute_spectrum,
     conductance,
@@ -51,7 +51,7 @@ from spectral_graph import (  # noqa: E402
     spectral_clustering,
     sweep_cut,
 )
-from spectral_graph.laplacian import laplacian_matrix  # noqa: E402
+from spectral_graph.laplacian import laplacian_matrix
 
 SEED = 20260902
 

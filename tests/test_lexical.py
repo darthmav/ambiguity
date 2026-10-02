@@ -43,6 +43,7 @@ from langgraph_agent.lexical import (
 # tokenize
 # --------------------------------------------------------------------------
 
+
 def test_an_identifier_is_indexed_whole_and_in_pieces():
     """Both, and the "whole" half is the one that does the work here.
 

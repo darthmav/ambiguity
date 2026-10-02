@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
-from langgraph_agent import config, nodes
+from langgraph_agent import config, initial_state, nodes
 
 THINKS = ["completion", "thinking", "tools"]
 PLAIN = ["completion"]
@@ -330,14 +330,7 @@ class _ThinkingSeat:
 
 
 def _state() -> dict[str, Any]:
-    return {
-        "goal": "g", "messages": [], "architecture": "", "verdict": "",
-        "plan": "p", "research": "", "builder_report": "a report",
-        "next_agent": "Builder", "research_status": "", "blockers": "",
-        "files_changed": [], "failed_verification": [],
-        "unverified": [], "builder_cut_off": "", "lint_failed": [],
-        "expect_failures": False, "step_count": 0,
-    }
+    return {**initial_state("g"), "plan": "p", "builder_report": "a report", "next_agent": "Builder"}
 
 
 def test_only_the_answer_is_read_never_the_reasoning():
@@ -520,12 +513,7 @@ def test_the_builder_reports_instead_of_failing_on_a_seat_without_tools(monkeypa
 
     seat = config._SeatLLM("builder", _NoTools("notools:cloud"), provider="ollama")
     monkeypatch.setattr(nodes, "get_agent_llm", lambda agent, temperature=0.1: seat)
-    state: Any = {
-        "goal": "g", "messages": [], "plan": "1. Edit it.", "research": "",
-        "files_changed": [], "failed_verification": [], "lint_failed": [],
-        "expect_failures": False, "discuss_only": False, "output_dir": "",
-        "step_count": 0,
-    }
+    state: Any = {**initial_state("g"), "plan": "1. Edit it."}
 
     result = nodes.builder_node(state)
 

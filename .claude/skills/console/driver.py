@@ -13,9 +13,8 @@ Usage (from the project root):
 
     .claude/skills/console/driver.py up
     .claude/skills/console/driver.py rpc rag_stats
-    .claude/skills/console/driver.py rpc search_documents '{"query":"planner","k":3}'
+    .claude/skills/console/driver.py rpc search_documents '{"query":"planner","top_k":3}'
     .claude/skills/console/driver.py shot /tmp/console.png
-    .claude/skills/console/driver.py reindex     # reindex AND restart -- see below
     .claude/skills/console/driver.py smoke
     .claude/skills/console/driver.py down
 """
@@ -143,54 +142,6 @@ def cmd_restart(args: list[str]) -> int:
 
 
 # --------------------------------------------------------------------------
-# corpus
-# --------------------------------------------------------------------------
-
-
-def cmd_reindex(_args: list[str]) -> int:
-    """Build the corpus, by asking the server to do what it does anyway.
-
-    There is no reindex script and no reindex RPC. Two things index: a run,
-    which rebuilds the corpus before the Architect opens, and embedding a
-    document into it. So this drives a run -- the cheapest goal it can -- and
-    the corpus comes back as a side effect of the thing that needs it.
-
-    That also retires the restart this command used to exist for. An
-    out-of-process script wrote the graph behind a live serve.py, which had
-    built its NetworkX graph once and never re-read it: rag_stats reported
-    zeros and the Graph tab drew "No graph yet" forever while search_documents
-    happily returned hits from the freshly written chunks. The rebuild now
-    happens *inside* the running server, on the object the console reads, so
-    there is nothing to restart.
-    """
-    if not is_up():
-        print("server is down; starting it")
-        rc = cmd_up([])
-        if rc != 0:
-            return rc
-    print("running a goal so the corpus is built (first time the daemon loads "
-          "qwen3-embedding:latest, and may pull it)...")
-    # Generous timeout: the index itself is under a minute, but the run that
-    # carries it is four cloud seats long. `discuss_only` keeps the Builder
-    # away from the working tree -- the corpus is the only thing wanted here.
-    envelope = rpc("run_goal", {"goal": "Summarise what this project is.",
-                                "discuss_only": True}, timeout=900)
-    if "error" in envelope:
-        print(f"run failed: {envelope['error'].get('message')}")
-        return 1
-    for message in envelope["result"].get("messages", []):
-        if message.startswith("[Corpus]"):
-            print(message)
-            break
-    else:
-        print("the corpus was already up to date")
-    stats = rpc("rag_stats")["result"]
-    print(f"corpus: {stats.get('corpus')} -- {stats.get('total_documents')} documents, "
-          f"{stats.get('total_chunks')} chunks, {stats.get('total_nodes')} nodes")
-    return 0
-
-
-# --------------------------------------------------------------------------
 # screenshot
 # --------------------------------------------------------------------------
 
@@ -302,20 +253,22 @@ def cmd_smoke(_args: list[str]) -> int:
     check("status responds", bool(st.get("embedding")), f"embedding={st.get('embedding')}")
 
     stats = rpc("rag_stats")["result"]
-    indexed = stats.get("corpus") == "indexed"
-    check("corpus indexed", indexed, f"corpus={stats.get('corpus')}")
-    check("graph has nodes", stats.get("total_nodes", 0) > 0,
-          f"nodes={stats.get('total_nodes')} edges={stats.get('total_edges')}")
-    stale = (stats.get("staleness") or {}).get("stale")
-    check("graph not stale", stale is False,
-          "reindexed under a live server? see `driver.py reindex`" if stale else "")
-
-    docs = rpc("list_documents")["result"]["documents"]
-    check("documents listed", len(docs) > 0, f"n={len(docs)}")
-
-    hits = rpc("search_documents", {"query": "planner agent", "k": 3})["result"]["results"]
-    check("semantic search returns hits", len(hits) > 0,
-          f"top={hits[0]['id']}" if hits else "")
+    corpus = stats.get("corpus")
+    check("corpus state reported", corpus in ("absent", "empty", "indexed"), f"corpus={corpus}")
+    if corpus == "indexed":
+        check("graph has nodes", stats.get("total_nodes", 0) > 0,
+              f"nodes={stats.get('total_nodes')} edges={stats.get('total_edges')}")
+        stale = (stats.get("staleness") or {}).get("stale")
+        check("corpus matches the archive", stale is False)
+        docs = rpc("list_documents")["result"]["documents"]
+        check("documents listed", len(docs) > 0, f"n={len(docs)}")
+        hits = rpc("search_documents", {"query": "planner agent", "top_k": 3})["result"]["results"]
+        check("semantic search returns hits", len(hits) > 0,
+              f"top={hits[0]['id']}" if hits else "")
+    else:
+        # Not a failure: the corpus is the research archive, which a fresh
+        # machine has none of until something is researched or uploaded.
+        print("  note  the archive is empty -- upload a document or research online")
 
     seats = rpc("list_seats")["result"]["seats"]
     check("four seats configured", len(seats) == 4, f"n={len(seats)}")
@@ -326,6 +279,16 @@ def cmd_smoke(_args: list[str]) -> int:
     print(f"  note  {live}/{len(seats)} seats live"
           f"{'' if live else ' -- run_goal will fail until a tag is pulled'}")
 
+    healing = rpc("healing")["result"]
+    check("self-healing reports", isinstance(healing.get("circuits"), list),
+          f"circuits={len(healing.get('circuits', []))}")
+    for circuit in healing.get("circuits", []):
+        if circuit["state"] != "closed":
+            print(f"  note  circuit {circuit['name']} is {circuit['state']}")
+    for name, result in (healing.get("health") or {}).items():
+        if result.get("status") != "healthy":
+            print(f"  note  {name}: {result.get('status')} -- {result.get('details')}")
+
     bad = rpc("no_such_method")
     check("unknown method returns error envelope, not 500", "error" in bad)
 
@@ -335,17 +298,13 @@ def cmd_smoke(_args: list[str]) -> int:
 
 COMMANDS = {
     "up": cmd_up, "down": cmd_down, "restart": cmd_restart,
-    "reindex": cmd_reindex, "shot": cmd_shot, "seats": cmd_seats,
+    "shot": cmd_shot, "seats": cmd_seats,
     "rpc": cmd_rpc, "smoke": cmd_smoke, "doctor": cmd_doctor,
 }
 
 
 def main() -> int:
-    # Line-buffer our own stdout. `reindex` shells out to a child that writes
-    # straight to this same fd; with the default block buffering on a pipe, the
-    # driver's own progress lines flush last and the log reads as though the
-    # reindex ran before the server was stopped. serve.py's main() does this
-    # for the same reason.
+    # Line-buffered, so progress lines appear as they happen under a pipe.
     sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         print(__doc__)

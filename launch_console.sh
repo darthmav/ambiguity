@@ -92,9 +92,9 @@ echo ""
 echo "Starting frontend server on ${URL}..."
 
 # The values serve.py reads as off.
-case "${INDEX_PROJECT_BEFORE_RUN:-1}" in
+case "${REBUILD_CORPUS:-1}" in
     0|false|no)
-        echo "  (INDEX_PROJECT_BEFORE_RUN is off: nothing rebuilds the corpus, at"
+        echo "  (REBUILD_CORPUS is off: nothing rebuilds the corpus, at"
         echo "   startup or before a run.)"
         ;;
     *)

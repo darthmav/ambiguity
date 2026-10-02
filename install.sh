@@ -964,7 +964,7 @@ step "Console"
 # The promise at the top of this script is a console that runs, and nothing
 # above starts one. So serve.py is started on a free port, asked for
 # /api/status -- what launch_console.sh waits on -- and for the page itself,
-# then stopped. INDEX_PROJECT_BEFORE_RUN=0 is what leaves the machine as it was
+# then stopped. REBUILD_CORPUS=0 is what leaves the machine as it was
 # found: a console brings the corpus up to date as soon as it is serving, so
 # without it this check started a first build -- the embedding model loaded
 # onto the cards, knowledge/ created -- and then killed it seconds in. SIGTERM,
@@ -972,7 +972,7 @@ step "Console"
 # would never see it.
 console_log=/tmp/ambiguity-console-check.log
 console_port="$("$PY" -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
-PORT="$console_port" INDEX_PROJECT_BEFORE_RUN=0 "$PY" serve.py >"$console_log" 2>&1 &
+PORT="$console_port" REBUILD_CORPUS=0 "$PY" serve.py >"$console_log" 2>&1 &
 console_pid=$!
 console_up=0
 for _ in $(seq 1 60); do
