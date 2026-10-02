@@ -293,6 +293,58 @@ def test_an_unavailable_rebuild_is_its_own_outcome(monkeypatch):
     assert serve._last_rebuild["source"] == "unavailable"
 
 
+class _UnloadableKB(_IndexingKB):
+    """The model's load fails its whole schedule on the first document."""
+
+    def add_document(self, doc_id: str, content: str, metadata: dict[str, Any]) -> int:
+        self.added.append(doc_id)
+        raise gs.EmbedderLoadFailed(
+            "Ollama could not embed with the model (after 5 attempts): cudaMalloc failed: "
+            "out of memory"
+        )
+
+
+def test_a_rebuild_stops_when_the_model_will_not_load(tmp_path):
+    """One schedule per rebuild, not one per document: the rest would be refused."""
+    uploads = tmp_path / gs.UPLOADS_DIR
+    uploads.mkdir()
+    for name in ("a.md", "b.md", "c.md"):
+        (uploads / name).write_text(f"{name} text", encoding="utf-8")
+    kb = _UnloadableKB()
+
+    report = gs.index_corpus_files(kb, str(tmp_path))  # type: ignore[arg-type]
+
+    assert len(kb.added) == 1
+    assert report["unavailable_circuit"] == "embedder-load"
+    assert "a.md" in report["unavailable"] and "out of memory" in report["unavailable"]
+    assert report["errors"] == [], "named once, as the reason, not again as a file error"
+
+
+def test_a_model_that_will_not_load_is_not_called_unreachable():
+    """The fix is a freed card, not a daemon, and the line must send the operator there."""
+    line = serve._corpus_feed_line({
+        "source": "unavailable", "unavailable_circuit": "embedder-load", "indexed": 0,
+        "unavailable": "uploads/a.md: cudaMalloc failed: out of memory", "errors": [],
+    })
+
+    assert line is not None
+    assert "could not be loaded onto the cards" in line
+    assert "out of memory" in line and "nvidia-smi" in line
+    assert "could not be reached" not in line
+
+
+def test_an_unreachable_daemon_leaves_the_embedder_circuit_closed(monkeypatch, no_waits):
+    """Nothing was loaded, so nothing was learnt about whether the model fits."""
+    import urllib.request
+
+    monkeypatch.setattr(urllib.request, "urlopen", _refused)
+
+    with pytest.raises(RuntimeError, match="could not embed"):
+        gs.OllamaEmbedder(gs.EMBEDDING_MODEL_NAME).encode("a passage")
+
+    assert not gs.EMBEDDER_LOAD.is_open
+
+
 # ---------------------------------------------------------------------------
 # Online research
 # ---------------------------------------------------------------------------
@@ -458,6 +510,22 @@ def test_the_monitor_waits_for_the_daemon_before_rebuilding(monitor, monkeypatch
     assert monitor == []
     assert serve._health["ollama-daemon"]["status"] == "unhealthy"
     assert serve._health["corpus"]["status"] == "unhealthy"
+
+
+def test_the_monitor_waits_out_the_embedder_cooldown(monitor, monkeypatch):
+    """Every pass would meet the open circuit as a refusal, and log a failed repair."""
+    serve._last_rebuild.update(source="unavailable", unavailable_circuit="embedder-load")
+    gs.EMBEDDER_LOAD.trip("the model did not fit the cards")
+
+    serve._heal()
+
+    assert monitor == []
+    assert "would not load" in serve._health["corpus"]["details"]
+
+    monkeypatch.setattr(gs.EMBEDDER_LOAD._breaker, "reset_timeout", 0)
+    serve._heal()
+
+    assert monitor == ["after the embedder came back"], "the rebuild is the trial"
 
 
 def test_the_monitor_logs_a_change_of_health_once(monitor):

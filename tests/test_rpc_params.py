@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import json
+from http import HTTPStatus
 
 import pytest
 
@@ -238,6 +239,25 @@ def test_a_non_numeric_content_length_is_refused():
 def test_a_well_formed_call_still_works():
     reply = _post(json.dumps({"method": "list_seats", "params": {}}).encode())
     assert "seats" in reply["result"]
+
+
+def test_a_request_is_logged_beside_its_status(capsys):
+    """`[API] 404` alone, on the line after `GET /`, read as the page itself missing.
+
+    It was the favicon's: `send_error` logs its code before the request line.
+    """
+    handler = serve.Handler.__new__(serve.Handler)
+    handler.requestline = "GET /favicon.ico HTTP/1.1"
+    handler.log_error("code %d, message %s", 404, "File not found")
+    handler.log_request(HTTPStatus.NOT_FOUND)
+    handler.log_error("Request timed out: %r", "slow client")
+    handler.requestline = "POST /rpc HTTP/1.1"
+    handler.log_request(200)
+
+    assert capsys.readouterr().out.splitlines() == [
+        "[API] GET /favicon.ico HTTP/1.1 -> 404",
+        "[API] Request timed out: 'slow client'",
+    ]
 
 
 # ---------------------------------------------------------------------------

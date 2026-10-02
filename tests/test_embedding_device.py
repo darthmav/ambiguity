@@ -183,10 +183,114 @@ def test_a_refusal_is_not_retried(monkeypatch):
     """A 4xx is the daemon saying no to the request; asking again changes nothing."""
     calls = _flaky(monkeypatch, failures=100, code=404)
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError) as refused:
         OllamaEmbedder(EMBEDDING_MODEL_NAME).encode("a passage")
 
     assert calls["n"] == 1
+    assert not isinstance(refused.value, gs.EmbedderLoadFailed)
+    assert not gs.EMBEDDER_LOAD.is_open, "a refused request is the daemon answering"
+
+
+def test_every_chunk_fits_one_pass_of_the_load():
+    """What makes the batch a free saving rather than a change of vectors.
+
+    Measured 2026-10-02: a chunk embedded in one pass came back bit-identical at
+    a batch of 256 as at 512. A batch shorter than a chunk (254 tokens, plus the
+    special tokens the daemon adds) would split it into two passes and move its
+    vector, and every corpus built before would be searched with others.
+    """
+    options = gs.OLLAMA_EMBED_OPTIONS
+
+    assert options["num_batch"] >= gs.CHUNK_MAX_TOKENS + 2
+    assert options["num_ctx"] >= options["num_batch"]
+
+
+def test_a_load_that_outlasts_the_schedule_opens_the_embedder_circuit(monkeypatch):
+    """On 2026-10-02 every page of a research phase spent its own whole schedule.
+
+    Once one schedule has failed, what holds the cards is not a model being
+    evicted, so the next embed is refused without asking the daemon.
+    """
+    calls = _flaky(monkeypatch, failures=100)
+    embedder = OllamaEmbedder(EMBEDDING_MODEL_NAME)
+
+    with pytest.raises(gs.EmbedderLoadFailed, match=r"after \d+ attempts.*llama-server"):
+        embedder.encode("the first page")
+    assert gs.EMBEDDER_LOAD.is_open
+    tried = calls["n"]
+
+    with pytest.raises(gs.CircuitOpenError, match="embedder-load"):
+        embedder.encode("the second page")
+    assert calls["n"] == tried, "a refused embed must not reach the daemon"
+
+
+def test_the_trial_after_the_cooldown_is_one_attempt(monkeypatch):
+    """A load that already outlasted a schedule is tested once, then trusted again."""
+    calls = _flaky(monkeypatch, failures=gs.OLLAMA_EMBED_LOAD_RETRIES + 2)
+    embedder = OllamaEmbedder(EMBEDDING_MODEL_NAME)
+    with pytest.raises(gs.EmbedderLoadFailed):
+        embedder.encode("a passage")
+    monkeypatch.setattr(gs.EMBEDDER_LOAD._breaker, "reset_timeout", 0)
+
+    with pytest.raises(gs.EmbedderLoadFailed):
+        embedder.encode("a passage")
+    assert calls["n"] == gs.OLLAMA_EMBED_LOAD_RETRIES + 2
+    assert gs.EMBEDDER_LOAD.is_open, "a failed trial opens it again"
+
+    embedder.encode("a passage")
+    assert not gs.EMBEDDER_LOAD.is_open, "a trial that loads closes it"
+
+
+def test_a_stop_during_the_schedule_does_not_open_the_circuit(monkeypatch):
+    """A stopped schedule did not show that the model cannot load."""
+    calls = _flaky(monkeypatch, failures=100)
+
+    with pytest.raises(gs.EmbeddingStopped):
+        OllamaEmbedder(EMBEDDING_MODEL_NAME).encode(
+            "a passage", should_stop=lambda: calls["n"] >= 1
+        )
+
+    assert calls["n"] == 1
+    assert not gs.EMBEDDER_LOAD.is_open
+
+
+def test_an_empty_store_is_searched_without_loading_the_model(monkeypatch):
+    """A cleared corpus, or one whose first pages all failed to embed, holds nothing.
+
+    Embedding the query anyway loaded the model and evicted the seat holding the
+    cards -- and it was how two run tests reached the live daemon on every suite.
+    """
+    from types import SimpleNamespace
+
+    kb = _kb()
+    kb.collection = SimpleNamespace(count=lambda: 0)
+
+    def no_embed(texts: Any) -> Any:
+        raise AssertionError("an empty store must not load the embedder")
+
+    monkeypatch.setattr(kb, "_encode", no_embed)
+
+    assert kb.search("what does the corpus say?") == []
+
+
+def test_the_tokenizer_keeps_transformers_advice_out_of_the_log(monkeypatch):
+    """Without torch, importing transformers announces it, which nothing here needs."""
+    import os
+    import sys
+    from types import SimpleNamespace
+
+    monkeypatch.delenv("TRANSFORMERS_NO_ADVISORY_WARNINGS", raising=False)
+    seen: list[str | None] = []
+
+    def from_pretrained(name: str, **kwargs: Any) -> object:
+        seen.append(os.environ.get("TRANSFORMERS_NO_ADVISORY_WARNINGS"))
+        return object()
+
+    fake = SimpleNamespace(AutoTokenizer=SimpleNamespace(from_pretrained=from_pretrained))
+    monkeypatch.setitem(sys.modules, "transformers", fake)
+
+    assert OllamaEmbedder(EMBEDDING_MODEL_NAME).tokenizer is not None
+    assert seen == ["1"]
 
 
 # ---------------------------------------------------------------------------

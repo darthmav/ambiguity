@@ -33,8 +33,10 @@ backend opens a *circuit*: calls to it fail at once instead of each waiting it
 out, the header shows a red `… down` chip, and the first call after a short
 cooldown tests whether it is back (click the chip to test now). A seat call or
 an embed that meets a daemon mid-restart is retried briefly; a corpus rebuild
-the daemon interrupted is redone once it answers again. The State tab lists
-each service's health, every circuit, and the healing journal; a run's
+the daemon interrupted is redone once it answers again. An embedding model that
+will not fit the cards gets a circuit of its own (`embedder-load down`), so a
+rebuild stops after one document instead of retrying every one. The State tab
+lists each service's health, every circuit, and the healing journal; a run's
 snapshot carries its own healing events.
 
 *Attach* — in the Engineer tab, beside Run — puts a document of your own into

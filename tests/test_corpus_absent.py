@@ -21,6 +21,7 @@ which is also the claim of the last one in the file.
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -359,7 +360,7 @@ def test_the_corpus_is_built_before_the_online_phase_and_not_after(nowhere, monk
         order.append("corpus")
         return {"indexed": 1, "skipped": 0, "errors": [], "total_chunks": 1}
 
-    def research(factory, goal):
+    def research(factory, goal, **kwargs):
         order.append("web")
         return {"source": "duckduckgo", "documents": 0, "considered": 0}
 
@@ -420,7 +421,8 @@ def test_the_phase_opens_the_door_only_for_a_page_it_keeps(monkeypatch):
 
     def factory():
         opened.append(1)
-        return object()
+        # Not a bare object(): the phase hands the corpus its stop to embed under.
+        return SimpleNamespace()
 
     monkeypatch.setattr(web_research, "select_pages", lambda *a, **k: [])
     report = web_research.research_online(factory, "a goal", ".")

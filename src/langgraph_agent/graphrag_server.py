@@ -34,7 +34,7 @@ from langgraph_agent.lexical import (
     reciprocal_rank_fusion,
 )
 from langgraph_agent.projects import PROJECTS_DIR, embedded_projects, held_out_of_corpus
-from langgraph_agent.self_healing import CircuitOpenError, call_with_retry
+from langgraph_agent.self_healing import Circuit, CircuitOpenError, call_with_retry
 
 # The embedding model that builds and searches the corpus, served by the local
 # daemon. There is exactly one: vectors from two models share no space, so a
@@ -72,20 +72,54 @@ def _failed_model_load(exc: BaseException) -> bool:
     return isinstance(exc, urllib.error.HTTPError) and exc.code >= 500
 
 
+# The embedder's load, as a circuit: a whole retry schedule that ends in a 5xx
+# opens it, since what holds the cards by then is not a model the arbiter can
+# evict. On 2026-10-02 it was the desktop's share of the card driving the
+# display, which a browser opened minutes earlier had grown past the 75 MiB the
+# load left free: fifteen loads failed in four minutes, three pages' schedules
+# back to back, and a 50-file rebuild would have spent over an hour the same
+# way. While it is open every embed fails at once, so a rebuild stops after one
+# document; the first embed after the cooldown is the trial, and one attempt
+# answers it.
+EMBEDDER_LOAD_COOLDOWN_SECONDS = 120.0
+EMBEDDER_LOAD = Circuit(
+    "embedder-load",
+    failure_threshold=1,
+    recovery_timeout=EMBEDDER_LOAD_COOLDOWN_SECONDS,
+    trips_on=_failed_model_load,
+)
+
+
 # The window and batch the embedder is loaded with, sent on every call -- the
 # daemon reloads a model whose options change, so a search at another window
 # would evict the runner an index is using. At the default 4,096/2,048 the
 # model asked for more than the cards hold and ran a third of its layers on the
 # CPU; at 512 it fits wholly, twice as fast, with identical vectors (cosine
-# 1.000000) -- and 512 is still twice the chunker's passages. `num_gpu: 999`
-# forces every layer onto the cards: where the model does not fit the load
-# errors rather than spilling, and a corpus is built on the placement it is
-# searched on (a split load's vectors differ slightly).
-OLLAMA_EMBED_OPTIONS: dict[str, int] = {"num_ctx": 512, "num_batch": 512, "num_gpu": 999}
+# 1.000000) -- and 512 is still twice the chunker's passages. The batch is the
+# chunker's window rather than the load's: the last card holds the output layer
+# and a compute buffer sized by the batch -- nearly all of it logits an
+# embedding never reads -- and here that card also drives the display. Measured
+# 2026-10-02 on two 3 GB GTX 1060s, at 512 the buffer took 338 MiB and llama.cpp
+# projected 64 MiB left on the display card; at 256, 169 MiB and 250 MiB, with
+# every chunk (254 tokens + EOS) and short query embedding bit-identically and
+# a batch of 8 no slower. A longer input still embeds, in two passes, and its
+# vector moves by under 3e-4 in cosine. `num_gpu: 999` forces every layer onto
+# the cards: where the model does not fit the load errors rather than spilling,
+# and a corpus is built on the placement it is searched on (a split load's
+# vectors differ slightly).
+OLLAMA_EMBED_OPTIONS: dict[str, int] = {"num_ctx": 512, "num_batch": 256, "num_gpu": 999}
 
 
 class EmbeddingStopped(RuntimeError):
     """The run was stopped between two batches of an embedding."""
+
+
+class EmbedderLoadFailed(RuntimeError):
+    """The daemon could not load the embedding model through a whole retry schedule.
+
+    The model's failure, not a passage's: it opened `EMBEDDER_LOAD`, which
+    refuses every embed after it, so a pass over many documents ends here.
+    """
 
 
 class OllamaEmbedder:
@@ -121,6 +155,10 @@ class OllamaEmbedder:
     @property
     def tokenizer(self) -> Any:
         if self._tokenizer is None:
+            # The tokenizer is all this process takes from transformers, which
+            # otherwise announces on import that it found no PyTorch: printed
+            # just before an embed failed, it read as the cause.
+            os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
             from transformers import AutoTokenizer
 
             try:
@@ -139,11 +177,12 @@ class OllamaEmbedder:
     ) -> Any:
         """One vector per passage, or a single vector for a single string.
 
-        Each batch goes through the daemon's circuit. An unreachable daemon is retried
-        briefly (`retry_unreachable`); a failed model load (5xx) is retried on the
-        slower load schedule; a 4xx is the daemon refusing and raises at once.
-        `should_stop` is asked before each batch and through every wait, so a stopped
-        run waits for at most one batch.
+        Each batch goes through the daemon's circuit and the embedder's own. An
+        unreachable daemon is retried briefly (`retry_unreachable`); a failed model
+        load (5xx) is retried on the slower load schedule, and one that outlasts it
+        opens `EMBEDDER_LOAD` and raises `EmbedderLoadFailed`; a 4xx is the daemon
+        refusing and raises at once. `should_stop` is asked before each batch and
+        through every wait, so a stopped run waits for at most one batch.
         """
         import urllib.error
 
@@ -173,32 +212,49 @@ class OllamaEmbedder:
                     give_up=should_stop,
                 )
 
+            # While the circuit is open this call is refused, or -- once the
+            # cooldown is over -- is its trial: one attempt, since the schedule
+            # waits out a card being freed and the load that opened the circuit
+            # already outlasted one.
+            tries = 1 if EMBEDDER_LOAD.is_open else OLLAMA_EMBED_LOAD_RETRIES + 1
+
+            def schedule(
+                embed: Callable[[], Any] = embed, start: int = start, tries: int = tries
+            ) -> Any:
+                try:
+                    return call_with_retry(
+                        embed,
+                        max_attempts=tries,
+                        min_wait=OLLAMA_EMBED_RETRY_SECONDS,
+                        max_wait=OLLAMA_EMBED_RETRY_SECONDS * 4,
+                        retry_if=_failed_model_load,
+                        give_up=should_stop,
+                        name=f"embed:{self.model}",
+                    )
+                except Exception as exc:
+                    # Raised inside the circuit, so a schedule the stop cut
+                    # short is not counted as a load that cannot be made.
+                    if should_stop is not None and should_stop():
+                        raise EmbeddingStopped(
+                            f"stopped after {start} of {len(items)} passages"
+                        ) from exc
+                    raise
+
             try:
-                payload = call_with_retry(
-                    embed,
-                    max_attempts=OLLAMA_EMBED_LOAD_RETRIES + 1,
-                    min_wait=OLLAMA_EMBED_RETRY_SECONDS,
-                    max_wait=OLLAMA_EMBED_RETRY_SECONDS * 4,
-                    retry_if=_failed_model_load,
-                    give_up=should_stop,
-                    name=f"embed:{self.model}",
-                )
-            except CircuitOpenError:
+                payload = EMBEDDER_LOAD.call(schedule)
+            except (CircuitOpenError, EmbeddingStopped):
                 # Not this batch's failure: every caller stands down together.
                 raise
             except Exception as exc:
-                if should_stop is not None and should_stop():
-                    raise EmbeddingStopped(
-                        f"stopped after {start} of {len(items)} passages"
-                    ) from exc
                 tried = f" (after {attempts} attempts)" if attempts > 1 else ""
                 detail = (
                     exc.read().decode("utf-8", "replace").strip()
                     if isinstance(exc, urllib.error.HTTPError) else ""
                 )
-                raise RuntimeError(
-                    f"Ollama could not embed with {self.model}{tried}: {detail or exc}"
-                ) from exc
+                message = f"Ollama could not embed with {self.model}{tried}: {detail or exc}"
+                if _failed_model_load(exc):
+                    raise EmbedderLoadFailed(message) from exc
+                raise RuntimeError(message) from exc
             batch = body["input"]
             embeddings = payload.get("embeddings") or []
             if len(embeddings) != len(batch):
@@ -761,6 +817,11 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         # An empty query is not a question: it still embeds, and would match
         # something.
         if not query or not query.strip():
+            return []
+        # Nor is a store with nothing in it -- a cleared corpus, or one whose
+        # first pages all failed to embed. Embedding the query anyway loaded
+        # the model and evicted the seat holding the cards, to find nothing.
+        if not self.collection.count():
             return []
 
         query_embedding = self._encode(query).tolist()
@@ -1522,9 +1583,10 @@ def index_corpus_files(
     its vectors and only rejoins the graph -- so a rebuild costs what changed.
 
     `progress(done, total)` follows each file; `should_stop` is asked before each
-    file and between embedding batches. A stop, or the daemon's circuit opening,
-    ends the pass early -- `stopped` or `unavailable` in the report -- and leaves
-    the corpus part-built for the next rebuild to finish.
+    file and between embedding batches. A stop, or a circuit the embedder needs
+    opening -- the daemon's, or `EMBEDDER_LOAD` -- ends the pass early: `stopped`,
+    or `unavailable` with the circuit named in `unavailable_circuit`. Either
+    leaves the corpus part-built for the next rebuild to finish.
     """
     files = iter_corpus_files(root)
     wanted = {str(path) for path in files}
@@ -1561,7 +1623,7 @@ def index_corpus_files(
     errors: list[str] = list(errors_pre)
 
     stopped = False
-    unavailable = ""
+    unavailable = unavailable_circuit = ""
     kb._should_stop = should_stop
     for position, file_path in enumerate(files, 1):
         if should_stop is not None and should_stop():
@@ -1587,8 +1649,14 @@ def index_corpus_files(
             stopped = True
             break
         except CircuitOpenError as exc:
-            # The daemon is gone: every document left would fail the same way.
-            unavailable = str(exc)
+            # The daemon is gone, or the model will not load: every document
+            # left would fail the same way.
+            unavailable, unavailable_circuit = str(exc), exc.circuit
+            break
+        except EmbedderLoadFailed as exc:
+            # This document's load opened the embedder's circuit, which would
+            # refuse every document left.
+            unavailable, unavailable_circuit = f"{file_path}: {exc}", EMBEDDER_LOAD.name
             break
         except Exception as exc:
             errors.append(f"{file_path}: {exc}")
@@ -1606,6 +1674,7 @@ def index_corpus_files(
     report: dict[str, Any] = {
         "stopped": stopped,
         "unavailable": unavailable,
+        "unavailable_circuit": unavailable_circuit,
         "indexed": indexed,
         "embedded": embedded,
         "reused": reused,

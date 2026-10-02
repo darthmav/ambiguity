@@ -490,17 +490,19 @@ def test_no_capital_forced_by_position_becomes_a_hub_entity():
 
 
 # The twenty best-connected entities, as a person last read and accepted them:
-# 2026-10-01, when the census widened back to all the prose the checkout ships.
-# The arrivals were ruled real terms -- `ValueError`, `GraphRAG`, `Callable`,
-# `Verdict`, `Architecture` (the Architect's section and state field) and
-# `CircuitOpenError` -- and four sentence-openers the positional guard caught
-# joined `ENTITY_STOPWORDS`. The twentieth slot is a tie at six documents,
-# settled by name. Earlier rulings: `git log -p tests/test_claims.py`.
+# 2026-10-02, when the embedder gained a circuit of its own and `Circuit` (the
+# self-healing class) reached a sixth document. The twentieth slot is a tie at
+# six documents, settled by name, so it took the place of `CircuitOpenError`;
+# both are real terms. The 2026-10-01 audit, when the census widened back to
+# all the prose the checkout ships, ruled `ValueError`, `GraphRAG`, `Callable`,
+# `Verdict` and `Architecture` (the Architect's section and state field) real
+# terms, and four sentence-openers the positional guard caught joined
+# `ENTITY_STOPWORDS`. Earlier rulings: `git log -p tests/test_claims.py`.
 AUDITED_TOP_ENTITIES = frozenset({
     "Builder", "Architect", "Planner", "Researcher", "Exception", "ValueError",
     "GraphRAG", "Ollama", "Python", "AgentState", "Callable", "Search",
     "Verdict", "Anthropic", "Fiedler", "Laplacian", "RECURSION_LIMIT", "AGENTS",
-    "Architecture", "CircuitOpenError",
+    "Architecture", "Circuit",
 })
 
 

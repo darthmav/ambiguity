@@ -62,9 +62,11 @@ from langgraph_agent.corpus_health import (  # noqa: E402
 )
 from langgraph_agent.graph import RECURSION_LIMIT  # noqa: E402
 from langgraph_agent.graphrag_server import (  # noqa: E402
+    EMBEDDER_LOAD,
     EMBEDDING_MODEL_NAME,
     INDEXABLE_SUFFIXES,
     NO_CORPUS_NOTE,
+    WEB_RESEARCH_DIR,
     GraphRAGKnowledgeBase,
     calibrate_relevance_floor,
     corpus_state,
@@ -1372,6 +1374,14 @@ def _corpus_feed_line(report: dict[str, Any], *, when: str = "before the run") -
             "The next run carries on from there: what is already embedded keeps its "
             "vectors."
         )
+    if source == "unavailable" and report.get("unavailable_circuit") == EMBEDDER_LOAD.name:
+        return (
+            f"[Corpus] {EMBEDDING_MODEL_NAME} could not be loaded onto the cards "
+            f"{when}, so the rebuild stopped after {report.get('indexed', 0)} "
+            f"document(s): {report.get('unavailable')}.{note} The console rebuilds "
+            "the corpus once a load fits; `nvidia-smi` names what else holds the "
+            "cards."
+        )
     if source == "unavailable":
         return (
             f"[Corpus] The embedder could not be reached {when}, so the rebuild "
@@ -1427,7 +1437,7 @@ def _research_online_before_the_run(goal: str, requested: bool) -> dict[str, Any
         return {"source": "stopped", "documents": 0, "considered": 0, "note":
                 "Stopped before the online research phase began."}
     try:
-        report = research_online(_kb_for_indexing, goal)
+        report = research_online(_kb_for_indexing, goal, should_stop=RUN_CONTROL.stopped)
     except Exception as exc:
         return {"source": "error", "documents": 0, "considered": 0,
                 "note": f"The online research phase failed: {exc}"}
@@ -1448,6 +1458,14 @@ def _research_feed_line(report: dict[str, Any]) -> str:
     source = report.get("source", "")
     considered = report.get("considered", 0)
     kept = report.get("documents", 0)
+    failed = report.get("failed") or []
+    # Named, not only counted: a page that earned a place and was not embedded
+    # once read as one the gate turned away, which sends the operator to the
+    # goal when the fix is a freed card.
+    unembedded = (
+        f"earned a place but could not be embedded: {failed[0].get('error', '')}"
+        if failed else ""
+    )
 
     if source == "not_requested":
         return (
@@ -1461,14 +1479,26 @@ def _research_feed_line(report: dict[str, Any]) -> str:
         return "[Research] Stopped before online research began."
     if source == "error" or (not considered and report.get("errors")):
         return f"[Research] Online research found nothing usable: {report.get('note') or 'the search failed'}"
+    if report.get("stopped"):
+        return (
+            f"[Research] Stopped during online research, after embedding {kept} "
+            "page(s); the pages still to embed were left alone."
+        )
+    if not kept and failed:
+        saved = (
+            f" Their text is saved under {WEB_RESEARCH_DIR}/, and the next rebuild embeds it."
+            if any(page.get("saved") for page in failed) else ""
+        )
+        return f"[Research] Read {considered} page(s); {len(failed)} {unembedded}.{saved}"
     if not kept:
         return (
             f"[Research] Read {considered} page(s) and kept none -- none of them "
             "scored well enough against this goal to earn a place in the corpus."
         )
+    more = f" {len(failed)} more {unembedded}." if failed else ""
     return (
         f"[Research] Read {considered} page(s), embedded {kept} "
-        f"({report.get('chunks', 0)} passages) in {report.get('elapsed_s', 0)}s. "
+        f"({report.get('chunks', 0)} passages) in {report.get('elapsed_s', 0)}s.{more} "
         "The Researcher retrieves these like any other document."
     )
 
@@ -1699,7 +1729,8 @@ def rpc_run_goal(params: dict[str, Any]) -> dict[str, Any]:
 
 # How often the console checks the services it depends on and repairs what it
 # can: an open circuit is re-probed, and a corpus whose last rebuild stopped
-# because the embedder could not be reached is rebuilt once it answers again.
+# because the embedder could not be reached, or its model would not load, is
+# rebuilt once it answers again or its cooldown is over.
 HEALTH_CHECK_SECONDS = float(os.getenv("HEALTH_CHECK_SECONDS", "30"))
 
 # The latest answer from each service, as `{status, details}` per component.
@@ -1738,7 +1769,11 @@ def _check_health() -> dict[str, dict[str, str]]:
     if last.get("source") == "unavailable":
         results["corpus"] = {
             "status": "unhealthy",
-            "details": "the last rebuild stopped because the embedder could not be reached",
+            "details": (
+                "the last rebuild stopped because the embedding model would not load"
+                if last.get("unavailable_circuit") == EMBEDDER_LOAD.name
+                else "the last rebuild stopped because the embedder could not be reached"
+            ),
         }
     else:
         results["corpus"] = {"status": "healthy", "details": f"corpus {corpus_state()[0]}"}
@@ -1758,11 +1793,14 @@ def _heal() -> None:
 
     # A rebuild stopped by an unreachable embedder is finished once it is back.
     # Nothing else rebuilds on its own: any other failure is not one waiting
-    # on a service, and a run rebuilds before it starts anyway.
+    # on a service, and a run rebuilds before it starts anyway. A model that
+    # would not load is waited out for its circuit's cooldown, which a rebuild
+    # tried every pass would only meet as a refusal, logged each time.
     if (
         REBUILD_CORPUS
         and results["corpus"]["status"] == "unhealthy"
         and results["ollama-daemon"]["status"] == "healthy"
+        and not EMBEDDER_LOAD.retry_in
         and not _run_in_flight()
     ):
         when = "after the embedder came back"
@@ -2021,15 +2059,23 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def log_message(self, format: str, *args: Any) -> None:
+    def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
         # RPC calls log themselves in handle_rpc, with their method name and
-        # timing; the default line would add a second, less useful entry.
-        request_line = args[0] if args else ""
-        if isinstance(request_line, str) and (
-            "POST /rpc" in request_line or "GET /api/status" in request_line
-        ):
+        # timing; the default line would add a second, less useful entry, and
+        # the status poll's would drown the rest.
+        if "POST /rpc" in self.requestline or "GET /api/status" in self.requestline:
             return
-        print(f"[API] {request_line}")
+        print(f"[API] {self.requestline} -> {int(code) if isinstance(code, int) else code}")
+
+    def log_error(self, format: str, *args: Any) -> None:
+        # `send_error` states its code here before `log_request` repeats it
+        # beside the request line; printed alone, a favicon's 404 read as the
+        # page's own, on the line after `GET /`.
+        if not format.startswith("code %d"):
+            self.log_message(format, *args)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        print(f"[API] {format % args}")
 
 
 def _exit_the_way_the_console_would(signum: int, _frame: Any) -> None:

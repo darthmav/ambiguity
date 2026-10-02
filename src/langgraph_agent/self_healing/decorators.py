@@ -181,6 +181,11 @@ class Circuit:
     def is_open(self) -> bool:
         return bool(self._breaker.current_state == pybreaker.STATE_OPEN)
 
+    @property
+    def retry_in(self) -> float:
+        """Seconds until an open circuit lets its trial call through; 0 if closed or due."""
+        return _retry_in(self._breaker) if self.is_open else 0.0
+
 
 def circuit_states() -> list[dict[str, Any]]:
     """Every circuit this process has defined: its state, failures and cooldown."""

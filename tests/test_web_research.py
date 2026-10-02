@@ -29,6 +29,7 @@ import pytest
 from langgraph_agent import web_research
 from langgraph_agent.graphrag_server import (
     MAX_INDEXABLE_BYTES,
+    EmbeddingStopped,
     _document_metadata,
     iter_corpus_files,
 )
@@ -618,3 +619,50 @@ def test_a_page_the_embedder_refuses_costs_that_page_alone(monkeypatch, tmp_path
     assert report["documents"] == 1
     assert len(report["failed"]) == 1
     assert "could not embed" in report["failed"][0]["error"]
+    assert report["failed"][0]["saved"], "written before the embed, so the next rebuild embeds it"
+
+
+def test_a_stop_ends_the_phase_between_pages(monkeypatch, kb, tmp_path):
+    """On 2026-10-02 a stop arrived mid-phase and the next page began anyway."""
+    _standard_web(monkeypatch, {
+        "https://example.com/retrieval": ON_TOPIC,
+        "https://example.com/ranking": ON_TOPIC,
+    })
+
+    report = research_online(
+        lambda: kb, GOAL, str(tmp_path), should_stop=lambda: len(kb.added) >= 1
+    )
+
+    assert report["stopped"]
+    assert report["documents"] == 1
+    assert len(kb.added) == 1
+    assert report["failed"] == []
+
+
+def test_the_embedder_is_handed_the_stop(monkeypatch, tmp_path):
+    """Asked between batches and through every retry wait, so one batch is the wait.
+
+    A stop that ends an embed is the phase's end, not that page's failure.
+    """
+    _standard_web(monkeypatch, {
+        "https://example.com/retrieval": ON_TOPIC,
+        "https://example.com/ranking": ON_TOPIC,
+    })
+
+    def stop() -> bool:
+        return False
+
+    class _StoppedMidEmbed(_RecordingKB):
+        _should_stop = None
+
+        def add_document(self, doc_id, content, metadata):
+            self.handed = self._should_stop
+            raise EmbeddingStopped("stopped after 0 of 3 passages")
+
+    kb = _StoppedMidEmbed()
+    report = research_online(lambda: kb, GOAL, str(tmp_path), should_stop=stop)
+
+    assert kb.handed is stop
+    assert kb._should_stop is None, "handed back once the phase is over"
+    assert report["stopped"]
+    assert report["failed"] == []

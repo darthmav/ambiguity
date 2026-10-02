@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 
 import serve
+from langgraph_agent.control import RUN_CONTROL
 
 
 class _RecordingGraph:
@@ -118,6 +119,52 @@ def test_reading_pages_and_keeping_none_is_not_reported_as_a_failure(monkeypatch
     line = next(m for m in result["messages"] if "[Research]" in m)
     assert "kept none" in line
     assert "failed" not in line.lower()
+
+
+def test_pages_that_could_not_be_embedded_are_not_reported_as_turned_away():
+    """2026-10-02: three pages earned a place, the embedder could not load, and the
+    feed said none had scored well enough -- sending the operator to the goal."""
+    line = serve._research_feed_line({
+        **FOUND, "considered": 4, "documents": 0, "chunks": 0,
+        "failed": [{"url": "https://example.com/a", "saved": True,
+                    "error": "Ollama could not embed with the model: cudaMalloc failed: out of memory"}],
+    })
+
+    assert "could not be embedded" in line and "cudaMalloc" in line
+    assert "research/web/" in line and "next rebuild" in line
+    assert "kept none" not in line and "scored well enough" not in line
+
+
+def test_a_partial_embed_names_the_pages_left_out():
+    line = serve._research_feed_line({
+        **FOUND, "failed": [{"url": "https://example.com/c", "saved": True, "error": "out of memory"}],
+    })
+
+    assert "embedded 2" in line
+    assert "1 more earned a place but could not be embedded: out of memory" in line
+
+
+def test_a_stop_during_the_phase_is_worded_as_a_stop():
+    line = serve._research_feed_line({**FOUND, "documents": 1, "stopped": True})
+
+    assert line.startswith("[Research] Stopped during online research")
+    assert "embedding 1 page(s)" in line
+
+
+def test_the_run_hands_the_phase_its_stop(monkeypatch, graph):
+    """A stop must reach the embeds the phase makes, not wait for the phase to end."""
+    handed: dict[str, Any] = {}
+
+    def fake(kb, goal, *args, **kwargs):
+        handed.update(kwargs)
+        return FOUND
+
+    monkeypatch.setattr(serve, "research_online", fake)
+    monkeypatch.setattr(serve, "_kb_for_indexing", lambda: object())
+
+    serve.rpc_run_goal({"goal": "g", "research_web": True})
+
+    assert handed["should_stop"] == RUN_CONTROL.stopped
 
 
 def test_the_three_empty_outcomes_are_worded_apart():

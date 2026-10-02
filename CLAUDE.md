@@ -323,13 +323,18 @@ a Builder that runs programs. No CORS header is sent; the page is same-origin.
   `OLLAMA_EMBED_OPTIONS` and `OLLAMA_SEAT_GPU_OPTIONS` force every layer onto
   the GPU, `GPU_ARBITER` (`control.py`) serializes the embedder against the
   seats and evicts the resident model, and a seat whose forced load does not
-  fit is rebuilt unforced and retried once. The arbiter's wait is unbounded: a
-  waiter never runs beside the holder. Across processes the daemon enforces the
-  same through `OLLAMA_MAX_LOADED_MODELS=1` / `OLLAMA_NUM_PARALLEL=1`, a drop-in
-  `install.sh` writes.
+  fit is rebuilt unforced and retried once -- the embedder never is, since a
+  split changes its vectors. Its `num_batch` is the chunker's window, not the
+  load's: the last card, here also the display's, holds a compute buffer sized
+  by it, and a chunk in one pass embeds bit-identically at any batch that holds
+  it (`test_every_chunk_fits_one_pass_of_the_load`). The arbiter's wait is
+  unbounded: a waiter never runs beside the holder. Across processes the daemon
+  enforces the same through `OLLAMA_MAX_LOADED_MODELS=1` /
+  `OLLAMA_NUM_PARALLEL=1`, a drop-in `install.sh` writes.
 - **The emergency stop is cooperative.** `RUN_CONTROL` is a process-global
-  checked at node tops, in the Builder's turn loop, before each verified file
-  and between supersteps -- never inside a tool batch. Every exit path writes
+  checked at node tops, in the Builder's turn loop, before each verified file,
+  between online-research pages and embedding batches, and between supersteps
+  -- never inside a tool batch. Every exit path writes
   `runs/last_run.json`, and `shutdown` defers the exit to the run's own
   `finally` under `_run_lock`.
 - **Three nested timeouts, none redundant**: `LLM_TIMEOUT_SECONDS` bounds one
@@ -368,8 +373,10 @@ session). Where it is used:
   daemon answering. `retry_unreachable` retries a daemon call briefly, since an
   unreachable daemon ran nothing; the emergency stop ends the wait.
 - **The embedder** retries a failed model load (5xx) on its own longer
-  schedule; a rebuild that meets an open circuit ends as `unavailable` instead
-  of failing document by document.
+  schedule, and a schedule that still ends in a 5xx opens `EMBEDDER_LOAD`
+  (`embedder-load`): every embed is refused at once until a single-attempt
+  trial after its cooldown loads. A rebuild that meets an open circuit ends as
+  `unavailable`, naming it, instead of failing document by document.
 - **Cloud seats** get one circuit per provider (`PROVIDER_CIRCUITS`), opened by
   outages (`provider_unavailable`), never by a 4xx. Their SDKs retry requests
   themselves, so nothing retries on top.
@@ -385,7 +392,8 @@ session). Where it is used:
   health, re-probes open circuits, and rebuilds a corpus whose last rebuild
   stopped because the embedder could not be reached. The console shows an open
   circuit in the header (click it to let the next call through now) and the
-  journal in the telemetry feed and the State tab.
+  journal in the telemetry feed and the State tab. A corpus whose rebuild met
+  `embedder-load` is rebuilt the same way, once that circuit's cooldown is over.
 
 Retrying never extends a deadline's guarantee: work under `_with_deadline`
 still never writes to state, and a retry inside an abandoned seat call ends on
@@ -437,6 +445,10 @@ every checkout has, so `uploads/`, `projects/` and fetched pages are out.
   It closes by itself once the daemon answers a trial call; clicking the chip
   lets the next call through now. A rebuild it interrupted is redone by the
   monitor once the daemon is back.
+- **The header shows `embedder-load down`** -- the embedding model's forced
+  load failed a whole retry schedule. `journalctl -u ollama` names the card and
+  the allocation that failed, and `nvidia-smi` what else holds that card -- on
+  the display card, the desktop and any browser. Click the chip to retry now.
 - **Online research finds nothing, or reports DuckDuckGo's bot check** -- Check
   `SEARXNG_URL` is in `.env` and the instance answers; an HTTP 403 means `json`
   is missing from its `search.formats`.

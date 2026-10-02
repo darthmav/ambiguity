@@ -49,6 +49,7 @@ import httpx
 from langgraph_agent.graphrag_server import (
     MAX_INDEXABLE_BYTES,
     WEB_RESEARCH_DIR,
+    EmbeddingStopped,
     _document_metadata,
 )
 from langgraph_agent.html_text import extract
@@ -673,30 +674,52 @@ def research_online(
     goal: str,
     root: str = ".",
     keep: int | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Search the web for a goal and embed what earns a place. The pre-run phase.
 
     Takes a *factory* for the corpus and calls it only once a page has earned a
     place, so a phase that stores nothing leaves no empty corpus behind. A failure
-    storing one page is that page's alone and lands in `failed`. `considered` and
-    `documents` are both reported: twelve pages read and none kept is a working
-    phase on a goal the web has nothing to say about.
+    storing one page is that page's alone and lands in `failed`, with `saved`
+    saying whether its text reached disk for the next rebuild to embed.
+    `considered` and `documents` are both reported: twelve pages read and none
+    kept is a working phase on a goal the web has nothing to say about.
+
+    `should_stop` is asked before each page and handed to the embedder, which
+    asks it between batches and through every retry wait, so a stopped run waits
+    for one batch rather than for every page left; `stopped` says it happened.
     """
     started = time.monotonic()
     answer = search_web(goal)
     selected = select_pages(goal, answer["pages"], keep or WEB_SEARCH_MAX_RESULTS)
 
     stored: list[dict[str, Any]] = []
-    failed: list[dict[str, str]] = []
+    failed: list[dict[str, Any]] = []
+    stopped = False
     kb: GraphRAGKnowledgeBase | None = None
-    for page in selected:
-        # Any failure is this page's, not the phase's.
-        try:
-            if kb is None:
-                kb = open_kb()
-            stored.append(store_web_document(kb, page, goal, root))
-        except Exception as exc:
-            failed.append({"url": page.get("url", ""), "error": str(exc)})
+    try:
+        for page in selected:
+            if should_stop is not None and should_stop():
+                stopped = True
+                break
+            # Any failure is this page's, not the phase's.
+            try:
+                if kb is None:
+                    kb = open_kb()
+                    kb._should_stop = should_stop
+                stored.append(store_web_document(kb, page, goal, root))
+            except EmbeddingStopped:
+                stopped = True
+                break
+            except Exception as exc:
+                url = page.get("url", "")
+                saved = bool(url) and (
+                    Path(root) / WEB_RESEARCH_DIR / _document_name_for(url)
+                ).is_file()
+                failed.append({"url": url, "error": str(exc), "saved": saved})
+    finally:
+        if kb is not None:
+            kb._should_stop = None
 
     return {
         "goal": goal,
@@ -708,6 +731,7 @@ def research_online(
         "chunks": sum(item["chunks"] for item in stored),
         "stored": stored,
         "failed": failed,
+        "stopped": stopped,
         "errors": answer["errors"],
         "elapsed_s": round(time.monotonic() - started, 1),
     }

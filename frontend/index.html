@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ambiguity console</title>
+<!-- No icon, said out loud: otherwise every load asks for /favicon.ico and logs a 404. -->
+<link rel="icon" href="data:,">
 <style>
 :root{
   --bg:#0a0b0d; --bg-2:#101216; --bg-3:#15181e; --line:#1e232c; --line-2:#2a313d;
@@ -2454,7 +2456,8 @@ const HEAL_RECENT = [];
 function healingChip(h){
   return (h.circuits || []).filter(c => c.state === "open").map(c => {
     const wait = c.retry_in_s ? ` · retry ${Math.ceil(c.retry_in_s)}s` : " · next call tests it";
-    const why = `${c.name} failed ${c.threshold} times in a row, so calls to it are refused `
+    const failed = c.threshold === 1 ? "failed" : `failed ${c.threshold} times in a row`;
+    const why = `${c.name} ${failed}, so calls to it are refused `
       + "until it answers again. Click to let the next call through now.";
     return `<span class="circuit" data-circuit="${esc(c.name)}" title="${esc(why)}">`
       + `${esc(c.name)} down${wait}</span>`;
