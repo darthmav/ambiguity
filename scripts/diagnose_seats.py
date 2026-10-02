@@ -680,7 +680,7 @@ def run_probe(candidate: Candidate, role: str, mods: dict[str, Any]) -> ProbeRes
             from langchain_core.messages import HumanMessage, SystemMessage
 
             response = tool_llm.invoke([
-                SystemMessage(content=nodes.BUILDER_PROMPT),
+                SystemMessage(content=nodes.seat_prompt("builder")),
                 HumanMessage(content=(
                     "Write a file `retry_helper.py` containing a `retry(fn, "
                     "attempts=3)` function. Call the filesystem_write tool to "

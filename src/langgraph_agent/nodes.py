@@ -11,6 +11,7 @@ research are parsed from fixed sections, and what the Builder wrote is linted
 and run before anyone rules on it.
 """
 
+import functools
 import json
 import keyword
 import os
@@ -105,8 +106,14 @@ def _with_deadline(work: Callable[[], _T], seconds: float, fallback: _T) -> _T:
 PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "prompts"
 
 
-def _load_prompt(name: str) -> str:
-    """A seat's system prompt. There is no fallback copy to drift from the file."""
+@functools.cache
+def seat_prompt(name: str) -> str:
+    """A seat's system prompt, read the first time the seat needs it.
+
+    Never at import: importing the package must not need the checkout's data
+    files, and the image's build stage imports it before prompts/ is copied
+    in. There is no fallback copy to drift from the file.
+    """
     try:
         return (PROMPTS_DIR / f"{name}.txt").read_text(encoding="utf-8")
     except OSError as exc:
@@ -114,12 +121,6 @@ def _load_prompt(name: str) -> str:
             f"The {name} prompt is missing ({exc}). The seats' prompts live in "
             f"{PROMPTS_DIR}; run from a checkout of the project."
         ) from exc
-
-
-ARCHITECT_PROMPT = _load_prompt("architect")
-PLANNER_PROMPT = _load_prompt("planner")
-RESEARCHER_PROMPT = _load_prompt("researcher")
-BUILDER_PROMPT = _load_prompt("builder")
 
 
 def _get_state_injection(state: AgentState) -> str:
@@ -418,7 +419,7 @@ def _rule_on_state(state: AgentState, reviewing: bool) -> dict[str, str]:
     )
 
     messages = [
-        SystemMessage(content=ARCHITECT_PROMPT),
+        SystemMessage(content=seat_prompt("architect")),
         HumanMessage(content=f"{state_injection}\n\nUser goal: {goal}\n\n{task}"),
     ]
 
@@ -603,7 +604,7 @@ def _make_plan(state: AgentState) -> dict[str, Any]:
     map_block = f"\n\n{corpus_map}" if corpus_map else ""
 
     messages = [
-        SystemMessage(content=PLANNER_PROMPT),
+        SystemMessage(content=seat_prompt("planner")),
         HumanMessage(content=f"{state_injection}{map_block}\n\nUser goal: {goal}"),
     ]
 
@@ -921,7 +922,7 @@ def _gather_research(state: AgentState) -> tuple[str, str]:
         return _retrieved_findings(results, floor, graph), ResearchStatus.READY_FOR_BUILDER.value
 
     messages = [
-        SystemMessage(content=RESEARCHER_PROMPT),
+        SystemMessage(content=seat_prompt("researcher")),
         HumanMessage(
             content=f"{_get_state_injection(state)}\n\nPlan to research:\n{plan}\n\n"
             f"{_retrieval_for_the_seat(results, floor, why_none)}"
@@ -1765,7 +1766,7 @@ def _seat_pass(
         else OUTPUT_DIR_NOTE.format(output_dir=output_dir) if output_dir else ""
     )
     messages: list[Any] = [
-        SystemMessage(content=BUILDER_PROMPT + note),
+        SystemMessage(content=seat_prompt("builder") + note),
         HumanMessage(
             content=f"{_get_state_injection(state)}\n\nPlan to implement:\n"
             f"{state.get('plan', '')}\n\nResearch findings:\n{state.get('research', '')}"

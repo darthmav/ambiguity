@@ -1,6 +1,11 @@
 """The package's public surface, pinned."""
 
+import subprocess
+import sys
 from importlib.metadata import version
+from pathlib import Path
+
+import pytest
 
 import langgraph_agent
 from langgraph_agent import AgentState, initial_state
@@ -42,3 +47,40 @@ def test_each_initial_state_is_its_own():
     first["messages"].append("x")
     first["files_changed"].append("y.py")
     assert second["messages"] == [] and second["files_changed"] == []
+
+
+def test_importing_the_package_reads_no_prompt_file(tmp_path):
+    """The image's build stage imports the package before prompts/ is copied in.
+
+    A prompt read at import broke that build, so the import runs here in a fresh
+    interpreter that records every file it opens.
+    """
+    prompts = Path(langgraph_agent.__file__).resolve().parents[2] / "prompts"
+    probe = (
+        "import sys\n"
+        "opened = []\n"
+        f"prefix = {str(prompts)!r}\n"
+        "sys.addaudithook(lambda event, args: event == 'open'"
+        " and str(args[0]).startswith(prefix) and opened.append(str(args[0])))\n"
+        "import langgraph_agent.graphrag_server  # what the build stage imports\n"
+        "print(opened)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-P", "-c", probe],
+        cwd=tmp_path, capture_output=True, text=True, timeout=300,
+    )
+
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert result.stdout.strip().splitlines()[-1] == "[]"
+
+
+def test_a_missing_prompt_is_named_when_its_seat_needs_it(monkeypatch, tmp_path):
+    from langgraph_agent import nodes
+
+    monkeypatch.setattr(nodes, "PROMPTS_DIR", tmp_path)
+    nodes.seat_prompt.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="The architect prompt is missing"):
+            nodes.seat_prompt("architect")
+    finally:
+        nodes.seat_prompt.cache_clear()
