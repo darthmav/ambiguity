@@ -86,6 +86,7 @@ from langgraph_agent.graphrag_server import (  # noqa: E402
     index_corpus_files,
     iter_corpus_files,
     open_knowledge_base,
+    remove_corpus_sources,
     resolve_persist_dir,
     store_uploaded_document,
 )
@@ -586,18 +587,28 @@ def rpc_export_corpus(_: dict[str, Any]) -> dict[str, Any]:
 
 
 def rpc_clear_corpus(_: dict[str, Any]) -> dict[str, Any]:
-    """Empty the knowledge base in place.
+    """Empty the knowledge base, and delete what it would be rebuilt from.
+
+    Clearing the store alone did not last: the corpus is rebuilt from the walk
+    when the console starts, so a restart embedded the same pages again. The
+    sources go first (`remove_corpus_sources`), so a store that fails to clear
+    is pruned by the next rebuild rather than refilled.
 
     Refused mid-run for the reason `_refuse_while_a_run_is_in_flight` sets out.
-    Refused with no corpus for a different one: creating a store in order to
-    empty it would leave behind exactly the thing the operator was asking to
-    be rid of.
+    With no corpus the sources are still deleted, but no store is created in
+    order to empty it: that would leave behind exactly the thing the operator
+    was asking to be rid of. Refused only when there is nothing either way.
     """
     with _changing_the_corpus("cleared"):
         kb_or_none = _open_kb()
-        if kb_or_none is None:
+        if kb_or_none is None and not iter_corpus_files():
             raise ValueError(f"There is no corpus to clear. {absent_corpus()[1]}")
-        return kb_or_none.clear()
+        sources = remove_corpus_sources()
+        forget_cached_walk()
+        if kb_or_none is None:
+            return {"removed_chunks": 0, "removed_nodes": 0, "removed_edges": 0,
+                    "removed_floor": False, **sources}
+        return {**kb_or_none.clear(), **sources}
 
 
 def rpc_list_seats(_: dict[str, Any]) -> dict[str, Any]:

@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import threading
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
@@ -47,6 +48,7 @@ from langgraph_agent.projects import (
     PROJECTS_DIR,
     embedded_projects,
     held_out_of_corpus,
+    set_project_embedded,
     skipped_dir,
 )
 from langgraph_agent.self_healing import Circuit, CircuitOpenError, call_with_retry
@@ -1718,6 +1720,40 @@ def iter_corpus_files(root: str = ".", roots: tuple[str, ...] | None = None) -> 
                 ):
                     files.add(path)
     return sorted(files)
+
+
+def remove_corpus_sources(root: str = ".") -> dict[str, int]:
+    """Delete what a rebuild would index, so an emptied corpus stays empty.
+
+    The corpus is a function of the walk, so emptying the store alone lasts only
+    until the next rebuild -- the next start -- embeds the same files again.
+    Fetched pages and uploads are deleted; a generated project is opted out,
+    never deleted, since its directory is a run's work and not the archive's.
+    The directories themselves stay: in the container each is a volume's mount
+    point.
+
+    Returns:
+        How many files were deleted and how many projects opted out.
+    """
+    root_path = Path(root)
+    removed_files = 0
+    for corpus_root in (WEB_RESEARCH_DIR, UPLOADS_DIR):
+        directory = root_path / corpus_root
+        if not directory.is_dir():
+            continue
+        for entry in directory.iterdir():
+            if entry.is_dir() and not entry.is_symlink():
+                removed_files += sum(1 for p in entry.rglob("*") if not p.is_dir())
+                shutil.rmtree(entry)
+            else:
+                removed_files += 1
+                entry.unlink()
+
+    opted_out = embedded_projects(root_path)
+    for name in opted_out:
+        set_project_embedded(name, False, root_path)
+
+    return {"removed_files": removed_files, "projects_opted_out": len(opted_out)}
 
 
 def index_corpus_files(

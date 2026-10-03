@@ -22,10 +22,14 @@ from store_doubles import StoreDoubleMixin
 import serve
 from langgraph_agent.graphrag_server import (
     EMBEDDING_DIMENSIONS,
+    UPLOADS_DIR,
+    WEB_RESEARCH_DIR,
     GraphRAGKnowledgeBase,
     index_corpus_files,
+    iter_corpus_files,
     relevance_floor,
 )
+from langgraph_agent.projects import set_project_embedded
 
 # The walk's mechanics, laid out at the top of a scratch tree.
 pytestmark = pytest.mark.usefixtures("whole_root_walk")
@@ -386,8 +390,13 @@ def test_export_of_an_empty_corpus_is_still_a_document(tmp_path):
 
 
 @pytest.fixture
-def console_kb(kb, monkeypatch):
-    """Point the console's `_kb()` at the fake, and start with no run armed."""
+def console_kb(kb, monkeypatch, tmp_path):
+    """Point the console's `_kb()` at the fake, and start with no run armed.
+
+    Run from an empty directory: a clear deletes the corpus's sources from the
+    working directory, which must never be the checkout's.
+    """
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(serve, "kb", kb)
     with serve._run_lock:
         serve._run_progress.update(running=False, goal="", node="", run_id="")
@@ -407,6 +416,51 @@ def test_rpc_clear_empties_the_corpus(console_kb):
     assert result["removed_chunks"] == 2
     assert console_kb.graph.number_of_nodes() == 0
     assert console_kb.collection.count() == 0
+
+
+def test_rpc_clear_deletes_the_sources_a_restart_would_reembed(console_kb, tmp_path):
+    """A clear has to outlive a restart, and the restart rebuilds from the walk.
+
+    Emptying the store alone left the fetched pages and uploads on disk, and the
+    next start embedded every one of them again. A project is opted out, never
+    deleted: its directory is a run's work, not the archive.
+    """
+    (tmp_path / WEB_RESEARCH_DIR).mkdir(parents=True)
+    (tmp_path / WEB_RESEARCH_DIR / "page.md").write_text("# fetched\n")
+    (tmp_path / UPLOADS_DIR / "nested").mkdir(parents=True)
+    (tmp_path / UPLOADS_DIR / "nested" / "notes.md").write_text("# mine\n")
+    (tmp_path / "projects" / "surfer").mkdir(parents=True)
+    (tmp_path / "projects" / "surfer" / "app.py").write_text("print(1)\n")
+    set_project_embedded("surfer", True, tmp_path)
+
+    result = serve.rpc_clear_corpus({})
+
+    assert result["removed_files"] == 2
+    assert result["projects_opted_out"] == 1
+    assert iter_corpus_files(str(tmp_path)) == []
+    assert (tmp_path / WEB_RESEARCH_DIR).is_dir()  # a volume's mount point stays
+    assert (tmp_path / "projects" / "surfer" / "app.py").exists()
+
+
+def test_rpc_clear_with_no_store_still_deletes_the_sources(console_kb, monkeypatch, tmp_path):
+    """Files on disk with no store yet are a corpus the next start would build."""
+    monkeypatch.setattr(serve, "kb", None)
+    monkeypatch.setattr(serve, "open_knowledge_base", lambda: None)
+    (tmp_path / UPLOADS_DIR).mkdir()
+    (tmp_path / UPLOADS_DIR / "notes.md").write_text("# mine\n")
+
+    result = serve.rpc_clear_corpus({})
+
+    assert result["removed_files"] == 1
+    assert not (tmp_path / UPLOADS_DIR / "notes.md").exists()
+
+
+def test_rpc_clear_with_nothing_at_all_is_refused(console_kb, monkeypatch):
+    monkeypatch.setattr(serve, "kb", None)
+    monkeypatch.setattr(serve, "open_knowledge_base", lambda: None)
+
+    with pytest.raises(ValueError, match="no corpus to clear"):
+        serve.rpc_clear_corpus({})
 
 
 def test_rpc_clear_is_refused_while_a_run_is_in_flight(console_kb):

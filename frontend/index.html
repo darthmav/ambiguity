@@ -440,7 +440,7 @@ pre#state-dump{font:11px/1.7 var(--mono);color:var(--ink-2);white-space:pre-wrap
       <button class="go ghost" id="tpbtn"
               title="Group the corpus into topic communities — documents together with the entities that define them. The number of topics is chosen from the eigengap, and the answer is 'no clear structure' rather than a made-up map when the corpus has none.">Topics</button>
       <button class="go danger" id="clrbtn"
-              title="Empty the corpus: its chunks, graph and floor go in one database transaction, leaving an empty store — the same shape a reindex leaves. Refused while a run is in flight.">Clear corpus</button>
+              title="Empty the corpus and delete what it is rebuilt from: fetched pages and uploads are deleted, embedded projects are opted out (never deleted), and chunks, graph and floor go in one database transaction. A restart then finds nothing to embed. Refused while a run is in flight.">Clear corpus</button>
       <span class="muted" id="restat"></span>
     </div>
     <!-- One scroll for the analyses and the list together. The panel itself
@@ -1552,7 +1552,9 @@ $("#clrbtn").onclick = async () => {
   try{
     const r = await rpc("clear_corpus", {});
     $("#restat").textContent =
-      `cleared — ${r.removed_chunks} chunks, ${r.removed_nodes} nodes removed`;
+      `cleared — ${r.removed_chunks} chunks, ${r.removed_nodes} nodes, ` +
+      `${r.removed_files} files removed` +
+      (r.projects_opted_out ? `, ${r.projects_opted_out} projects opted out` : "");
     NODES = [];                       // the drawn graph went with the corpus
     await Promise.all([loadDocs(), poll(true)]);
   }catch(e){ $("#restat").textContent = "clear failed: " + e.message; }

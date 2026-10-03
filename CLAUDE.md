@@ -356,7 +356,10 @@ a Builder that runs programs. No CORS header is sent; the page is same-origin.
 - **Changing the corpus is refused while a run or a rebuild is in flight**
   (`clear_corpus`, `upload_document`); `export_corpus` is not, since reading
   takes nothing away. `clear()` empties chunks, graph and floor record in one
-  transaction, and only then the in-memory graph.
+  transaction, and only then the in-memory graph. `clear_corpus` first deletes
+  what a rebuild would walk (`remove_corpus_sources`): fetched pages and uploads
+  go, projects are opted out but never deleted. Without that, the next start
+  embedded the same files again.
 - **An uploaded document is a file first**: `store_uploaded_document` writes
   under `uploads/` and only then embeds, so `uploads/` must stay one of
   `CORPUS_ROOTS` or the next rebuild deletes the upload silently.
