@@ -49,6 +49,7 @@ from langgraph_agent.config import (  # noqa: E402
     daemon_request,
     get_agent_model_info,
     get_agent_status,
+    is_local_ollama_model,
     list_ollama_models,
     ollama_base_url,
     ollama_model_capabilities,
@@ -60,7 +61,12 @@ from langgraph_agent.corpus_health import (  # noqa: E402
     corpus_staleness,
     forget_cached_walk,
 )
-from langgraph_agent.corpus_store import POSTGRES, get_database, rebuild_claim  # noqa: E402
+from langgraph_agent.corpus_store import (  # noqa: E402
+    POSTGRES,
+    database_unreachable,
+    get_database,
+    rebuild_claim,
+)
 from langgraph_agent.graph import RECURSION_LIMIT  # noqa: E402
 from langgraph_agent.graphrag_server import (  # noqa: E402
     EMBEDDER_LOAD,
@@ -70,6 +76,7 @@ from langgraph_agent.graphrag_server import (  # noqa: E402
     GraphRAGKnowledgeBase,
     absent_corpus,
     calibrate_relevance_floor,
+    corpus_signature,
     corpus_state,
     embedding_device_status,
     floor_calibration,
@@ -256,6 +263,17 @@ def rpc_rag_stats(_: dict[str, Any]) -> dict[str, Any]:
         }
 
     stats = kb_or_none.stats()
+    if stats["total_chunks"] is None:
+        # The store could not be asked: unavailable, never "empty", which
+        # would tell the operator a rebuild is what is missing.
+        state, note = "unavailable", (
+            f"The corpus database could not be asked ({stats.get('store_error')}), so "
+            "there is nothing to retrieve until it answers. The console reports it as "
+            "the postgres circuit; a run goes ahead without retrieval."
+        )
+        stats.update(corpus=state, note=note, total_chunks=0,
+                     staleness={"stale": False, "unavailable": note})
+        return stats
     stats["corpus"] = "indexed" if stats["total_chunks"] else "empty"
 
     # The corpus drifts from the archive silently: every counter above stays
@@ -365,6 +383,32 @@ def rpc_search_documents(params: dict[str, Any]) -> dict[str, Any]:
     return {"results": results, "source": "local_graphrag"}
 
 
+def _why_the_corpus_is_busy(action: str) -> str | None:
+    """Why the corpus cannot be `action` now, or None. The caller holds `_run_lock`."""
+    running = bool(_run_progress["running"])
+    goal = str(_run_progress["goal"])
+    # A run takes precedence in the wording: it is the one of the two the
+    # operator can end, and a run started into a rebuild sets both flags.
+    if running:
+        detail = f" Running: {goal}" if goal else ""
+        return (
+            f"A run is in flight and the Researcher is searching this corpus, so "
+            f"it cannot be {action} right now. Stop the run first.{detail}"
+        )
+    if _background_rebuild["running"]:
+        return (
+            f"The corpus is being rebuilt to match the archive, so it cannot be "
+            f"{action} right now. The header says how far it has got; try again "
+            f"when it stops."
+        )
+    if _corpus_change["running"]:
+        return (
+            f"The corpus is being {_corpus_change['action']} from another request, so "
+            f"it cannot be {action} right now; try again in a moment."
+        )
+    return None
+
+
 def _refuse_while_a_run_is_in_flight(action: str) -> None:
     """Refuse to change the corpus underneath a run or a rebuild.
 
@@ -372,7 +416,9 @@ def _refuse_while_a_run_is_in_flight(action: str) -> None:
     or half-rebuilt corpus reads to the Researcher as one with nothing to say,
     and the run plans around an absence made out from under it. A background
     rebuild is the same hazard without the run, worded apart because the
-    operator stops a run but waits out a rebuild.
+    operator stops a run but waits out a rebuild. A change that goes on to
+    happen holds `_changing_the_corpus` instead, which checks and claims in one
+    hold of the lock.
 
     Args:
         action: Past participle of what was refused -- "cleared", "added to".
@@ -381,24 +427,33 @@ def _refuse_while_a_run_is_in_flight(action: str) -> None:
         ValueError: naming the goal in flight, or the rebuild.
     """
     with _run_lock:
-        running = bool(_run_progress["running"])
-        goal = str(_run_progress["goal"])
-        # A run takes precedence in the wording: it is the one of the two the
-        # operator can end, and a run started into a rebuild sets both flags.
-        indexing = bool(_background_rebuild["running"])
+        why = _why_the_corpus_is_busy(action)
+    if why is not None:
+        raise ValueError(why)
 
-    if running:
-        detail = f" Running: {goal}" if goal else ""
-        raise ValueError(
-            f"A run is in flight and the Researcher is searching this corpus, so "
-            f"it cannot be {action} right now. Stop the run first.{detail}"
-        )
-    if indexing:
-        raise ValueError(
-            f"The corpus is being rebuilt to match the archive, so it cannot be "
-            f"{action} right now. The header says how far it has got; try again "
-            f"when it stops."
-        )
+
+@contextlib.contextmanager
+def _changing_the_corpus(action: str) -> Iterator[None]:
+    """Change the corpus with no run or rebuild able to start until it is done.
+
+    The refusal used to be checked and then let go of: a run claimed in the gap
+    rebuilt the corpus under an upload, and the stored graph and the one in
+    memory parted. Checked and claimed in one hold of `_run_lock`; a run asked
+    for meanwhile is refused, and a background rebuild leaves it to the next.
+
+    Raises:
+        ValueError: as `_refuse_while_a_run_is_in_flight` does.
+    """
+    with _run_lock:
+        why = _why_the_corpus_is_busy(action)
+        if why is not None:
+            raise ValueError(why)
+        _corpus_change.update(running=True, action=action)
+    try:
+        yield
+    finally:
+        with _run_lock:
+            _corpus_change.update(running=False, action="")
 
 
 def rpc_list_projects(_: dict[str, Any]) -> dict[str, Any]:
@@ -420,9 +475,9 @@ def rpc_embed_project(params: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(error)
     if not Path(project_dir(name)).is_dir():
         raise ValueError(f"There is no project {name!r} under projects/.")
-    _refuse_while_a_run_is_in_flight("changed")
-    set_project_embedded(name, embed)
-    forget_cached_walk()
+    with _changing_the_corpus("changed"):
+        set_project_embedded(name, embed)
+        forget_cached_walk()
     rebuilding = REBUILD_CORPUS
     if rebuilding:
         threading.Thread(
@@ -456,15 +511,15 @@ def rpc_upload_document(params: dict[str, Any]) -> dict[str, Any]:
     search is reading. One document per call, so a file the corpus cannot take
     fails alone instead of taking a batch down with it.
     """
-    _refuse_while_a_run_is_in_flight("added to")
     name = params.get("name", "")
     content = params.get("content", "")
     if not isinstance(name, str) or not isinstance(content, str):
         raise ValueError("An upload is a filename and its text; both must be strings.")
-    report = store_uploaded_document(_kb_for_indexing(), name, content)
-    # The upload is a new file, so the cached walk is behind the corpus now;
-    # forgotten, or the new document would read as `extra`.
-    forget_cached_walk()
+    with _changing_the_corpus("added to"):
+        report = store_uploaded_document(_kb_for_indexing(), name, content)
+        # The upload is a new file, so the cached walk is behind the corpus
+        # now; forgotten, or the new document would read as `extra`.
+        forget_cached_walk()
     return report
 
 
@@ -536,11 +591,11 @@ def rpc_clear_corpus(_: dict[str, Any]) -> dict[str, Any]:
     empty it would leave behind exactly the thing the operator was asking to
     be rid of.
     """
-    _refuse_while_a_run_is_in_flight("cleared")
-    kb_or_none = _open_kb()
-    if kb_or_none is None:
-        raise ValueError(f"There is no corpus to clear. {absent_corpus()[1]}")
-    return kb_or_none.clear()
+    with _changing_the_corpus("cleared"):
+        kb_or_none = _open_kb()
+        if kb_or_none is None:
+            raise ValueError(f"There is no corpus to clear. {absent_corpus()[1]}")
+        return kb_or_none.clear()
 
 
 def rpc_list_seats(_: dict[str, Any]) -> dict[str, Any]:
@@ -610,7 +665,7 @@ def _seat_model_options() -> list[dict[str, str]]:
         caps = ollama_model_capabilities(tag)
         if caps is not None and "completion" not in caps:
             continue
-        cloud = tag.endswith((":cloud", "-cloud"))
+        cloud = not is_local_ollama_model(tag)
         options.append({
             "label": tag,
             "provider": "ollama",
@@ -931,21 +986,30 @@ def rpc_shutdown(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def _calibrate_the_floor_before_the_run(corpus_report: dict[str, Any]) -> dict[str, Any]:
-    """Measure the relevance floor the first time the corpus is whole.
+    """Measure the relevance floor whenever the corpus is whole and has changed.
 
     A cosine means nothing absolute and nothing across models, so the floor is
-    measured, never set: `embedding_calibration.json` holds questions the
-    corpus answers and questions it cannot, and the floor sits in the gap. A
-    model that leaves no gap gets no floor. Skipped unless the corpus phase left
-    a whole corpus.
+    measured, never set: questions the corpus answers -- drawn from its own
+    documents -- against questions it cannot (`embedding_calibration.json`),
+    and the floor sits in the gap. A corpus that leaves no gap gets no floor.
+    A record taken on the texts the corpus holds now is `known`; one taken on
+    other texts, or before records named their corpus, is measured again.
+    Skipped unless the corpus phase left a whole corpus.
     """
-    if floor_calibration() is not None:
-        return {"source": "known", "model": EMBEDDING_MODEL_NAME}
+    record = floor_calibration()
+    kb_or_none = _open_kb()
+    if record is not None and kb_or_none is not None:
+        try:
+            if record.get("corpus") == corpus_signature(kb_or_none):
+                return {"source": "known", "model": EMBEDDING_MODEL_NAME}
+        except Exception:
+            pass  # the store could not say what it holds; the checks below decide
     if RUN_CONTROL.stopped() or corpus_report.get("stopped"):
         return {"source": "stopped", "model": EMBEDDING_MODEL_NAME}
     if corpus_report.get("source") in ("error", "nothing_to_index", "unavailable"):
-        return {"source": "no_corpus", "model": EMBEDDING_MODEL_NAME}
-    kb_or_none = _open_kb()
+        # The floor a record carries is still the best there is to read off.
+        source = "known" if record is not None else "no_corpus"
+        return {"source": source, "model": EMBEDDING_MODEL_NAME}
     if kb_or_none is None or corpus_state()[0] != "indexed":
         return {"source": "no_corpus", "model": EMBEDDING_MODEL_NAME}
     with _run_lock:
@@ -964,6 +1028,13 @@ def _calibration_feed_line(report: dict[str, Any]) -> str | None:
     """Said when a floor was measured or could not be: the outcomes that change retrieval."""
     source = report.get("source")
     model = report.get("model")
+    if source == "calibrated" and report.get("too_small") is not None:
+        return (
+            f"[Embedder] The corpus offers {report['too_small']} question(s) it answers by "
+            f"construction, too few to measure a relevance floor for {model} on: the "
+            "Researcher's model answers every search, and the floor is measured again "
+            "once the corpus has changed."
+        )
     if source == "calibrated":
         answered = report.get("answered") or [0.0]
         unanswerable = report.get("unanswerable") or [0.0]
@@ -975,7 +1046,8 @@ def _calibration_feed_line(report: dict[str, Any]) -> str | None:
             return (
                 f"[Embedder] {model} left no gap between the two populations ({span}), "
                 "so it has no relevance floor: the Researcher's model answers every "
-                "search and the Planner gets no corpus map."
+                "search and the Planner gets no corpus map until the corpus changes "
+                "and the floor is measured again."
             )
         return (
             f"[Embedder] Measured a relevance floor for {model}: {span}, so retrieval "
@@ -1045,6 +1117,9 @@ def _claim_the_rebuild(
 # block and the snapshot all key off that dict. Guarded by `_run_lock`.
 _background_rebuild: dict[str, Any] = {"running": False, "message": "", "report": {}}
 
+# An upload, a clear or an opt-in under way (`_changing_the_corpus`).
+_corpus_change: dict[str, Any] = {"running": False, "action": ""}
+
 
 def _rebuild_the_corpus(
     *,
@@ -1088,7 +1163,23 @@ def _rebuild_the_corpus(
                 _kb_for_indexing(), progress=progress, should_stop=should_stop
             )
     except Exception as exc:
-        return {"source": "error", "corpus": state, "note": str(exc)}
+        if isinstance(exc, CircuitOpenError) or database_unreachable(exc):
+            # The claim or the store met a database that is not answering: an
+            # outage like one met midway, which the monitor redoes the rebuild
+            # after, so it is recorded the same way.
+            failed: dict[str, Any] = {
+                "source": "unavailable", "corpus": state, "stopped": False,
+                "unavailable": str(exc),
+                "unavailable_circuit": getattr(exc, "circuit", POSTGRES.name),
+                "indexed": 0, "embedded": 0, "reused": 0, "dropped": 0, "skipped": 0,
+                "errors": [],
+            }
+        else:
+            failed = {"source": "error", "corpus": state, "note": str(exc)}
+        with _run_lock:
+            _last_rebuild.clear()
+            _last_rebuild.update(failed)
+        return failed
 
     if report.get("stopped"):
         source = "stopped_midway"
@@ -1135,7 +1226,9 @@ def _rebuild_the_corpus_in_background(when: str = "at startup") -> dict[str, Any
     # Checked in the same hold, so a second caller finds one under way and
     # leaves it to finish the same walk.
     with _run_lock:
-        if _background_rebuild["running"]:
+        # A change under way finishes first; the next rebuild -- before the next
+        # run, or the monitor's -- catches the corpus up.
+        if _background_rebuild["running"] or _corpus_change["running"]:
             return None
         _background_rebuild["running"] = True
         _background_rebuild["message"] = "checking the archive against the corpus"
@@ -1266,6 +1359,12 @@ def _rebuild_the_corpus_before_the_run() -> dict[str, Any]:
     )
 
 
+def _passages(report: dict[str, Any]) -> str:
+    """The report's chunk count, or what stands in for one the store would not give."""
+    count = report.get("total_chunks")
+    return "an unknown number of" if count is None else str(count)
+
+
 def _corpus_feed_line(report: dict[str, Any], *, when: str = "before the run") -> str | None:
     """One line for the feed whenever a rebuild checked the corpus.
 
@@ -1281,7 +1380,7 @@ def _corpus_feed_line(report: dict[str, Any], *, when: str = "before the run") -
         return (
             f"[Corpus] The corpus already matched the archive, so nothing was "
             f"re-embedded: {report.get('indexed', 0)} document(s), "
-            f"{report.get('total_chunks', 0)} passage(s), checked in "
+            f"{_passages(report)} passage(s), checked in "
             f"{report.get('elapsed_s', 0)}s. The Researcher searches it as it "
             "stands."
         )
@@ -1310,7 +1409,7 @@ def _corpus_feed_line(report: dict[str, Any], *, when: str = "before the run") -
             )
         return (
             f"[Corpus] {was}, so the archive was indexed {when}: "
-            f"{report['indexed']} document(s), {report.get('total_chunks', 0)} "
+            f"{report['indexed']} document(s), {_passages(report)} "
             f"passage(s) in {report.get('elapsed_s', 0)}s.{note} The Researcher "
             "searches this like any other corpus."
         )
@@ -1321,7 +1420,7 @@ def _corpus_feed_line(report: dict[str, Any], *, when: str = "before the run") -
         if changed:
             parts.append(f"{changed} document(s) re-read")
         if dropped:
-            parts.append(f"{dropped} no longer in the archive dropped")
+            parts.append(f"{dropped} no longer in the archive (or no longer indexable) dropped")
         return (
             f"[Corpus] The corpus was behind the archive, so it was brought up "
             f"to date {when}: {', '.join(parts)}, {report.get('reused', 0)} "
@@ -1572,6 +1671,11 @@ def rpc_run_goal(params: dict[str, Any]) -> dict[str, Any]:
         if _run_progress["running"]:
             raise ValueError(
                 "A run is already in flight. Stop it before starting another."
+            )
+        if _corpus_change["running"]:
+            raise ValueError(
+                f"The corpus is being {_corpus_change['action']} right now; start the "
+                "run when that has finished."
             )
         RUN_CONTROL.arm(run_id)
         # Under the lock `run_progress` reads the record through, so no reply

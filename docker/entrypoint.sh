@@ -121,4 +121,21 @@ else
     echo "             docker compose build --no-cache"
 fi
 
+# 6. the image against the code --------------------------------------------
+# The code comes from the checkout (compose mounts it, pyproject.toml with
+# it), but the venv was installed when the image was built, and records what
+# from. A pull that adds a dependency leaves a container whose code imports a
+# package its venv does not have -- a ModuleNotFoundError with nothing to say
+# that a rebuild is the fix -- so it is said here first.
+deps_stamp="${VIRTUAL_ENV:-/opt/venv}/.ambiguity-deps"
+if [ -f "$deps_stamp" ] && [ -f pyproject.toml ]; then
+    if [ "$(sha256sum pyproject.toml | cut -d' ' -f1)" = "$(cat "$deps_stamp")" ]; then
+        echo "  dependencies: as pyproject.toml declares them"
+    else
+        echo "  dependencies: pyproject.toml has changed since this image was built,"
+        echo "                so the code can need a package the image lacks:"
+        echo "                docker compose up --build"
+    fi
+fi
+
 exec "$@"

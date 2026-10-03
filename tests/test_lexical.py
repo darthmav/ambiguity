@@ -226,6 +226,161 @@ def test_a_record_for_another_model_is_no_floor(tmp_path, monkeypatch, postgres)
     assert graphrag_server.relevance_floor() is None
 
 
+def _corpus_kb(tmp_path, files: dict[str, str]) -> GraphRAGKnowledgeBase:
+    """A corpus of real files on disk, with a fake store and no embedder."""
+    kb = object.__new__(GraphRAGKnowledgeBase)
+    kb.persist_dir = tmp_path
+    kb.collection = _FakeCollection()
+    kb.graph = nx.DiGraph()
+    for name, text in files.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        kb.graph.add_node(str(path), type="document")
+        kb.collection.upsert(
+            ids=[f"{path}#0000"], embeddings=[[0.0, 0.0, 0.0]], documents=[text],
+            metadatas=[{"doc_id": str(path), "sha": f"sha-{name}"}],
+        )
+    return kb
+
+
+def _page(goal: str) -> str:
+    return (
+        "# A page\n\n- Source: https://example.org/page\n- Retrieved: 2026-10-02 10:00 UTC\n"
+        f"- Researched for: {goal}\n\n---\n\nThe article itself.\n"
+    )
+
+
+def test_the_questions_the_corpus_answers_come_from_its_own_documents(tmp_path):
+    """They were twelve questions about this project's own code, which the
+    corpus -- the research archive -- never holds."""
+    from langgraph_agent.graphrag_server import answered_questions
+
+    kb = _corpus_kb(tmp_path, {
+        "research/web/a.md": _page("How should Postgres autovacuum be tuned?"),
+        "research/web/b.md": _page("How should Postgres autovacuum be tuned?"),
+        "uploads/deploy.md": "# Deploying the console with Docker\n\nSteps follow.\n",
+        "uploads/plain.txt": "a first line with enough words\nand more\n",
+        "uploads/tiny.md": "# Notes\n",
+    })
+
+    assert answered_questions(kb, 12) == [
+        "How should Postgres autovacuum be tuned?",  # one goal, asked once
+        "Deploying the console with Docker",
+        "a first line with enough words",
+    ]
+
+
+def test_the_questions_are_spread_across_a_large_corpus(tmp_path):
+    from langgraph_agent.graphrag_server import answered_questions
+
+    kb = _corpus_kb(tmp_path, {
+        f"research/web/{n:02d}.md": _page(f"What does research topic number {n:02d} cover?")
+        for n in range(30)
+    })
+
+    picked = answered_questions(kb, 4)
+    assert picked[0].endswith("00 cover?") and picked[-1].endswith("29 cover?")
+    assert len(set(picked)) == 4
+
+
+def test_the_floor_sits_between_the_corpus_s_own_answers_and_off_domain_questions(
+    tmp_path, monkeypatch
+):
+    from langgraph_agent.graphrag_server import (
+        answered_questions,
+        calibrate_relevance_floor,
+        corpus_signature,
+    )
+
+    kb = _corpus_kb(tmp_path, {
+        f"research/web/{n}.md": _page(f"How does subsystem number {n} behave?")
+        for n in range(3)
+    })
+    answered = set(answered_questions(kb, 12))
+    # The best cosine of each search, not its first hit, is what is measured.
+    monkeypatch.setattr(kb, "search", lambda q, k: [
+        {"score": 0.1}, {"score": 0.8 if q in answered else 0.3},
+    ])
+
+    record = calibrate_relevance_floor(kb)
+
+    assert record["answered"] == [0.8, 0.8, 0.8]
+    assert set(record["unanswerable"]) == {0.3}
+    assert record["floor"] == 0.55
+    assert record["corpus"] == corpus_signature(kb)
+    assert kb.collection.floor_record() == record
+
+
+def test_a_corpus_too_small_to_answer_itself_gets_no_floor_and_no_search(tmp_path, monkeypatch):
+    from langgraph_agent.graphrag_server import calibrate_relevance_floor
+
+    kb = _corpus_kb(tmp_path, {
+        "research/web/a.md": _page("How does the only topic here behave?"),
+        "uploads/b.md": "# Two words\n",
+    })
+    searched: list[str] = []
+    monkeypatch.setattr(kb, "search", lambda q, k: searched.append(q) or [])
+
+    record = calibrate_relevance_floor(kb)
+
+    assert (record["floor"], record["too_small"]) == (None, 1)
+    assert searched == []
+
+
+def test_a_changed_corpus_has_another_signature(tmp_path):
+    from langgraph_agent.graphrag_server import corpus_signature
+
+    kb = _corpus_kb(tmp_path, {"uploads/a.md": "# Some document title\n"})
+    before = corpus_signature(kb)
+    kb.collection.upsert(
+        ids=["late.md#0000"], embeddings=[[0.0, 0.0, 0.0]], documents=["late"],
+        metadatas=[{"doc_id": "late.md", "sha": "sha-late"}],
+    )
+    assert corpus_signature(kb) != before
+
+
+def test_a_floor_measured_on_other_texts_is_measured_again(monkeypatch):
+    """A record's presence was `known` for good: a no-gap record taken on a
+    corpus of three pages kept retrieval off however the archive grew."""
+    import serve
+    from langgraph_agent.graphrag_server import EMBEDDING_MODEL_NAME
+
+    measured: list[object] = []
+    stored: dict[str, Any] = {"model": EMBEDDING_MODEL_NAME, "floor": None, "corpus": "then"}
+    corpus = object()
+    monkeypatch.setattr(serve, "floor_calibration", lambda: stored)
+    monkeypatch.setattr(serve, "_open_kb", lambda: corpus)
+    monkeypatch.setattr(serve, "corpus_state", lambda: ("indexed", EMBEDDING_MODEL_NAME))
+    monkeypatch.setattr(serve, "calibrate_relevance_floor", lambda kb: measured.append(kb) or {
+        "model": EMBEDDING_MODEL_NAME, "floor": 0.5, "answered": [0.7], "unanswerable": [0.3],
+    })
+
+    monkeypatch.setattr(serve, "corpus_signature", lambda kb: "now")
+    assert serve._calibrate_the_floor_before_the_run({"source": "updated"})["source"] == "calibrated"
+    assert measured == [corpus]
+
+    monkeypatch.setattr(serve, "corpus_signature", lambda kb: "then")
+    assert serve._calibrate_the_floor_before_the_run({"source": "current"})["source"] == "known"
+    assert measured == [corpus]
+
+    del stored["corpus"]  # taken before records named their corpus
+    assert serve._calibrate_the_floor_before_the_run({"source": "current"})["source"] == "calibrated"
+
+
+def test_the_planner_map_does_not_search_without_a_floor(monkeypatch):
+    """It searched -- loading the embedder and evicting the seat about to plan --
+    and only then found there was no floor to read the hits against."""
+    import langgraph_agent.nodes as nodes
+
+    searched: list[object] = []
+    monkeypatch.setattr("langgraph_agent.graphrag_server.relevance_floor", lambda: None)
+    monkeypatch.setattr(nodes, "_call_tool", lambda name, args: searched.append(args) or {})
+
+    assert nodes._corpus_map("a goal") == ""
+    assert searched == []
+
+
 def test_nodes_read_the_floor_and_never_hard_code_one():
     """The floor is a property of the model, and meaningless apart from it.
 

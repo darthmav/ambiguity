@@ -173,7 +173,9 @@ request, so both come back 200.
 | `shutdown` | `stop_first` | whether the server is exiting |
 
 `GET /api/status` answers the same payload as `status`: `launch_console.sh`
-polls it as its readiness check, and the container's health check uses it.
+polls it as its readiness check, and the container's health check uses it --
+both looking for the payload's `indexes_on_run` key, since any server on the
+port answers the request itself.
 
 ## Customization
 

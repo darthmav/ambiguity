@@ -339,3 +339,65 @@ def test_a_bound_seat_keeps_its_belt_through_the_fallback(monkeypatch) -> None:
     belted = seat.bind_tools(["filesystem_write"])
     assert belted.invoke("hello") == "ok:None"
     assert belted._inner.bound == ["filesystem_write"]
+
+
+def _endless_model(tokens: int = 2000) -> object:
+    from langchain_core.language_models import BaseChatModel
+    from langchain_core.messages import AIMessage
+    from langchain_core.outputs import ChatGeneration, ChatResult
+
+    class Endless(BaseChatModel):
+        produced: int = 0
+
+        @property
+        def _llm_type(self) -> str:
+            return "endless"
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[no-untyped-def]
+            # What ChatOllama.invoke does: stream, telling the run manager of
+            # every token, and only then build the answer.
+            for _ in range(tokens):
+                time.sleep(0.005)
+                self.produced += 1
+                if run_manager:
+                    run_manager.on_llm_new_token("x")
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content="done"))])
+
+    return Endless()
+
+
+def test_a_seat_call_its_node_gave_up_on_lets_go_of_the_cards() -> None:
+    """The socket timeout bounds only the gap between streamed tokens, so an
+    abandoned call kept generating -- holding the arbiter every other seat and
+    the embedder wait on -- for as long as the model would."""
+    from langchain_core.messages import HumanMessage
+
+    from langgraph_agent.control import GPU_ARBITER
+    from langgraph_agent.nodes import _with_deadline
+
+    model = _endless_model()
+    seat = config._SeatLLM("planner", model)
+
+    assert _with_deadline(lambda: seat.invoke([HumanMessage(content="go")]), 0.2, None) is None
+
+    released = GPU_ARBITER._lock.acquire(timeout=3)
+    assert released, "the abandoned call still holds the cards"
+    GPU_ARBITER._lock.release()
+    stopped_at = model.produced  # type: ignore[attr-defined]
+    time.sleep(0.1)
+    assert model.produced == stopped_at < 2000  # type: ignore[attr-defined]
+    assert "planner" not in config._seat_failures, "giving up is not the seat failing"
+
+
+def test_a_seat_call_nobody_gave_up_on_streams_to_its_end() -> None:
+    from langchain_core.messages import HumanMessage
+
+    from langgraph_agent.nodes import _with_deadline
+
+    model = _endless_model(tokens=100)
+    seat = config._SeatLLM("planner", model)
+
+    reply = _with_deadline(lambda: seat.invoke([HumanMessage(content="go")]), 60, None)
+
+    assert reply is not None and reply.content == "done"
+    assert model.produced == 100  # type: ignore[attr-defined]

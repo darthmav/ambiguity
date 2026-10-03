@@ -73,11 +73,18 @@ def _route_from_planner(state: AgentState) -> Literal["researcher", "builder"]:
     return "researcher"
 
 
-def _route_from_researcher(state: AgentState) -> Literal["planner", "builder"]:
-    """Route on research_status; only a need_replan goes back to the Planner."""
+def _route_from_researcher(state: AgentState) -> Literal["planner", "builder", "__end__"]:
+    """Route on research_status; only a need_replan goes back to the Planner.
+
+    A replan counts a step (`researcher_node`), since the Planner and the
+    Researcher can loop without reaching the gate; at `MAX_STEPS` it ends the
+    run unapproved, as the gate would.
+    """
     status = state.get("research_status", ResearchStatus.READY_FOR_BUILDER.value)
 
     if status == ResearchStatus.NEED_REPLAN.value:
+        if state.get("step_count", 0) >= MAX_STEPS:
+            return "__end__"
         return "planner"
     return "builder"
 
@@ -122,7 +129,8 @@ def create_agent_graph() -> CompiledStateGraph[AgentState, Any, AgentState, Agen
     - Planner chooses Researcher (needs knowledge) or Builder (task is clear),
       except on the opening cycle, which always retrieves once before the
       Builder acts -- see `_route_from_planner`
-    - Researcher sets status: ready_for_builder | need_replan | no_relevant_knowledge
+    - Researcher sets status: ready_for_builder | need_replan | no_relevant_knowledge;
+      a need_replan counts a step, since that loop never reaches the gate
     - Builder always reports back to the Architect; it does not decide it is done
     - Stops on an `approved` verdict, or at MAX_STEPS
     """
@@ -161,6 +169,7 @@ def create_agent_graph() -> CompiledStateGraph[AgentState, Any, AgentState, Agen
         {
             "planner": "planner",
             "builder": "builder",
+            END: END,
         },
     )
 

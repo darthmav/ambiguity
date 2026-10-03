@@ -33,9 +33,8 @@ dependencies = [
     # spectral_graph and the corpus diagnostics built on it.
     "numpy>=2.0",
     "scipy>=1.14",
-    # self_healing: retries with backoff, and circuit breakers.
+    # self_healing: retries with backoff. Its circuit breakers are its own.
     "tenacity>=8.2.0",
-    "pybreaker>=1.2.0",
 ]
 
 [project.optional-dependencies]

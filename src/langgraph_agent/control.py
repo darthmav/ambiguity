@@ -13,6 +13,7 @@ import time
 from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 # Why a run ended, when the caller did not say.
@@ -234,8 +235,35 @@ EMBEDDER_ACTIVITY = EmbedderActivity()
 
 # How often a waiter re-checks the cards. A wait is never cut short -- giving
 # up and running anyway is the overlap the arbiter prevents -- and every holder
-# is bounded by its own timeout, so a wait always ends.
+# ends on its own: a silent daemon at the socket timeout, and a seat call its
+# node has given up on at the next token it streams (`abandoned`), however long
+# the model would have gone on generating.
 GPU_WAIT_POLL_SECONDS = 1.0
+
+
+# Set in a worker thread to the event its caller sets on giving up on it
+# (`_with_deadline` in nodes.py).
+_ABANDONED: ContextVar[threading.Event | None] = ContextVar("abandoned", default=None)
+
+
+@contextmanager
+def abandonable(event: threading.Event) -> Iterator[None]:
+    """Run the block as work whose caller says it has stopped waiting by setting `event`."""
+    token = _ABANDONED.set(event)
+    try:
+        yield
+    finally:
+        _ABANDONED.reset(token)
+
+
+def abandoned() -> bool:
+    """Whether the caller of the work this thread is doing has stopped waiting for it.
+
+    Python cannot cancel a thread; work that can stop part-way -- a streamed
+    seat call, between tokens -- asks this and stops, releasing what it holds.
+    """
+    event = _ABANDONED.get()
+    return event is not None and event.is_set()
 
 
 class GpuArbiter:

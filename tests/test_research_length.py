@@ -124,3 +124,38 @@ def test_each_finding_names_the_file_and_line_it_came_from(monkeypatch):
 
     assert "1. src/app/graph.py:118\n" in findings
     assert "2. notes.md\n" in findings
+
+
+def test_retrieval_answers_when_its_best_hit_clears_the_floor_whatever_rank_it_has(monkeypatch):
+    """BM25 can rank a lower-cosine passage first. The floor was measured on a
+    search's best cosine and was then read off its first hit, a different number."""
+    asked_the_seat: list[object] = []
+
+    def fake_tool(name, args):
+        return {
+            "results": [
+                {"id": "lexical-first.md", "content": "matched the words " * 20, "score": 0.30},
+                {"id": "dense-best.md", "content": "matched the meaning " * 20, "score": 0.52},
+            ],
+            "source": "local_graphrag",
+        }
+
+    monkeypatch.setattr("langgraph_agent.graphrag_server.relevance_floor", lambda: 0.37)
+    monkeypatch.setattr(nodes, "_call_tool", fake_tool)
+    monkeypatch.setattr(nodes, "get_agent_llm", lambda seat: asked_the_seat.append(seat))
+    findings, status = nodes._gather_research(
+        {"plan": "p", "goal": "g", "research": "", "messages": []}  # type: ignore[arg-type]
+    )
+
+    assert status == "ready_for_builder"
+    assert asked_the_seat == []
+    assert "dense-best.md" in findings
+
+
+def test_the_seat_is_told_the_best_score_not_the_first(monkeypatch):
+    text = nodes._retrieval_for_the_seat(
+        [{"id": "a.md", "content": "x", "score": 0.10}, {"id": "b.md", "content": "y", "score": 0.30}],
+        0.37,
+        "unused",
+    )
+    assert "The best scored 0.30" in text

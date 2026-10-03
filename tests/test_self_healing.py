@@ -3,7 +3,6 @@
 import threading
 import time
 
-import pybreaker
 import pytest
 
 from langgraph_agent.self_healing import (
@@ -11,12 +10,9 @@ from langgraph_agent.self_healing import (
     CircuitOpenError,
     SelfHealingLogger,
     call_with_retry,
-    circuit_breaker,
     circuit_states,
     get_healing_logger,
     reset_circuit,
-    retry_with_backoff,
-    self_healing_wrapper,
 )
 
 
@@ -55,99 +51,46 @@ def test_get_healing_logger_is_singleton():
     assert get_healing_logger() is get_healing_logger()
 
 
-def test_retry_with_backoff_succeeds_after_failures():
+def test_call_with_retry_succeeds_after_failures():
     call_count = [0]
 
-    @retry_with_backoff(max_attempts=3, min_wait=0.01, max_wait=0.05)
     def flaky() -> str:
         call_count[0] += 1
         if call_count[0] < 3:
             raise ConnectionError(f"attempt {call_count[0]}")
         return "ok"
 
-    assert flaky() == "ok"
+    assert call_with_retry(flaky, max_attempts=3, min_wait=0.01, max_wait=0.05) == "ok"
     assert call_count[0] == 3
 
 
-def test_retry_with_backoff_raises_when_exhausted():
+def test_call_with_retry_raises_when_exhausted():
     call_count = [0]
 
-    @retry_with_backoff(max_attempts=2, min_wait=0.01, max_wait=0.05)
     def always_fails() -> str:
         call_count[0] += 1
         raise ValueError(f"attempt {call_count[0]}")
 
     with pytest.raises(ValueError):
-        always_fails()
+        call_with_retry(always_fails, max_attempts=2, min_wait=0.01, max_wait=0.05)
     assert call_count[0] == 2
 
 
-def test_circuit_breaker_opens_after_threshold():
+def test_a_circuit_opens_at_its_threshold_and_stops_calling():
     call_count = [0]
+    circuit = Circuit("test_circuit", failure_threshold=3, recovery_timeout=60)
 
-    @circuit_breaker(failure_threshold=3, recovery_timeout=2, name="test_circuit")
     def failing_service() -> str:
         call_count[0] += 1
         raise ConnectionError("unavailable")
 
-    failures = 0
-    for _ in range(5):
-        try:
-            failing_service()
-        except Exception:
-            failures += 1
-
-    assert failures >= 3
-
-
-def test_circuit_breaker_recovers():
-    call_count = [0]
-    fail_until = 3
-
-    @circuit_breaker(failure_threshold=3, recovery_timeout=1, name="recovery_circuit")
-    def recovering_service() -> str:
-        call_count[0] += 1
-        if call_count[0] <= fail_until:
-            raise ConnectionError(f"down {call_count[0]}")
-        return "recovered"
-
     for _ in range(3):
-        with pytest.raises((ConnectionError, pybreaker.CircuitBreakerError)):
-            recovering_service()
-
-    time.sleep(1.5)
-
-    # Circuit is half-open; either it lets the call through and recovers,
-    # or it is still guarding -- both are acceptable outcomes here.
-    try:
-        result = recovering_service()
-        assert result == "recovered"
-    except Exception:
-        pass
-
-
-def test_self_healing_wrapper_combines_retry_and_circuit():
-    call_count = [0]
-
-    @self_healing_wrapper(
-        max_attempts=2,
-        failure_threshold=3,
-        recovery_timeout=2,
-        retry_exceptions=(ConnectionError,),
-        circuit_exception=ConnectionError,
-        name="combined_healing",
-    )
-    def critical_operation() -> str:
-        call_count[0] += 1
-        if call_count[0] < 3:
-            raise ConnectionError(f"transient {call_count[0]}")
-        return "succeeded"
-
-    try:
-        result = critical_operation()
-        assert result == "succeeded"
-    except ConnectionError:
-        pass  # retries exhausted before success is an acceptable outcome
+        with pytest.raises(ConnectionError):
+            circuit.call(failing_service)
+    for _ in range(2):
+        with pytest.raises(CircuitOpenError):
+            circuit.call(failing_service)
+    assert call_count[0] == 3
 
 
 def test_a_retry_logs_the_attempt_that_succeeded_and_no_other(caplog):
@@ -158,7 +101,6 @@ def test_a_retry_logs_the_attempt_that_succeeded_and_no_other(caplog):
     """
     calls = [0]
 
-    @retry_with_backoff(max_attempts=3, min_wait=0, max_wait=0)
     def flaky() -> str:
         calls[0] += 1
         if calls[0] < 3:
@@ -166,7 +108,7 @@ def test_a_retry_logs_the_attempt_that_succeeded_and_no_other(caplog):
         return "ok"
 
     with caplog.at_level("INFO", logger=get_healing_logger().logger.name):
-        assert flaky() == "ok"
+        assert call_with_retry(flaky, max_attempts=3, min_wait=0, max_wait=0) == "ok"
 
     successes = [r.getMessage() for r in caplog.records if "succeeded" in r.getMessage()]
     assert successes == ["Retry succeeded for 'flaky' on attempt 3"]
@@ -271,16 +213,16 @@ def test_only_failures_the_circuit_trips_on_count_toward_it():
 def test_expected_exception_is_what_the_circuit_counts():
     """It was accepted and ignored: every exception tripped the breaker."""
     calls = [0]
+    circuit = Circuit("expects_connection", failure_threshold=2, recovery_timeout=60,
+                      expected_exception=ConnectionError)
 
-    @circuit_breaker(failure_threshold=2, recovery_timeout=60,
-                     expected_exception=ConnectionError, name="expects_connection")
     def service() -> None:
         calls[0] += 1
         raise ValueError("not an outage")
 
     for _ in range(4):
         with pytest.raises(ValueError):
-            service()
+            circuit.call(service)
     assert calls[0] == 4
     assert _state("expects_connection")["state"] == "closed"
 
@@ -319,6 +261,99 @@ def test_one_name_is_one_circuit_whoever_calls_it():
             circuit.call(lambda: (_ for _ in ()).throw(ConnectionError("down")))
     assert first.is_open and second.is_open
     assert _state("shared_service")["threshold"] == 2
+
+
+def test_a_circuit_never_serializes_the_calls_it_guards():
+    """pybreaker held its lock across the call: a seat generating for minutes
+    held up every status read through the daemon's circuit."""
+    circuit = Circuit("not_serialized", failure_threshold=3, recovery_timeout=60)
+    inside, release = threading.Event(), threading.Event()
+
+    def long_call() -> str:
+        inside.set()
+        release.wait(5)
+        return "slow"
+
+    worker = threading.Thread(target=lambda: circuit.call(long_call))
+    worker.start()
+    try:
+        assert inside.wait(5)
+        started = time.monotonic()
+        assert circuit.call(lambda: "quick") == "quick"
+        assert time.monotonic() - started < 1
+    finally:
+        release.set()
+        worker.join(5)
+
+    # Resetting it does not wait on a call either.
+    inside.clear()
+    release.clear()
+    worker = threading.Thread(target=lambda: circuit.call(long_call))
+    worker.start()
+    try:
+        assert inside.wait(5)
+        started = time.monotonic()
+        reset_circuit("not_serialized")
+        assert time.monotonic() - started < 1
+    finally:
+        release.set()
+        worker.join(5)
+
+
+def test_a_half_open_circuit_lets_one_trial_through_and_refuses_the_rest():
+    circuit = Circuit("one_trial", failure_threshold=1, recovery_timeout=0.1)
+    with pytest.raises(ConnectionError):
+        circuit.call(lambda: (_ for _ in ()).throw(ConnectionError("down")))
+    time.sleep(0.2)
+
+    inside, release = threading.Event(), threading.Event()
+
+    def trial() -> str:
+        inside.set()
+        release.wait(5)
+        return "up"
+
+    results: list[str] = []
+    worker = threading.Thread(target=lambda: results.append(circuit.call(trial)))
+    worker.start()
+    try:
+        assert inside.wait(5)
+        assert _state("one_trial")["state"] == "half-open"
+        called = []
+        with pytest.raises(CircuitOpenError, match="a trial call is testing it now"):
+            circuit.call(lambda: called.append(1))
+        assert called == []
+    finally:
+        release.set()
+        worker.join(5)
+    assert results == ["up"]
+    assert _state("one_trial")["state"] == "closed"
+
+
+def test_a_failed_trial_reopens_the_circuit_for_another_cooldown():
+    circuit = Circuit("trial_fails", failure_threshold=1, recovery_timeout=0.1)
+    down = ConnectionError("down")
+    with pytest.raises(ConnectionError):
+        circuit.call(lambda: (_ for _ in ()).throw(down))
+    time.sleep(0.2)
+    with pytest.raises(ConnectionError):
+        circuit.call(lambda: (_ for _ in ()).throw(down))
+    assert circuit.is_open
+    assert circuit.retry_in > 0
+    with pytest.raises(CircuitOpenError):
+        circuit.call(lambda: "refused")
+
+
+def test_a_success_clears_the_count_of_a_closed_circuit():
+    circuit = Circuit("count_clears", failure_threshold=2, recovery_timeout=60)
+    for _ in range(3):
+        with pytest.raises(ConnectionError):
+            circuit.call(lambda: (_ for _ in ()).throw(ConnectionError("down")))
+        assert circuit.call(lambda: "up") == "up"
+    assert _state("count_clears") == {
+        "name": "count_clears", "state": "closed", "failures": 0, "threshold": 2,
+        "cooldown_s": 60, "retry_in_s": None,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -9,11 +9,9 @@ from .decorators import (
     Circuit,
     CircuitOpenError,
     call_with_retry,
-    circuit_breaker,
     circuit_states,
+    exception_chain,
     reset_circuit,
-    retry_with_backoff,
-    self_healing_wrapper,
 )
 from .logger import SelfHealingLogger, get_healing_logger
 
@@ -22,12 +20,10 @@ __all__ = [
     "CircuitOpenError",
     "SelfHealingLogger",
     "call_with_retry",
-    "circuit_breaker",
     "circuit_states",
+    "exception_chain",
     "get_healing_logger",
     "reset_circuit",
-    "retry_with_backoff",
-    "self_healing_wrapper",
 ]
 
 __version__ = "2.0.0"

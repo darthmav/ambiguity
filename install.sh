@@ -240,20 +240,26 @@ if [ -x "$VENV/bin/python" ] && floor_ok "$VENV/bin/python"; then
 else
     [ -e "$VENV" ] && { echo "  .venv is broken or too old; rebuilding it"; rm -rf "$VENV"; }
     # The first interpreter on PATH wins, so an Omarchy machine gets mise's
-    # Python if that is what you chose; /usr/bin/python3 is the fallback.
+    # Python if that is what you chose; /usr/bin/python3 is the fallback. One
+    # that is new enough but cannot make a venv -- no ensurepip, as some
+    # distribution and tool-managed builds ship -- is passed over, the way
+    # launch_console.sh passes over it.
     BASE_PY=""
-    for candidate in python3 python /usr/bin/python3; do
-        if command -v "$candidate" >/dev/null && floor_ok "$(command -v "$candidate")"; then
-            BASE_PY="$(command -v "$candidate")"
+    for candidate in python3 python python3.14 python3.13 python3.12 /usr/bin/python3; do
+        candidate="$(command -v "$candidate" 2>/dev/null)" || continue
+        floor_ok "$candidate" || continue
+        if "$candidate" -m venv "$VENV" >/tmp/ambiguity-venv.log 2>&1; then
+            BASE_PY="$candidate"
             break
         fi
+        echo "  $candidate could not create a venv (see /tmp/ambiguity-venv.log); trying the next interpreter"
+        rm -rf "$VENV"
     done
     if [ -z "$BASE_PY" ]; then
-        echo "  No Python >= $FLOOR found. Install it (sudo pacman -S python)" >&2
-        echo "  or drop --no-system, and re-run." >&2
+        echo "  No Python >= $FLOOR found that can make a venv. Install it" >&2
+        echo "  (sudo pacman -S python) or drop --no-system, and re-run." >&2
         exit 1
     fi
-    "$BASE_PY" -m venv "$VENV"
     ok "created .venv with $("$VENV/bin/python" --version) from $BASE_PY"
 fi
 
@@ -263,6 +269,48 @@ PY="$VENV/bin/python"
 echo "  installing the project and its dev tools (pip install -e \".[dev]\")"
 "$PY" -m pip install --quiet -e ".[dev]"
 ok "langgraph-agent installed in editable mode"
+# What the venv was installed from. launch_console.sh reinstalls when
+# pyproject.toml no longer matches it, so a launch right after this one installs
+# nothing, and a pull that changes the dependencies is picked up at the next.
+sha256sum pyproject.toml | cut -d' ' -f1 >"$VENV/.ambiguity-deps"
+
+# pip installs what pyproject.toml asks for and never removes what it stopped
+# asking for, so a venv older than these changes still carries the packages
+# behind them: pybreaker (the circuit breakers are the project's own now),
+# chromadb (the corpus moved to PostgreSQL), and the OpenAI stack (the provider
+# was removed). Each goes only if nothing left in the venv requires it.
+mapfile -t dropped < <("$PY" - <<'PY'
+import re
+from importlib import metadata
+
+DROPPED = {"pybreaker", "chromadb", "langchain-openai", "openai", "tiktoken"}
+
+
+def canonical(name):
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+installed = {canonical(d.metadata["Name"]): d for d in metadata.distributions() if d.metadata["Name"]}
+candidates = {name for name in DROPPED if name in installed}
+needed = set()
+for name, dist in installed.items():
+    if name in candidates:
+        continue
+    for spec in dist.requires or []:
+        if "extra ==" in spec:
+            continue
+        needed.add(canonical(re.split(r"[\s<>=!~;\[(]", spec, maxsplit=1)[0]))
+for name in sorted(candidates - needed):
+    print(name)
+PY
+)
+if [ "${#dropped[@]}" -gt 0 ]; then
+    if "$PY" -m pip uninstall --quiet -y "${dropped[@]}"; then
+        ok "removed what the project no longer uses: ${dropped[*]}"
+    else
+        NOTES+=("could not remove packages the project no longer uses (${dropped[*]}); harmless, but: $PY -m pip uninstall ${dropped[*]}")
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # 4. Ollama: daemon, sign-in, seat models
@@ -485,23 +533,39 @@ then :; else problem "could not fetch the embedding tokenizer; see /tmp/ambiguit
 # ---------------------------------------------------------------------------
 
 step "Git (the Builder's git_dwell)"
-# git_dwell's default pipeline commits in this checkout, pushes, and opens and
-# merges a pull request with gh. None of that is exercised until a Builder
+# git_dwell's default pipeline commits, pushes, and opens and merges a pull
+# request with gh -- in this checkout, or on a run given a project (the
+# console's default), in that project's own repository under projects/, which
+# the Builder makes with `git init`. None of that is exercised until a Builder
 # reaches it mid-run, where a missing identity or a signed-out gh stops the
 # pipeline at that stage, and the Builder spends its turns on a repository
 # that was never broken. So both are asked now.
 if ! command -v git >/dev/null; then
     problem "git is not installed (drop --no-system, or: sudo pacman -S git)"
 else
-    # Asked inside this checkout, so a repo-local identity counts as well.
+    # Asked inside this checkout, so a repo-local identity counts as well...
     git_name="$(git config user.name || true)"
     git_email="$(git config user.email || true)"
-    if [ -n "$git_name" ] && [ -n "$git_email" ]; then
-        ok "commits are authored as $git_name <$git_email>"
+    # ...and outside it, which is all a project's own repository sees: one set
+    # only in this checkout leaves every project run unable to commit.
+    shared_name="$(git config --global user.name || git config --system user.name || true)"
+    shared_email="$(git config --global user.email || git config --system user.email || true)"
+    identity_fix="git config --global user.name 'Your Name' && git config --global user.email you@example.com"
+    if [ -n "$shared_name" ] && [ -n "$shared_email" ]; then
+        if [ "$git_name <$git_email>" = "$shared_name <$shared_email>" ]; then
+            ok "commits are authored as $git_name <$git_email>, here and in a project's own repository"
+        else
+            ok "commits are authored as $git_name <$git_email> here, and as $shared_name <$shared_email> in a project's own repository"
+        fi
+    elif [ -n "$git_name" ] && [ -n "$git_email" ]; then
+        problem "git's identity ($git_name <$git_email>) is set only in this checkout, so a run given a project cannot commit in its own repository: $identity_fix"
     else
-        problem "git has no identity, so the Builder cannot commit: git config --global user.name 'Your Name' && git config --global user.email you@example.com"
+        problem "git has no identity, so the Builder cannot commit: $identity_fix"
     fi
 
+    # A project's own repository starts with no remote, so there git_dwell
+    # commits on a branch and stops at push until someone adds one; what is
+    # asked below is this checkout's.
     origin="$(git remote get-url origin 2>/dev/null || true)"
     if [ -z "$origin" ]; then
         # A checkout with no remote is legitimate; the pipeline just ends early.
@@ -1128,11 +1192,17 @@ step "Embedder"
 # held and the next run's GPU placement is not decided by an install.
 embed_status=0
 "$PY" - <<'PY' || embed_status=$?
+import logging
 import subprocess
 import sys
 
-from langgraph_agent.config import ollama_cpu_share
-from langgraph_agent.graphrag_server import EMBEDDING_MODEL_NAME, OllamaEmbedder
+# The retries and the circuit opening are the healing journal's; the line
+# printed below says the same once.
+logging.disable(logging.CRITICAL)
+
+from langgraph_agent.config import daemon_unreachable, ollama_cpu_share  # noqa: E402
+from langgraph_agent.graphrag_server import EMBEDDING_MODEL_NAME, OllamaEmbedder  # noqa: E402
+from langgraph_agent.self_healing import CircuitOpenError  # noqa: E402
 
 model = EMBEDDING_MODEL_NAME
 
@@ -1140,9 +1210,15 @@ loaded_before = ollama_cpu_share(model) is not None
 embedder = OllamaEmbedder(model)
 try:
     vector = embedder.encode("install check")
-except RuntimeError as exc:
-    print(f"  ✗ {exc}")
-    sys.exit(1)
+except Exception as exc:
+    # An unreachable daemon raises its own error (or, once its circuit opens,
+    # the refusal), never a RuntimeError: caught as one, it ended this step in
+    # a traceback and the summary blamed the GPU placement.
+    if isinstance(exc, CircuitOpenError) or daemon_unreachable(exc):
+        print(f"  ✗ the Ollama daemon did not answer, so {model} could not be asked to embed")
+        sys.exit(2)
+    print(f"  ✗ {model} could not embed: {type(exc).__name__}: {exc}")
+    sys.exit(3)
 print(f"  ✓ {model} embeds ({len(vector)} dimensions)")
 
 status = 0
@@ -1171,6 +1247,8 @@ sys.exit(status)
 PY
 case "$embed_status" in
     0) ;;
+    2) problem "the embedder could not be checked: the Ollama daemon is not answering (see Ollama above)" ;;
+    3) problem "the embedding model could not embed; see Embedder above (pulled? ollama pull $(sed -n 's/^EMBEDDING_MODEL_NAME = "\(.*\)"/\1/p' src/langgraph_agent/graphrag_server.py))" ;;
     *) problem "the embedder is not running 100% on the GPU as configured; see Embedder above" ;;
 esac
 
@@ -1182,11 +1260,16 @@ step "Seats"
 # first sent one short prompt through its real call path, in parallel, and a
 # failure lands in get_agent_status the way it would mid-run.
 if ! PROBE="$PROBE" "$PY" - <<'PY'
+import logging
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
-from langgraph_agent.config import AGENTS, get_agent_llm, get_agent_status
+# A daemon that is down opens its circuit while the seats are read; each
+# seat's line below says so once, which the healing journal's lines repeated.
+logging.disable(logging.CRITICAL)
+
+from langgraph_agent.config import AGENTS, get_agent_llm, get_agent_status  # noqa: E402
 
 silent: set[str] = set()
 

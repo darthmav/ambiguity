@@ -81,6 +81,12 @@ COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install -e ".[tools]"
 
+# What the venv was installed from -- the stamp launch_console.sh and install.sh
+# write on the host. Compose mounts the code, and pyproject.toml with it, from
+# the checkout, so an image older than the code can be missing a package it
+# imports; the entrypoint compares the two and says to rebuild.
+RUN sha256sum pyproject.toml | cut -d' ' -f1 >"$VIRTUAL_ENV/.ambiguity-deps"
+
 # Debug symbols from 145 compiled extensions, and nothing reads them
 # here -- a segfault in scipy is not a thing this project debugs from inside
 # its own container. Suite green after it, the same way.
@@ -168,9 +174,11 @@ USER 1000:1000
 
 # The same readiness check launch_console.sh waits on, for the same reason:
 # /api/status answers as soon as the server is up, and building a corpus does
-# not block it.
+# not block it. And the same test of the answer: the console's own status
+# payload, not merely a reply -- on the host network, whatever else holds the
+# port replies too.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD ["sh", "-c", "curl -fsS \"http://127.0.0.1:${PORT}/api/status\" >/dev/null || exit 1"]
+    CMD ["sh", "-c", "curl -fsS \"http://127.0.0.1:${PORT}/api/status\" | grep -q '\"indexes_on_run\"' || exit 1"]
 
 ENTRYPOINT ["/usr/local/bin/ambiguity-entrypoint"]
 CMD ["python", "serve.py"]

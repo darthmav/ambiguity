@@ -272,6 +272,126 @@ def test_only_the_named_paths_are_committed(repo, client):
     assert committed == ["mine.txt"]
 
 
+def test_the_named_paths_are_all_a_commit_takes_whatever_else_is_staged(repo, client):
+    """`paths` was only what got staged: the commit was a bare `git commit`,
+    which takes the whole index, so whatever the operator had staged went into
+    the commit, the pull request and the merge."""
+    (repo / "mine.txt").write_text("mine\n", encoding="utf-8")
+    (repo / "theirs.txt").write_text("theirs\n", encoding="utf-8")
+    _run("git", "add", "theirs.txt", cwd=repo)  # the operator's, staged already
+
+    result = _dwell(
+        client,
+        message="feat: just mine",
+        paths=["mine.txt"],
+        stages=["survey", "branch", "stage", "commit"],
+    )
+
+    assert result["success"], result
+    committed = subprocess.run(
+        ["git", "show", "--name-only", "--format=", "HEAD"],
+        cwd=repo, capture_output=True, text=True,
+    ).stdout.split()
+    assert committed == ["mine.txt"]
+    still_staged = subprocess.run(
+        ["git", "diff", "--cached", "--name-only"], cwd=repo, capture_output=True, text=True,
+    ).stdout.split()
+    assert still_staged == ["theirs.txt"]
+
+
+def test_a_directory_inside_another_repository_is_refused(repo, client):
+    """git looks upward for a repository, so a project directory without its
+    own would have committed -- and merged -- the checkout around it."""
+    project = repo / "projects" / "demo"
+    project.mkdir(parents=True)
+    (project / "main.py").write_text("print('hi')\n", encoding="utf-8")
+
+    result = _dwell(client, message="feat: demo", cwd="projects/demo")
+
+    assert not result["success"]
+    assert "not a git repository of its own" in result["error"]
+    log = subprocess.run(
+        ["git", "log", "--oneline"], cwd=repo, capture_output=True, text=True
+    ).stdout.splitlines()
+    assert len(log) == 1  # the seed, and nothing the refusal made
+
+
+def test_in_a_project_s_own_repository_it_commits_there_and_only_there(repo, client):
+    project = repo / "projects" / "demo"
+    project.mkdir(parents=True)
+    _run("git", "init", "-b", "main", str(project), cwd=project)
+    _run("git", "config", "user.email", "test@example.com", cwd=project)
+    _run("git", "config", "user.name", "Test", cwd=project)
+    (project / "seed.txt").write_text("seed\n", encoding="utf-8")
+    _run("git", "add", "seed.txt", cwd=project)
+    _run("git", "commit", "-m", "seed", cwd=project)
+    (project / "main.py").write_text("print('hi')\n", encoding="utf-8")
+    (repo / "operator.txt").write_text("the operator's\n", encoding="utf-8")
+
+    result = _dwell(
+        client,
+        message="feat: demo",
+        cwd="projects/demo",
+        paths=["projects/demo/main.py"],  # spelled from the root, like every tool
+        stages=["survey", "branch", "stage", "commit"],
+    )
+
+    assert result["success"], result
+    committed = subprocess.run(
+        ["git", "show", "--name-only", "--format=", "HEAD"],
+        cwd=project, capture_output=True, text=True,
+    ).stdout.split()
+    assert committed == ["main.py"]
+    outer = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True
+    ).stdout
+    assert "operator.txt" in outer  # untouched: never staged, never committed
+
+
+def test_a_path_outside_the_repository_it_runs_in_is_refused(repo, client):
+    project = repo / "projects" / "demo"
+    project.mkdir(parents=True)
+    _run("git", "init", "-b", "main", str(project), cwd=project)
+
+    result = _dwell(client, message="feat: x", cwd="projects/demo", paths=["seed.txt"])
+
+    assert not result["success"]
+    assert "outside projects/demo" in result["error"]
+
+
+def test_on_a_project_run_the_builder_s_git_tools_act_in_the_project(monkeypatch):
+    """Whatever cwd the model asks for, or none."""
+    from types import SimpleNamespace
+
+    import langgraph_agent.nodes as nodes
+
+    seen: list[dict] = []
+
+    class _OneDwell:
+        calls = 0
+
+        def invoke(self, messages):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(content="", tool_calls=[
+                    {"name": "git_dwell", "args": {"message": "m"}, "id": "c1"},
+                    {"name": "git_status", "args": {"cwd": "."}, "id": "c2"},
+                ])
+            return SimpleNamespace(content="done", tool_calls=[])
+
+    monkeypatch.setattr(
+        nodes, "_call_tool", lambda name, args: seen.append({name: args}) or {"success": True}
+    )
+    nodes._run_builder_tools(
+        _OneDwell(), [], [], [], nodes._Deadline(30), output_dir="projects/demo"
+    )
+
+    assert seen == [
+        {"git_dwell": {"message": "m", "cwd": "projects/demo"}},
+        {"git_status": {"cwd": "projects/demo"}},
+    ]
+
+
 # ---------------------------------------------------------------------------
 # branch naming
 # ---------------------------------------------------------------------------

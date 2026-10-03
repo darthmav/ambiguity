@@ -379,9 +379,12 @@ class MCPClient:
             return {"success": False, "error": str(e), "path": path}
 
     def _git_status(self, args: dict[str, Any]) -> dict[str, Any]:
-        """`git status --porcelain`. The exit status is read first: a failed command and
-        a clean tree both print nothing.
+        """`git status --porcelain`, in `cwd` when given. The exit status is read first:
+        a failed command and a clean tree both print nothing.
         """
+        cwd, error = _resolve_cwd(args.get("cwd"))
+        if error is not None:
+            return {"success": False, "error": error}
         try:
             result = subprocess.run(
                 ["git", "status", "--porcelain"],
@@ -389,6 +392,7 @@ class MCPClient:
                 text=True,
                 timeout=10,
                 stdin=subprocess.DEVNULL,
+                cwd=cwd,
             )
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -401,8 +405,11 @@ class MCPClient:
         """`git diff`, of the whole tree or of one path.
 
         The path goes after `--`, only when there is one, so a path that also names a
-        branch is not read as a revision.
+        branch is not read as a revision. Run in `cwd` when given.
         """
+        cwd, error = _resolve_cwd(args.get("cwd"))
+        if error is not None:
+            return {"success": False, "error": error}
         path = str(args.get("path") or "").strip()
         command = ["git", "diff"] + (["--", path] if path else [])
         try:
@@ -412,6 +419,7 @@ class MCPClient:
                 text=True,
                 timeout=10,
                 stdin=subprocess.DEVNULL,
+                cwd=cwd,
             )
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -420,8 +428,11 @@ class MCPClient:
                     or f"git diff exited {result.returncode}"}
         return {"success": True, "diff": result.stdout or "No changes"}
 
-    def _run_vcs(self, *argv: str, timeout: float = 60.0) -> tuple[bool, str]:
-        """One git/gh invocation. Returns `(ok, output)` with stderr folded in.
+    def _run_vcs(
+        self, *argv: str, timeout: float = 60.0, cwd: str | None = None
+    ) -> tuple[bool, str]:
+        """One git/gh invocation, in `cwd` when given. Returns `(ok, output)` with
+        stderr folded in.
 
         stderr says the useful part -- "nothing to commit", a rejected push. No shell:
         a commit message containing `;` is a message.
@@ -429,7 +440,7 @@ class MCPClient:
         try:
             done = subprocess.run(
                 list(argv), capture_output=True, text=True,
-                timeout=timeout, stdin=subprocess.DEVNULL,
+                timeout=timeout, stdin=subprocess.DEVNULL, cwd=cwd,
             )
         except FileNotFoundError:
             return False, f"{argv[0]} is not installed on this machine"
@@ -437,17 +448,19 @@ class MCPClient:
             return False, f"{' '.join(argv)} timed out after {timeout:g}s"
         return done.returncode == 0, ((done.stdout or "") + (done.stderr or "")).strip()
 
-    def _default_branch(self) -> str:
+    def _default_branch(self, cwd: str | None = None) -> str:
         """The branch a PR targets: `origin/HEAD` first, then the usual names.
 
         The remote's prefix is removed, not everything up to the last slash, so
         `release/2.0` survives.
         """
-        ok, out = self._run_vcs("git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
+        ok, out = self._run_vcs(
+            "git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD", cwd=cwd
+        )
         if ok and out.startswith("refs/remotes/origin/"):
             return out.removeprefix("refs/remotes/origin/")
         for name in ("main", "master"):
-            ok, _ = self._run_vcs("git", "show-ref", "--verify", f"refs/heads/{name}")
+            ok, _ = self._run_vcs("git", "show-ref", "--verify", f"refs/heads/{name}", cwd=cwd)
             if ok:
                 return name
         return "main"
@@ -465,7 +478,35 @@ class MCPClient:
         (`--squash --delete-branch`); a caller wanting the review point names stages
         without `merge`. A push that never reached the remote is retried briefly --
         pushing a commit again is harmless; nothing else here is retried.
+
+        *`paths` commits only what it names*, whatever else the index holds. *In
+        `cwd`, only that directory's own repository*: git looks upward for one, so
+        a directory inside another repository is refused rather than committing
+        the one around it.
         """
+        cwd, cwd_error = _resolve_cwd(args.get("cwd"))
+        if cwd_error is not None:
+            return {"success": False, "error": cwd_error}
+        if cwd is not None:
+            ok, top = self._run_vcs("git", "rev-parse", "--show-toplevel", cwd=cwd)
+            if not ok or Path(top).resolve() != Path(cwd).resolve():
+                return {"success": False, "error": (
+                    f"{cwd} is not a git repository of its own, so git_dwell would act "
+                    "on the repository around it. Run `git init` in it first "
+                    f"(terminal_execute with cwd={cwd})."
+                )}
+        paths: list[str] = []
+        for raw in [str(x) for x in (args.get("paths") or [])]:
+            if cwd is None:
+                paths.append(raw)
+                continue
+            # Spelled from the project root, like every other tool's paths, and
+            # handed to git relative to the repository it runs in.
+            inside = Path(raw).resolve()
+            if not inside.is_relative_to(Path(cwd).resolve()):
+                return {"success": False, "error": f"{raw} is outside {cwd}, the repository "
+                        "this git_dwell runs in."}
+            paths.append(str(inside.relative_to(Path(cwd).resolve())) or ".")
         message = str(args.get("message") or "").strip()
         requested = [str(x) for x in (args.get("stages") or DWELL_DEFAULT_STAGES)]
         unknown = [x for x in requested if x not in DWELL_STAGES]
@@ -487,13 +528,13 @@ class MCPClient:
             return {"success": False, "error": f"{stage}: {detail}",
                     "stopped_at": stage, "stages": log}
 
-        default = self._default_branch()
-        ok, branch = self._run_vcs("git", "rev-parse", "--abbrev-ref", "HEAD")
+        default = self._default_branch(cwd)
+        ok, branch = self._run_vcs("git", "rev-parse", "--abbrev-ref", "HEAD", cwd=cwd)
         if not ok:
             return stop("survey", f"cannot read the current branch: {branch}")
 
         if "survey" in stages:
-            ok, dirty = self._run_vcs("git", "status", "--porcelain")
+            ok, dirty = self._run_vcs("git", "status", "--porcelain", cwd=cwd)
             if not ok:
                 return stop("survey", dirty)
             record("survey", True, f"on {branch} (default {default}); "
@@ -502,7 +543,7 @@ class MCPClient:
         if "branch" in stages:
             if branch == default:
                 wanted = str(args.get("branch") or "").strip() or _branch_name_from(message)
-                ok, out = self._run_vcs("git", "checkout", "-b", wanted)
+                ok, out = self._run_vcs("git", "checkout", "-b", wanted, cwd=cwd)
                 if not ok:
                     return stop("branch", out)
                 branch = wanted
@@ -514,8 +555,7 @@ class MCPClient:
                                   "'branch' stage, or check out a branch first")
 
         if "stage" in stages:
-            paths = [str(x) for x in (args.get("paths") or [])]
-            ok, out = self._run_vcs("git", "add", *(paths or ["-A"]))
+            ok, out = self._run_vcs("git", "add", *(["--", *paths] if paths else ["-A"]), cwd=cwd)
             if not ok:
                 return stop("stage", out)
             record("stage", True, f"staged {', '.join(paths) if paths else 'all changes'}")
@@ -523,14 +563,21 @@ class MCPClient:
         if "commit" in stages:
             if not message:
                 return stop("commit", "no message given; pass `message`")
-            ok, staged = self._run_vcs("git", "diff", "--cached", "--name-only")
+            # Asked of the named paths alone, when there are some: what else the
+            # index holds is not this commit's.
+            ok, staged = self._run_vcs(
+                "git", "diff", "--cached", "--name-only", *(["--", *paths] if paths else []),
+                cwd=cwd,
+            )
             if ok and not staged.strip():
                 # Nothing to commit is an ordinary outcome, not a failure; the
                 # stages that need a commit are dropped.
                 record("commit", True, "nothing staged to commit")
                 stages = [x for x in stages if x not in ("push", "pr", "merge")]
             else:
-                ok, out = self._run_vcs("git", "commit", "-m", message)
+                ok, out = self._run_vcs(
+                    "git", "commit", "-m", message, *(["--", *paths] if paths else []), cwd=cwd
+                )
                 if not ok:
                     return stop("commit", out)
                 record("commit", True, out.splitlines()[0] if out else "committed")
@@ -538,7 +585,9 @@ class MCPClient:
         if "push" in stages:
 
             def push() -> str:
-                ok, out = self._run_vcs("git", "push", "-u", "origin", branch, timeout=120)
+                ok, out = self._run_vcs(
+                    "git", "push", "-u", "origin", branch, timeout=120, cwd=cwd
+                )
                 if not ok:
                     if any(mark in out.lower() for mark in _PUSH_FAILED_IN_TRANSIT):
                         raise _PushFailedInTransit(out)
@@ -559,7 +608,9 @@ class MCPClient:
             record("push", True, f"pushed {branch} to origin")
 
         if "pr" in stages:
-            ok, existing = self._run_vcs("gh", "pr", "view", "--json", "url", "-q", ".url")
+            ok, existing = self._run_vcs(
+                "gh", "pr", "view", "--json", "url", "-q", ".url", cwd=cwd
+            )
             if ok and existing.strip().startswith("http"):
                 # A branch already carrying a PR is the ordinary case on a
                 # second pass.
@@ -570,7 +621,7 @@ class MCPClient:
                     "gh", "pr", "create", "--base", default, "--head", branch,
                     "--title", title,
                     "--body", message or "Opened by the dwell pipeline.",
-                    timeout=120,
+                    timeout=120, cwd=cwd,
                 )
                 if not ok:
                     return stop("pr", out)
@@ -578,7 +629,7 @@ class MCPClient:
 
         if "merge" in stages:
             ok, out = self._run_vcs("gh", "pr", "merge", "--squash", "--delete-branch",
-                                    timeout=120)
+                                    timeout=120, cwd=cwd)
             if not ok:
                 return stop("merge", out)
             record("merge", True, out.splitlines()[-1] if out else "merged")

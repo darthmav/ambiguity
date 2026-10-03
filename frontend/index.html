@@ -355,7 +355,7 @@ pre#state-dump{font:11px/1.7 var(--mono);color:var(--ink-2);white-space:pre-wrap
         <div class="scroll" id="director"><div class="muted">Give the Architect a goal. It sets the direction, the Planner breaks it down, and it rules on the result. Attach a document — or drop one here — to put it in the corpus the Researcher searches.</div></div>
         <div id="eng-input">
           <textarea id="eng-prompt" rows="1" placeholder="Tell the Architect what you want done&hellip;"></textarea>
-          <select id="eng-where" title="Where the files this run generates are stored. A project under projects/ stays out of the corpus until you embed it — from the verdict when the run ends, or from the Corpus tab — or you attach its files by hand. This checkout means the run edits the project itself, and its files are indexed like the rest of it."></select>
+          <select id="eng-where" title="Where the files this run generates are stored. A project under projects/ stays out of the corpus until you embed it — from the verdict when the run ends, or from the Corpus tab — or you attach its files by hand. This checkout means the run edits the project itself; the checkout is never indexed, so its files reach the corpus only if you upload them."></select>
           <input id="eng-project" placeholder="new project name" title="Letters, digits, '.', '_' or '-'. Left blank, it is named after the goal." hidden>
           <label class="optout" title="A file that does not run is still executed and still reported — it just stops blocking the Architect's approval. For goals whose product is a failing file.">
             <input type="checkbox" id="eng-expect-fail"> expect failures
@@ -1302,7 +1302,7 @@ function paintWhere(){
   sel.innerHTML =
     `<option value="${esc(NEW_PROJECT)}">New project\u2026</option>`
     + PROJECTS.map(p => `<option value="${esc(p.name)}">projects/${esc(p.name)}${p.embedded ? " (embedded)" : ""}</option>`).join("")
-    + `<option value="">This checkout (indexed)</option>`;
+    + `<option value="">This checkout</option>`;
   sel.value = [...sel.options].some(o => o.value === want) ? want : NEW_PROJECT;
   $("#eng-project").hidden = sel.value !== NEW_PROJECT;
 }
@@ -2148,6 +2148,8 @@ function recoveryBlock(r){
   if(r.builder_cut_off)
     parts.push(r.builder_cut_off === "turn_cap"
       ? "The Builder ran out of tool turns before it finished."
+      : r.builder_cut_off === "no_tools"
+      ? "The Builder's model cannot call tools, so nothing was built."
       : "The Builder hit its deadline before it finished.");
   if(r.lint_failed && r.lint_failed.length)
     parts.push(`Fails lint: ${r.lint_failed.join(", ")}`);
@@ -2508,7 +2510,20 @@ $("#stats").addEventListener("click", async e => {
   poll(true);
 });
 
+// One poll at a time. The interval does not wait for a slow one -- a status
+// read held up behind a busy database -- so without this every tick stacked
+// another request on the server's threads. A poll asked for while one is in
+// flight (a chip clicked) runs once more when it ends, rather than not at all.
+let POLL_IN_FLIGHT = null, POLL_AGAIN = false;
 async function poll(quiet){
+  if(POLL_IN_FLIGHT){ POLL_AGAIN = true; return POLL_IN_FLIGHT; }
+  POLL_IN_FLIGHT = (async () => {
+    do{ POLL_AGAIN = false; await pollOnce(quiet); }while(POLL_AGAIN && !EXITING);
+  })();
+  try{ await POLL_IN_FLIGHT; }finally{ POLL_IN_FLIGHT = null; }
+}
+
+async function pollOnce(quiet){
   if(EXITING) return;
   try{
     const [st, stats, healing] = await Promise.all([
@@ -2532,6 +2547,8 @@ async function poll(quiet){
     const indexing = indexingChip(st) + healingChip(healing);
     $("#stats").innerHTML = CORPUS === "absent"
       ? `<span class="nocorpus">no corpus &mdash; ${BUILDS_ON_RUN ? "a restart or the next run rebuilds it from the archive" : "nothing indexed"}</span>`+indexing
+      : CORPUS === "unavailable"
+      ? `<span class="nocorpus" title="${esc(stats.note || "")}">corpus unavailable &mdash; the database is not answering; a run goes ahead without retrieval</span>`+indexing
       : CORPUS === "empty"
       ? `<span class="nocorpus">corpus empty &mdash; ${BUILDS_ON_RUN ? "a restart or the next run rebuilds it from the archive" : "REBUILD_CORPUS is off, so nothing will rebuild it"}</span>`+indexing
       : `<span>docs <b>${stats.total_documents}</b></span>`+

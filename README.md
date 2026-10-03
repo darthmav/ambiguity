@@ -14,11 +14,12 @@ you want them.
 ## 🎨 Web Console
 
 ```bash
-# Quick launch
+# Quick launch: on first launch it builds .venv and installs the
+# dependencies, and again whenever pyproject.toml changes
 ./launch_console.sh
 
-# Or manually
-python serve.py
+# Or manually, from that venv
+.venv/bin/python serve.py
 # Open: http://localhost:8080
 ```
 
@@ -172,7 +173,8 @@ fetched web pages into it, and nothing else forces anything to read it: the
 Researcher ran only when a plan happened to route there, so a confidently
 written plan meant a run that built a corpus and consulted none of it. On a goal
 the corpus answers, that hop costs a search and no model call at all — retrieval
-returns straight from GraphRAG whenever the top hit clears the relevance floor.
+returns straight from GraphRAG whenever the best hit clears the relevance floor,
+which is measured on the corpus itself and again whenever it has changed.
 Later cycles route as the Planner asks.
 
 ### The Four Agents
@@ -246,6 +248,15 @@ Everything it installs is free to use. Elsewhere, or by hand:
 pip install -e ".[dev]"
 ```
 
+`./launch_console.sh` does the Python half itself: on first launch it builds
+`.venv` from the first interpreter that meets `requires-python` and installs
+the project with the Builder's tools (`.[tools]`), and it reinstalls whenever
+`pyproject.toml` no longer matches the stamp the venv was installed from
+(`.venv/.ambiguity-deps`, which `install.sh` writes too) or a declared
+dependency is missing -- so a pull that changes the dependencies needs no
+step of its own. The log is `/tmp/ambiguity-install.log`. It does none of the
+system half: Ollama, its models, PostgreSQL and SearxNG are `install.sh`'s.
+
 ### Running in a container
 
 An Arch image of the console and the database its corpus lives in, as one
@@ -279,9 +290,12 @@ whether it answers, because with no daemon behind them every default seat fails
 its first call and the corpus cannot be embedded.
 
 What is shared with the host Python install: **code and `.env`, read-only,
-and nothing else.** `src/`, `serve.py`, `frontend/`, `prompts/` and
-`spectral_graph/` are mounted from the checkout so an edit shows on restart, but
-the container cannot write to them. Everything the app writes to disk --
+and nothing else.** `src/`, `pyproject.toml`, `serve.py`, `frontend/`,
+`prompts/` and `spectral_graph/` are mounted from the checkout so an edit shows
+on restart, but the container cannot write to them. The venv is the image's,
+installed at the last `--build`, so the entrypoint compares `pyproject.toml`
+with what that venv was installed from and says when a pull has changed the
+dependencies: then `docker compose up --build`. Everything the app writes to disk --
 `runs/`, `uploads/`, `research/web/`, `projects/` and the rest -- is a named
 Docker volume, and the corpus is in the stack's own database, so the container
 and a console started on the host (`./launch_console.sh`, port 8080, the host's
@@ -293,7 +307,10 @@ document, upload it through its console. It runs as uid 1000
 
 `git_dwell`'s `push`, `pr` and `merge` stages need your own credentials:
 uncomment the `~/.gitconfig` and `~/.config/gh` mounts in `docker-compose.yml`.
-Without them commits carry a fallback identity and `gh` has no account.
+Without them commits carry a fallback identity and `gh` has no account. On a
+run given a project (the console's default) the git tools act in that
+project's own repository on the `projects` volume -- the Builder `git init`s it
+-- which has no remote, so there `git_dwell` commits and stops at `push`.
 
 `docker compose stop` is the console's exit button rather than a kill -- a run
 in flight is stopped and the exit deferred until it has written its snapshot,
@@ -510,7 +527,7 @@ Per the 4-Agent System specification:
 | `files_changed`    | Builder     | Files a write tool reported writing            |
 | `failed_verification` | Builder  | Written files that failed to run, or were never run |
 | `unverified`       | Builder     | The part of `failed_verification` nobody ran   |
-| `builder_cut_off`  | Builder     | `turn_cap` \| `deadline` when a pass ended early |
+| `builder_cut_off`  | Builder     | `turn_cap` \| `deadline` when a pass ended early, `no_tools` when its model could not act |
 | `lint_failed`      | Builder     | Written Python files that still fail `ruff check` |
 | `expect_failures`  | Caller      | A file that runs and fails stops blocking approval |
 | `discuss_only`     | Caller      | No tools at all; the run proposes and changes nothing |

@@ -33,9 +33,12 @@ systemctl is-active  ollama.service   # active
 ## Build
 
 There is no venv in a fresh checkout. On Arch / Omarchy `./install.sh` builds
-it. Nothing in the project touches torch or a card itself -- the embedding
-model is `qwen3-embedding:latest`, served by the local Ollama daemon, which
-owns its GPU placement. The only Hugging Face download is that model's
+it, and `./launch_console.sh` builds it on first launch too -- and reinstalls
+whenever `pyproject.toml` no longer matches `.venv/.ambiguity-deps`, the stamp
+both write, or a declared dependency is missing. Nothing in the project
+touches torch or a card itself -- the embedding model is
+`qwen3-embedding:latest`, served by the local Ollama daemon, which owns its
+GPU placement. The only Hugging Face download is that model's
 tokenizer, which the in-process chunker cuts passages with. By hand:
 
 ```bash
@@ -123,10 +126,12 @@ header chip; it closes by itself once the daemon answers a trial call.
 ./launch_console.sh
 ```
 
-Prints seat status, starts the server, opens a browser at
-http://localhost:8080, tails the log, stops on Ctrl+C. It launches
-`python serve.py` off PATH, so **it only works if the venv is active** —
-otherwise it dies with `ModuleNotFoundError: No module named 'langgraph'`.
+Builds or refreshes `.venv` when it has to (first launch, a changed
+`pyproject.toml`, a missing dependency; the log is
+`/tmp/ambiguity-install.log`), prints seat status, starts the server, opens a
+browser at http://localhost:8080, tails the log, stops on Ctrl+C. It runs
+`python serve.py` from that venv, activated, never from whatever is first on
+PATH.
 
 Five tabs: Engineer, Graph (default), Retrieval, Corpus, State.
 
@@ -212,7 +217,7 @@ skip into a failure, as CI does.
 
 | Symptom | Fix |
 |---|---|
-| `ModuleNotFoundError: No module named 'langgraph'` | venv missing or not used. Re-run Build; `driver.py` picks up `.venv` automatically. |
+| `ModuleNotFoundError: No module named 'langgraph'` | venv missing or not used. `./launch_console.sh` rebuilds it; `driver.py` picks up `.venv` automatically. In the container: the image predates the code (the entrypoint says so) -- `docker compose up --build`. |
 | Graph tab empty, `rag_stats` corpus=absent | The archive is empty. Upload a document, or run a goal with research online. |
 | Header shows `ollama-daemon down` | The daemon stopped answering. Start it; the circuit closes on the next trial call, or `rpc reset_circuit` now. |
 | Shell command exits 144, server still running | `pkill -f serve.py` matched its own caller. Use `driver.py down`. |

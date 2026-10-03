@@ -27,7 +27,7 @@ from typing import Any, TypeVar, cast
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from langgraph_agent.config import get_agent_llm
-from langgraph_agent.control import RUN_CONTROL
+from langgraph_agent.control import RUN_CONTROL, abandonable
 from langgraph_agent.mcp_client import (
     TERMINAL_TIMEOUT_MAX_SECONDS,
     TERMINAL_TIMEOUT_SECONDS,
@@ -74,18 +74,22 @@ class _Deadline:
 def _with_deadline(work: Callable[[], _T], seconds: float, fallback: _T) -> _T:
     """Run `work`, giving up on it after `seconds` and returning `fallback`.
 
-    Python cannot cancel a thread blocked on a socket, so an abandoned worker
-    unwinds on its own when the client timeout fires. Hence `work` must not
-    write to state -- a late finisher would land in a state the graph had moved
-    past -- and the worker is a daemon thread: a pool's threads are joined at
-    exit, so one stuck worker would hold up shutdown.
+    Python cannot cancel a thread, so an abandoned worker is told instead
+    (`control.abandoned`): a streamed seat call stops at its next token and
+    lets go of the cards, and one blocked on a silent socket unwinds when the
+    client timeout fires. Hence `work` must not write to state -- a late
+    finisher would land in a state the graph had moved past -- and the worker
+    is a daemon thread: a pool's threads are joined at exit, so one stuck
+    worker would hold up shutdown.
     """
     box: list[Any] = []
     error: list[BaseException] = []
+    given_up = threading.Event()
 
     def _run() -> None:
         try:
-            box.append(work())
+            with abandonable(given_up):
+                box.append(work())
         except BaseException as exc:  # re-raised on the caller's thread below
             error.append(exc)
 
@@ -94,6 +98,7 @@ def _with_deadline(work: Callable[[], _T], seconds: float, fallback: _T) -> _T:
     thread.join(timeout=seconds)
 
     if thread.is_alive():
+        given_up.set()
         return fallback
     if error:
         # A seat that failed outright is not a timeout; let it raise so
@@ -565,15 +570,17 @@ def _corpus_map(goal: str) -> str:
     if not goal.strip():
         return ""
     try:
-        response = _call_tool(
-            "search_knowledge_graph", {"query": goal, "top_k": PLANNER_MAP_RESULTS}
-        )
+        # The floor first: with none there is no map, and searching anyway
+        # loaded the embedder -- evicting the seat about to plan -- for nothing.
         from langgraph_agent.graphrag_server import relevance_floor
 
         floor = relevance_floor()
+        if floor is None:
+            return ""
+        response = _call_tool(
+            "search_knowledge_graph", {"query": goal, "top_k": PLANNER_MAP_RESULTS}
+        )
     except Exception:
-        return ""
-    if floor is None:
         return ""
 
     results = response.get("results", []) if isinstance(response, dict) else []
@@ -811,7 +818,9 @@ def _retrieval_for_the_seat(
             "answer `no_relevant_knowledge`."
         )
 
-    top = float(results[0].get("score") or 0.0)
+    from langgraph_agent.graphrag_server import best_score
+
+    top = best_score(results)
     if floor is None:
         verdict = (
             "This corpus has no measured relevance floor yet, so none of them "
@@ -840,7 +849,7 @@ def _retrieval_for_the_seat(
 def _retrieved_findings(results: list[dict[str, Any]], floor: float, graph: Any) -> str:
     """Retrieval that answered the plan, written up in the Researcher's format.
 
-    Only the top hit had to clear the floor. The rest ride along -- the diverse
+    Only the best hit had to clear the floor. The rest ride along -- the diverse
     hits `SEARCH_ESCALATION` widens the window for -- each marked with its side
     of the floor, so the Builder weighs a weaker passage as weaker.
     """
@@ -881,9 +890,10 @@ def _retrieved_findings(results: list[dict[str, Any]], floor: float, graph: Any)
 def _gather_research(state: AgentState) -> tuple[str, str]:
     """Retrieve for the Researcher and return `(findings, status)`.
 
-    Retrieval answers by itself when its top hit clears `relevance_floor()`;
-    otherwise the seat judges what came back. Reads state and never writes it,
-    so it can run under `_with_deadline`.
+    Retrieval answers by itself when its best hit clears `relevance_floor()`
+    (`best_score`, the statistic the floor was measured on); otherwise the seat
+    judges what came back. Reads state and never writes it, so it can run under
+    `_with_deadline`.
     """
     plan = state.get("plan", "")
     results: list[dict[str, Any]] = []
@@ -903,10 +913,10 @@ def _gather_research(state: AgentState) -> tuple[str, str]:
         if response.get("source") == "no_corpus":
             why_none = "no corpus has been built on this machine"
         # Imported late, as mcp_client does: graphrag_server pulls in the database driver.
-        from langgraph_agent.graphrag_server import relevance_floor
+        from langgraph_agent.graphrag_server import best_score, relevance_floor
 
         floor = relevance_floor()
-        accepted = floor is not None and bool(results) and results[0].get("score", 0) > floor
+        accepted = floor is not None and bool(results) and best_score(results) > floor
         if accepted and results[0].get("id"):
             # A hit's id is its document's node in the graph.
             try:
@@ -1001,6 +1011,10 @@ def researcher_node(state: AgentState) -> AgentState:
     elif research_status == "need_replan":
         state["next_agent"] = "Planner"
         state["messages"].append("[Researcher] Needs replan")
+        # A replan is a cycle the Architect's gate never sees -- the Planner
+        # and the Researcher can go round without reaching the Builder -- so
+        # it is counted here, and `MAX_STEPS` bounds this loop too.
+        state["step_count"] = state.get("step_count", 0) + 1
     elif research_status == "no_relevant_knowledge":
         state["next_agent"] = "Builder"
         state["messages"].append("[Researcher] No relevant knowledge, proceeding")
@@ -1240,8 +1254,13 @@ OUTPUT_DIR_NOTE = (
     "file under that directory, spelling the full path from the project root "
     "(for example {output_dir}/main.py) -- filesystem_write refuses any other "
     "path. Pass cwd={output_dir} to terminal_execute and run_tests when you "
-    "run what you wrote."
+    "run what you wrote. The git tools act in {output_dir}/ itself, and "
+    "git_dwell needs it to be a repository of its own (git init it first)."
 )
+
+
+# The Builder's git tools, which on a run given a project act in that project.
+_GIT_TOOL_NAMES = frozenset({"git_status", "git_diff", "git_dwell"})
 
 
 def _outside_output_dir(path: str, output_dir: str) -> str | None:
@@ -1354,6 +1373,11 @@ def _run_builder_tools(
         for call in calls:
             name = str(call.get("name", ""))
             args = dict(call.get("args") or {})
+            if output_dir and name in _GIT_TOOL_NAMES:
+                # The project's own repository, never the checkout around it:
+                # `projects/` is ignored there, so `git add -A` could only stage
+                # the operator's own work -- and the default pipeline merges.
+                args["cwd"] = output_dir
 
             if name not in BUILDER_TOOL_NAMES:
                 # Refused, not run: the client serves the Researcher's tools
@@ -1496,6 +1520,7 @@ _VERIFY_LABELS = {
 _CUT_OFF_REASONS = {
     "turn_cap": "the Builder ran out of tool turns before it finished",
     "deadline": "the Builder hit its deadline before it finished",
+    "no_tools": "the Builder's model cannot call tools, so nothing was built",
 }
 
 
@@ -1567,6 +1592,7 @@ def _verify_written_files(
     files_changed: list[str],
     tool_log: list[str],
     deadline: _Deadline | None = None,
+    cwd: str = "",
 ) -> list[tuple[str, str, str]]:
     """Run the runnable files the Builder wrote, and report what happened.
 
@@ -1574,7 +1600,9 @@ def _verify_written_files(
     imported rather than executed (`_import_target`), both under this process's
     own interpreter, which has the project's dependencies. `deadline` bounds the
     pass as a whole, and a file past it or past the emergency stop comes back
-    "unverified" -- never "ok".
+    "unverified" -- never "ok". `cwd` is where each file runs: a project run's
+    directory, where the Builder was told to run what it wrote, so a file that
+    opens its neighbours by relative path runs the same for the proof.
 
     Returns (path, status, detail) per runnable file, where status is "ok",
     "imported", "failed" or "unverified".
@@ -1603,7 +1631,9 @@ def _verify_written_files(
         # would arrive as two arguments.
         python = shlex.quote(sys.executable)
         if target is None:
-            command, passed = f"{python} {shlex.quote(path)}", "ok"
+            # Absolute, so it names the same file from whichever `cwd` it runs in.
+            script = str(Path(path).resolve()) if cwd else path
+            command, passed = f"{python} {shlex.quote(script)}", "ok"
         else:
             root, module = target
             command, passed = f'{python} -c "import {module}"', "imported"
@@ -1624,6 +1654,7 @@ def _verify_written_files(
                         else max(1, int(min(VERIFY_TIMEOUT_SECONDS, deadline.remaining())))
                     ),
                     "env": env,
+                    **({"cwd": cwd} if cwd else {}),
                 },
             )
         except Exception as exc:
@@ -1753,11 +1784,15 @@ def _seat_pass(
     files_changed: list[str],
     tool_log: list[str],
     deadline: _Deadline,
-) -> tuple[str, bool, bool, bool]:
-    """The Builder's seat at work: (closing message, out of turns, out of time, stopped).
+) -> tuple[str, bool, bool, bool, str]:
+    """The Builder's seat at work.
 
-    A discussion run binds no tools, so it takes the path of a model that cannot
-    call any: there is no tool loop for it to act through.
+    Returns (closing message, out of turns, out of time, stopped, why it could
+    not act). A discussion run binds no tools, so it takes the path of a model
+    that cannot call any: there is no tool loop for it to act through. The last
+    element is empty unless a real model was refused its tools on a run that
+    needed them -- such a pass can only describe work, so it must not read as
+    having done it. A stub answers in canned text by design and is exempt.
     """
     discuss_only = bool(state.get("discuss_only"))
     note = (
@@ -1773,19 +1808,27 @@ def _seat_pass(
         ),
     ]
     llm = get_agent_llm("builder")
+    no_tools = ""
     try:
         tool_llm = None if discuss_only else llm.bind_tools(BUILDER_TOOLS)
-    except AttributeError:  # StubLLM, or a model without tool support
+    except AttributeError as exc:  # StubLLM, or a model without tool support
         tool_llm = None
+        if not getattr(llm, "is_stub", False):
+            no_tools = str(exc).removeprefix("bind_tools: ").removeprefix("bind_tools") or (
+                "the model offers no tool binding"
+            )
 
     if RUN_CONTROL.stopped():
-        return "", False, False, True
+        return "", False, False, True, no_tools
     if tool_llm is None:
         reply = _with_deadline(
             lambda: _as_text(llm.invoke(messages).content), deadline.remaining(), None
         )
-        return reply or "", False, reply is None, False
-    return _run_builder_tools(tool_llm, messages, files_changed, tool_log, deadline, output_dir)
+        return reply or "", False, reply is None, False, no_tools
+    return (
+        *_run_builder_tools(tool_llm, messages, files_changed, tool_log, deadline, output_dir),
+        "",
+    )
 
 
 def _prove(
@@ -1809,7 +1852,9 @@ def _prove(
         if path not in files_changed and path not in carried and Path(path).exists()
     ]
     lint = _lint_written_files(files_changed + carried + lint_carried, tool_log, deadline)
-    return _verify_written_files(files_changed + carried, tool_log, deadline), lint
+    # A discussion run writes nothing, and has no project to run in.
+    cwd = "" if state.get("discuss_only") else str(state.get("output_dir") or "")
+    return _verify_written_files(files_changed + carried, tool_log, deadline, cwd), lint
 
 
 def _proof_report(
@@ -1881,7 +1926,7 @@ def builder_node(state: AgentState) -> AgentState:
     # it leaves unspent is added to the reserve: a slow build cannot starve the
     # proof.
     loop_deadline = _Deadline(max(0.0, BUILDER_DEADLINE_SECONDS - VERIFY_RESERVE_SECONDS))
-    content, exhausted, out_of_time, stopped = _seat_pass(
+    content, exhausted, out_of_time, stopped, no_tools = _seat_pass(
         state, output_dir, files_changed, tool_log, loop_deadline
     )
     verification, lint = _prove(
@@ -1987,6 +2032,12 @@ def builder_node(state: AgentState) -> AgentState:
             f"Builder stopped after {MAX_BUILDER_TOOL_TURNS} tool turns without "
             "finishing. Narrow the plan or split it into smaller steps."
         )
+    if no_tools and not blockers:
+        blockers = (
+            f"The Builder's model cannot call tools ({no_tools}), so this pass could "
+            "not write or run anything. Seat the Builder on a model that reports "
+            "`tools` (`ollama show <tag>` lists its capabilities)."
+        )
 
     state["builder_report"] = builder_report
     state["files_changed"] = all_files_changed
@@ -1997,7 +2048,10 @@ def builder_node(state: AgentState) -> AgentState:
     # `expect_failures` and must not excuse unrun files with them.
     state["unverified"] = list(unverified)
     state["builder_cut_off"] = (
-        "turn_cap" if exhausted else "deadline" if out_of_time else ""
+        "turn_cap" if exhausted
+        else "deadline" if out_of_time
+        else "no_tools" if no_tools
+        else ""
     )
     state["lint_failed"] = lint_failed
     state["blockers"] = blockers
@@ -2030,6 +2084,11 @@ def builder_node(state: AgentState) -> AgentState:
         summary = (
             f"Stopped after {MAX_BUILDER_TOOL_TURNS} tool turns without "
             f"finishing. Files: {len(files_changed)}"
+        )
+    elif no_tools:
+        summary = (
+            f"Could not act: the Builder's model cannot call tools. "
+            f"Files: {len(files_changed)}"
         )
     elif discuss_only:
         summary = "Discussion only: proposal ready, nothing was changed"

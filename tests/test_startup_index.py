@@ -289,6 +289,41 @@ def test_an_idle_server_refuses_neither():
     assert serve._refuse_while_a_run_is_in_flight("cleared") is None
 
 
+def test_nothing_starts_on_the_corpus_while_an_upload_is_changing_it(monkeypatch):
+    """The refusal was checked and let go of: a run claimed in the gap rebuilt
+    the corpus under the upload, and the stored and in-memory graphs parted."""
+    monkeypatch.setattr(serve, "REBUILD_CORPUS", True)
+    inside, release = threading.Event(), threading.Event()
+
+    def slow_store(kb, name, content):  # type: ignore[no-untyped-def]
+        inside.set()
+        release.wait(5)
+        return {"path": f"uploads/{name}"}
+
+    rebuilt: list[str] = []
+    monkeypatch.setattr(serve, "store_uploaded_document", slow_store)
+    monkeypatch.setattr(serve, "_kb_for_indexing", lambda: object())
+    monkeypatch.setattr(serve, "_rebuild_the_corpus", lambda **kw: rebuilt.append("ran") or {})
+    upload = threading.Thread(
+        target=serve.rpc_upload_document, args=({"name": "a.md", "content": "x"},)
+    )
+    upload.start()
+    try:
+        assert inside.wait(5)
+        with pytest.raises(ValueError, match="being added to"):
+            serve.rpc_run_goal({"goal": "Do a thing"})
+        assert serve._rebuild_the_corpus_in_background("test") is None
+        with pytest.raises(ValueError, match="another request"):
+            serve.rpc_clear_corpus({})
+    finally:
+        release.set()
+        upload.join(5)
+
+    assert rebuilt == []
+    assert serve._corpus_change["running"] is False
+    assert serve._run_progress["running"] is False
+
+
 def test_the_stale_verdict_is_withheld_while_the_corpus_is_being_rebuilt(monkeypatch, tmp_path):
     """A poll landing inside a rebuild sees a corpus mid-repair of exactly what
     the verdict would accuse it of, so the accusation is withheld and the

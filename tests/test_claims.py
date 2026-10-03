@@ -330,6 +330,38 @@ def test_a_container_stop_outlasts_the_node_in_flight():
     )
 
 
+def test_every_installer_writes_and_reads_one_dependency_stamp():
+    """The launcher reinstalls when pyproject.toml no longer matches the stamp
+    the venv was installed from, and install.sh writes the same stamp so a
+    launch right after it installs nothing; the image bakes one too, which its
+    entrypoint compares. Four places agreeing on one file and one hash, or the
+    launcher reinstalls on every start -- or never."""
+    stamp = ".ambiguity-deps"
+    command = "sha256sum pyproject.toml | cut -d' ' -f1"
+    for name in ("launch_console.sh", "install.sh", "dockerfile", "docker/entrypoint.sh"):
+        text = (ROOT / name).read_text(encoding="utf-8")
+        assert stamp in text, f"{name} no longer names the dependency stamp"
+        assert command in text, f"{name} computes the stamp some other way"
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "./pyproject.toml:/app/pyproject.toml:ro" in compose, (
+        "compose no longer mounts pyproject.toml, so the entrypoint compares the "
+        "image's stamp with the image's own copy and can never see the code move on"
+    )
+
+
+def test_readiness_is_judged_on_a_key_the_status_payload_carries():
+    """The launcher and the image's health check look for the console's own
+    answer, not merely an answer -- another server on the port answers too."""
+    import serve
+
+    key = '"indexes_on_run"'
+    assert key.strip('"') in serve.rpc_status({})
+    assert key in (ROOT / "launch_console.sh").read_text(encoding="utf-8")
+    healthcheck = re.search(r"^HEALTHCHECK\b.*\n.*$", (ROOT / "dockerfile").read_text(
+        encoding="utf-8"), re.MULTILINE)
+    assert healthcheck and "indexes_on_run" in healthcheck.group(0)
+
+
 def test_the_documented_rpc_methods_are_the_served_ones():
     """frontend/README.md listed a `reindex` that no longer existed and missed
     fifteen methods that did."""
@@ -490,10 +522,12 @@ def test_no_capital_forced_by_position_becomes_a_hub_entity():
 
 
 # The twenty best-connected entities, as a person last read and accepted them:
-# 2026-10-02, when the embedder gained a circuit of its own and `Circuit` (the
-# self-healing class) reached a sixth document. The twentieth slot is a tie at
-# six documents, settled by name, so it took the place of `CircuitOpenError`;
-# both are real terms. The 2026-10-01 audit, when the census widened back to
+# 2026-10-02, when a Researcher's replan began counting toward the step
+# ceiling and `MAX_STEPS` (graph.py's constant) reached a seventh document;
+# `Architecture` left at the tie for the twentieth slot, six documents settled
+# by name, which `AGENTS` now holds -- all three are real terms. Earlier the
+# same day `Circuit` (the self-healing class) reached a sixth document and took
+# the place of `CircuitOpenError`. The 2026-10-01 audit, when the census widened back to
 # all the prose the checkout ships, ruled `ValueError`, `GraphRAG`, `Callable`,
 # `Verdict` and `Architecture` (the Architect's section and state field) real
 # terms, and four sentence-openers the positional guard caught joined
@@ -502,7 +536,7 @@ AUDITED_TOP_ENTITIES = frozenset({
     "Builder", "Architect", "Planner", "Researcher", "Exception", "ValueError",
     "GraphRAG", "Ollama", "Python", "AgentState", "Callable", "Search",
     "Verdict", "Anthropic", "Fiedler", "Laplacian", "RECURSION_LIMIT", "AGENTS",
-    "Architecture", "Circuit",
+    "MAX_STEPS", "Circuit",
 })
 
 

@@ -1,27 +1,30 @@
-"""Retries with backoff and circuit breakers, as decorators or plain calls.
+"""Retries with backoff and circuit breakers, as plain calls.
 
-- `call_with_retry` / `retry_with_backoff`: call again after a failure the
-  policy calls transient, waiting exponentially longer each time, up to
-  `max_attempts`. `give_up` cuts a wait short and re-raises the last failure.
-- `Circuit` / `circuit_breaker`: stop calling a service that keeps failing.
-  After `recovery_timeout` seconds one trial call is let through; if it
-  succeeds the circuit closes again on its own.
-- `self_healing_wrapper`: both, with the circuit outside the retries.
+- `call_with_retry`: call again after a failure the policy calls transient,
+  waiting exponentially longer each time, up to `max_attempts`. `give_up`
+  cuts a wait short and re-raises the last failure.
+- `Circuit`: stop calling a service that keeps failing. After
+  `recovery_timeout` seconds one trial call is let through; if it succeeds
+  the circuit closes again on its own.
 
 Circuits are named and shared: every caller naming one counts toward it and is
 protected by it, which is what lets several functions that talk to one service
 stand down together. A refused call raises `CircuitOpenError`, and no retry
 policy here ever retries one -- an open circuit is answered by its cooldown.
+
+A circuit only keeps the books; it never serializes the calls it guards. Its
+lock is held to read and update its state, never across the call itself, so a
+seat generating for two minutes does not hold up a status read that goes
+through the same circuit.
 """
 
+import contextlib
 import functools
 import threading
 import time
-from collections.abc import Callable
-from datetime import UTC, datetime
+from collections.abc import Callable, Iterator
 from typing import Any, ParamSpec, TypeVar
 
-import pybreaker
 from tenacity import (
     RetryCallState,
     Retrying,
@@ -30,49 +33,162 @@ from tenacity import (
     wait_exponential,
 )
 
-from .logger import SelfHealingLogger, get_healing_logger
+from .logger import get_healing_logger
 
 P = ParamSpec("P")
 R = TypeVar("R")
 
-# Every circuit this process has defined, by name.
-_circuit_breakers: dict[str, pybreaker.CircuitBreaker] = {}
-_registry_lock = threading.Lock()
+STATE_CLOSED = "closed"
+STATE_OPEN = "open"
+STATE_HALF_OPEN = "half-open"
 
 # How finely a backoff wait is sliced, so `give_up` is asked while waiting.
 _WAIT_SLICE_SECONDS = 0.25
 
 
-class CircuitOpenError(pybreaker.CircuitBreakerError):
+def exception_chain(exc: BaseException) -> list[BaseException]:
+    """`exc` and every exception it was raised from or during, outermost first.
+
+    What a `trips_on` predicate reads: a library's own error is usually the
+    context of the one a caller sees.
+    """
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    while current is not None and all(current is not seen for seen in chain):
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+class CircuitOpenError(Exception):
     """A call refused without being attempted, because its circuit is open."""
 
-    def __init__(self, circuit: str, retry_in: float) -> None:
+    def __init__(self, circuit: str, retry_in: float, *, testing: bool = False) -> None:
         self.circuit = circuit
         self.retry_in = retry_in
+        if testing:
+            detail = "a trial call is testing it now"
+        else:
+            detail = f"the next call is let through to test it in {max(0, round(retry_in))}s"
         super().__init__(
-            f"{circuit} is unavailable: its circuit opened after repeated failures, "
-            f"and the next call is let through to test it in {max(0, round(retry_in))}s"
+            f"{circuit} is unavailable: its circuit opened after repeated failures, and {detail}"
         )
 
 
-class _StateChangeLogger(pybreaker.CircuitBreakerListener):
-    """Logs a circuit's transitions -- only the ones that change its state."""
+class _Breaker:
+    """One circuit's state: what counts as a failure, how many, and since when.
 
-    def __init__(self, cb_name: str, logger: SelfHealingLogger) -> None:
-        self._cb_name = cb_name
-        self._logger = logger
+    Every method takes `_lock` for its own bookkeeping only. Closed, a failure
+    the circuit counts adds one and a call that succeeds -- or fails in a way
+    the circuit does not count, which is the service answering -- clears the
+    count; at `fail_max` it opens. Open, every call is refused until
+    `reset_timeout` has passed; then one caller becomes the trial and the
+    circuit is half-open, refusing the rest until the trial ends. The trial
+    closes it by succeeding and reopens it by failing.
+    """
 
-    def state_change(self, cb: pybreaker.CircuitBreaker, old_state: object, new_state: object) -> None:
-        old_name = getattr(old_state, "name", None)
-        new_name = getattr(new_state, "name", str(new_state))
-        if new_name == old_name:
-            return
-        if new_name == pybreaker.STATE_OPEN:
-            self._logger.log_circuit_opened(self._cb_name, cb.fail_counter)
-        elif new_name == pybreaker.STATE_CLOSED:
-            self._logger.log_circuit_closed(self._cb_name)
-        elif new_name == pybreaker.STATE_HALF_OPEN:
-            self._logger.log_circuit_half_open(self._cb_name)
+    def __init__(
+        self,
+        name: str,
+        fail_max: int,
+        reset_timeout: float,
+        counts: Callable[[BaseException], bool],
+        logger_name: str,
+    ) -> None:
+        self.name = name
+        self.fail_max = fail_max
+        self.reset_timeout = reset_timeout
+        self._counts = counts
+        self._logger = get_healing_logger(logger_name)
+        self._lock = threading.Lock()
+        self.state = STATE_CLOSED
+        self.fail_counter = 0
+        self._opened_at: float | None = None
+        # Which trial is under way, so one that outlives a reset cannot
+        # settle the state a later trial is testing.
+        self._trial = 0
+        self._trial_running = False
+
+    def retry_in(self) -> float:
+        """Seconds until an open circuit lets a trial call through; 0 if it would now."""
+        if self.state != STATE_OPEN or self._opened_at is None:
+            return 0.0
+        return max(0.0, self.reset_timeout - (time.monotonic() - self._opened_at))
+
+    def admit(self) -> int:
+        """Let a call through: 0 for an ordinary call, a trial number for the trial.
+
+        Raises `CircuitOpenError` for a call the circuit refuses.
+        """
+        with self._lock:
+            if self.state == STATE_CLOSED:
+                return 0
+            if self.state == STATE_OPEN and self.retry_in() > 0:
+                raise CircuitOpenError(self.name, self.retry_in())
+            if self._trial_running:
+                raise CircuitOpenError(self.name, 0.0, testing=True)
+            became_half_open = self.state != STATE_HALF_OPEN
+            self.state = STATE_HALF_OPEN
+            self._trial += 1
+            self._trial_running = True
+            trial = self._trial
+        if became_half_open:
+            self._logger.log_circuit_half_open(self.name)
+        return trial
+
+    def settle(self, trial: int, exc: BaseException | None) -> None:
+        """Record how a call admitted by `admit` ended: `exc` None for success."""
+        failed = exc is not None and self._counts(exc)
+        interrupted = exc is not None and not isinstance(exc, Exception)
+        opened = closed = False
+        with self._lock:
+            ours = trial != 0 and trial == self._trial and self._trial_running
+            if ours:
+                self._trial_running = False
+            if interrupted:
+                # Neither an answer nor an outage: the trial is simply over.
+                return
+            if ours and self.state == STATE_HALF_OPEN:
+                if failed:
+                    self.state, self._opened_at, opened = STATE_OPEN, time.monotonic(), True
+                else:
+                    self.state, self.fail_counter, closed = STATE_CLOSED, 0, True
+            elif self.state == STATE_CLOSED:
+                if failed:
+                    self.fail_counter += 1
+                    if self.fail_counter >= self.fail_max:
+                        self.state, self._opened_at, opened = STATE_OPEN, time.monotonic(), True
+                else:
+                    self.fail_counter = 0
+            failures = self.fail_counter
+        if opened:
+            self._logger.log_circuit_opened(self.name, failures)
+        if closed:
+            self._logger.log_circuit_closed(self.name)
+
+    def open(self) -> bool:
+        """Open the circuit now; False if it already was."""
+        with self._lock:
+            if self.state == STATE_OPEN:
+                return False
+            self.state, self._opened_at = STATE_OPEN, time.monotonic()
+            self._trial_running = False
+        self._logger.log_circuit_opened(self.name, 0)
+        return True
+
+    def close(self) -> None:
+        """Close the circuit now, clearing its count."""
+        with self._lock:
+            was = self.state
+            self.state, self.fail_counter, self._opened_at = STATE_CLOSED, 0, None
+            self._trial_running = False
+        if was != STATE_CLOSED:
+            self._logger.log_circuit_closed(self.name)
+
+
+# Every circuit this process has defined, by name.
+_circuit_breakers: dict[str, _Breaker] = {}
+_registry_lock = threading.Lock()
 
 
 def _get_circuit_breaker(
@@ -82,7 +198,7 @@ def _get_circuit_breaker(
     expected_exception: type[BaseException] = Exception,
     logger_name: str = "self_healing",
     trips_on: Callable[[BaseException], bool] | None = None,
-) -> pybreaker.CircuitBreaker:
+) -> _Breaker:
     """The circuit called `name`, created on first use.
 
     Only a failure that is an `expected_exception` -- and, when `trips_on` is
@@ -93,34 +209,14 @@ def _get_circuit_breaker(
     with _registry_lock:
         cb = _circuit_breakers.get(name)
         if cb is None:
-            def answered(exc: BaseException) -> bool:
-                return not isinstance(exc, expected_exception) or (
-                    trips_on is not None and not trips_on(exc)
+            def counts(exc: BaseException) -> bool:
+                return isinstance(exc, expected_exception) and (
+                    trips_on is None or trips_on(exc)
                 )
 
-            cb = pybreaker.CircuitBreaker(
-                name=name,
-                fail_max=failure_threshold,
-                reset_timeout=recovery_timeout,
-                exclude=[answered],
-                # The call that trips the circuit raises its own error, which
-                # says why; only the calls refused after it raise CircuitOpenError.
-                throw_new_error_on_trip=False,
-            )
-            cb.add_listener(
-                _StateChangeLogger(name, get_healing_logger(logger_name))
-            )
+            cb = _Breaker(name, failure_threshold, recovery_timeout, counts, logger_name)
             _circuit_breakers[name] = cb
         return cb
-
-
-def _retry_in(cb: pybreaker.CircuitBreaker) -> float:
-    """Seconds until an open circuit lets a trial call through; 0 if it would now."""
-    opened_at = cb._state_storage.opened_at
-    if opened_at is None:
-        return 0.0
-    elapsed = (datetime.now(UTC) - opened_at).total_seconds()
-    return max(0.0, float(cb.reset_timeout) - elapsed)
 
 
 class Circuit:
@@ -143,20 +239,35 @@ class Circuit:
         self._logger = get_healing_logger(logger_name)
 
     def call(self, func: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
-        """Call `func` through the circuit; raise `CircuitOpenError` if it is open."""
+        """Call `func` through the circuit; raise `CircuitOpenError` if it is open.
+
+        The circuit's lock is never held while `func` runs.
+        """
+        with self.guarding():
+            return func(*args, **kwargs)
+
+    @contextlib.contextmanager
+    def guarding(self) -> Iterator[None]:
+        """The circuit around a block, as `call` puts it around a function.
+
+        Refused before the block runs while the circuit is open; how the block
+        ends -- returning, or the exception it raises -- counts as one call.
+        """
         try:
-            result: R = self._breaker.call(func, *args, **kwargs)
-        except CircuitOpenError:
-            raise
-        except pybreaker.CircuitBreakerError as exc:
-            refusal = CircuitOpenError(self.name, _retry_in(self._breaker))
+            trial = self._breaker.admit()
+        except CircuitOpenError as refusal:
             self._logger.error(
                 f"Circuit breaker preventing call to '{self.name}': {refusal}",
                 action="circuit_prevented",
                 function=self.name,
             )
-            raise refusal from exc
-        return result
+            raise
+        try:
+            yield
+        except BaseException as exc:
+            self._breaker.settle(trial, exc)
+            raise
+        self._breaker.settle(trial, None)
 
     def __call__(self, func: Callable[P, R]) -> Callable[P, R]:
         """Use the circuit as a decorator."""
@@ -169,7 +280,7 @@ class Circuit:
 
     def trip(self, reason: str) -> None:
         """Open the circuit now, for a failure that says more than one call."""
-        if self._breaker.current_state != pybreaker.STATE_OPEN:
+        if self._breaker.state != STATE_OPEN:
             self._logger.warning(
                 f"Circuit for '{self.name}' tripped: {reason}",
                 action="circuit_tripped",
@@ -179,28 +290,28 @@ class Circuit:
 
     @property
     def is_open(self) -> bool:
-        return bool(self._breaker.current_state == pybreaker.STATE_OPEN)
+        return self._breaker.state == STATE_OPEN
 
     @property
     def retry_in(self) -> float:
         """Seconds until an open circuit lets its trial call through; 0 if closed or due."""
-        return _retry_in(self._breaker) if self.is_open else 0.0
+        return self._breaker.retry_in()
 
 
 def circuit_states() -> list[dict[str, Any]]:
     """Every circuit this process has defined: its state, failures and cooldown."""
     with _registry_lock:
-        breakers = sorted(_circuit_breakers.values(), key=lambda cb: str(cb.name))
+        breakers = sorted(_circuit_breakers.values(), key=lambda cb: cb.name)
     states = []
     for cb in breakers:
-        state = cb.current_state
+        state = cb.state
         states.append({
             "name": cb.name,
             "state": state,
             "failures": cb.fail_counter,
             "threshold": cb.fail_max,
             "cooldown_s": cb.reset_timeout,
-            "retry_in_s": round(_retry_in(cb), 1) if state == pybreaker.STATE_OPEN else None,
+            "retry_in_s": round(cb.retry_in(), 1) if state == STATE_OPEN else None,
         })
     return states
 
@@ -218,7 +329,7 @@ def reset_circuit(name: str | None = None) -> list[str]:
             breakers = [_circuit_breakers[name]]
     for cb in breakers:
         cb.close()
-    return [str(cb.name) for cb in breakers]
+    return [cb.name for cb in breakers]
 
 
 def call_with_retry(
@@ -250,7 +361,7 @@ def call_with_retry(
     def transient(exc: BaseException) -> bool:
         return (
             isinstance(exc, exceptions)
-            and not isinstance(exc, pybreaker.CircuitBreakerError)
+            and not isinstance(exc, CircuitOpenError)
             and (retry_if is None or retry_if(exc))
         )
 
@@ -296,115 +407,3 @@ def call_with_retry(
     if attempts > 1:
         logger.log_retry_success(label, attempts)
     return result
-
-
-def retry_with_backoff(
-    max_attempts: int = 3,
-    min_wait: float = 1.0,
-    max_wait: float = 60.0,
-    exceptions: tuple[type[BaseException], ...] = (Exception,),
-    logger_name: str = "self_healing",
-    *,
-    retry_if: Callable[[BaseException], bool] | None = None,
-    give_up: Callable[[], bool] | None = None,
-    name: str | None = None,
-) -> Callable[[Callable[P, R]], Callable[P, R]]:
-    """Decorator form of `call_with_retry`.
-
-    Example:
-        @retry_with_backoff(max_attempts=3, exceptions=(ConnectionError,))
-        def fetch_data(): ...
-    """
-
-    def decorator(func: Callable[P, R]) -> Callable[P, R]:
-        @functools.wraps(func)
-        def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
-            return call_with_retry(
-                functools.partial(func, *args, **kwargs),
-                max_attempts=max_attempts,
-                min_wait=min_wait,
-                max_wait=max_wait,
-                exceptions=exceptions,
-                retry_if=retry_if,
-                give_up=give_up,
-                name=name or func.__name__,
-                logger_name=logger_name,
-            )
-
-        return wrapper
-
-    return decorator
-
-
-def circuit_breaker(
-    failure_threshold: int = 5,
-    recovery_timeout: float = 30,
-    expected_exception: type[BaseException] = Exception,
-    logger_name: str = "self_healing",
-    name: str | None = None,
-    *,
-    trips_on: Callable[[BaseException], bool] | None = None,
-) -> Callable[[Callable[P, R]], Callable[P, R]]:
-    """Decorator form of `Circuit`; the circuit is named after the function by default.
-
-    Example:
-        @circuit_breaker(failure_threshold=3, recovery_timeout=60)
-        def call_external_service(): ...
-    """
-
-    def decorator(func: Callable[P, R]) -> Callable[P, R]:
-        circuit = Circuit(
-            name or func.__name__,
-            failure_threshold=failure_threshold,
-            recovery_timeout=recovery_timeout,
-            expected_exception=expected_exception,
-            trips_on=trips_on,
-            logger_name=logger_name,
-        )
-        return circuit(func)
-
-    return decorator
-
-
-def self_healing_wrapper(
-    max_attempts: int = 3,
-    failure_threshold: int = 5,
-    recovery_timeout: float = 30,
-    retry_exceptions: tuple[type[BaseException], ...] = (Exception,),
-    circuit_exception: type[BaseException] = Exception,
-    logger_name: str = "self_healing",
-    name: str | None = None,
-    *,
-    min_wait: float = 1.0,
-    max_wait: float = 60.0,
-    retry_if: Callable[[BaseException], bool] | None = None,
-    trips_on: Callable[[BaseException], bool] | None = None,
-) -> Callable[[Callable[P, R]], Callable[P, R]]:
-    """Retries inside a circuit: a whole run of failed retries counts as one failure.
-
-    Example:
-        @self_healing_wrapper(max_attempts=3, failure_threshold=5)
-        def critical_operation(): ...
-    """
-
-    def decorator(func: Callable[P, R]) -> Callable[P, R]:
-        circuit = Circuit(
-            name or f"{func.__module__}.{func.__name__}",
-            failure_threshold=failure_threshold,
-            recovery_timeout=recovery_timeout,
-            expected_exception=circuit_exception,
-            trips_on=trips_on,
-            logger_name=logger_name,
-        )
-        retried = retry_with_backoff(
-            max_attempts=max_attempts,
-            min_wait=min_wait,
-            max_wait=max_wait,
-            exceptions=retry_exceptions,
-            logger_name=logger_name,
-            retry_if=retry_if,
-            name=func.__name__,
-        )(func)
-        return circuit(retried)
-
-    return decorator

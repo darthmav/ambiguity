@@ -267,9 +267,13 @@ EXERCISES: dict[str, Exercise] = {
         "run is finished, and what overrules its `approved` verdict. Report "
         "the answer only -- create no files and change nothing.",
         expect_files=False,
-        what_it_tests="Retrieval against the real corpus, and whether the "
-                      "gate can end a run with no files to point at. Note it "
-                      "does NOT test the Researcher's model: a hit over the "
+        what_it_tests="Whether the gate can end a run with no files to point "
+                      "at, and retrieval when the corpus holds the answer. "
+                      "The corpus is the research archive, never this "
+                      "checkout, so it holds the gate's documentation only "
+                      "once someone has uploaded it (CLAUDE.md, say); until "
+                      "then this question reaches the Researcher's model as "
+                      "`offcorpus` does. Once it holds it, a hit over the "
                       "measured relevance floor is formatted straight into "
                       "the findings without the seat being called, so two "
                       "Researchers score alike here (this corpus's floor: "
@@ -283,7 +287,7 @@ EXERCISES: dict[str, Exercise] = {
         expect_files=False,
         what_it_tests="The Researcher's *model*, which the `research` exercise "
                       "cannot reach. `_gather_research` formats retrieval "
-                      "straight into the output whenever the top hit clears "
+                      "straight into the output whenever the best hit clears "
                       "the measured relevance floor and only calls the seat "
                       "below it, so a question this corpus cannot answer is "
                       "the only team exercise where the Researcher's model is "
@@ -1270,6 +1274,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Wall-clock seconds per team run (default: 900)")
     p.add_argument("--node-deadline", type=float, default=150.0)
     p.add_argument("--builder-deadline", type=float, default=240.0)
+    p.add_argument("--llm-timeout", type=float, default=None,
+                   help="Seconds one seat call may wait at the socket "
+                        "(default: LLM_TIMEOUT_SECONDS, the console's own)")
     p.add_argument("--tool-turns", type=int, default=8,
                    help="Builder tool turns, i.e. MAX_BUILDER_TOOL_TURNS "
                         "(default: 8, the shipped value)")
@@ -1329,7 +1336,9 @@ def main(argv: list[str]) -> int:
         return 0
 
     # Deadlines are module constants read from the environment at import time,
-    # so they are set before the project is imported.
+    # so they are set before `nodes` is imported below. `config` is imported at
+    # the top of this file, so its socket timeout is set on the module instead
+    # (`--llm-timeout`), which every seat call reads when it is built.
     #
     # These started tighter than the shipped 150s/240s, on the theory that a
     # sweep should be watchable and a wedged seat should not hold it for four
@@ -1354,7 +1363,6 @@ def main(argv: list[str]) -> int:
     # as an under-sized verification reserve.
     os.environ["NODE_DEADLINE_SECONDS"] = str(args.node_deadline)
     os.environ["BUILDER_DEADLINE_SECONDS"] = str(args.builder_deadline)
-    os.environ.setdefault("LLM_TIMEOUT_SECONDS", str(args.node_deadline))
     # Held back from the Builder's tool loop so the verification pass gets to
     # run at all. It was cut to 25s to match a shortened Builder deadline; now
     # that the deadline is back to the shipped 240s this goes back with it. A
@@ -1372,6 +1380,8 @@ def main(argv: list[str]) -> int:
     from langgraph_agent.state import Verdict
 
     nodes.MAX_BUILDER_TOOL_TURNS = args.tool_turns
+    if args.llm_timeout is not None:
+        config.LLM_TIMEOUT_SECONDS = args.llm_timeout
 
     mods: dict[str, Any] = {
         "config": config, "control": control, "nodes": nodes,
@@ -1436,7 +1446,8 @@ def main(argv: list[str]) -> int:
     print(f"  worst case     ~{(team_runs * args.budget) / 60:.0f} min of runs "
           f"plus probes")
     print(f"  deadlines      node {args.node_deadline:.0f}s / "
-          f"builder {args.builder_deadline:.0f}s / turns {args.tool_turns}")
+          f"builder {args.builder_deadline:.0f}s / turns {args.tool_turns} / "
+          f"socket {config.LLM_TIMEOUT_SECONDS:.0f}s")
     print(f"  paid seats     {'included' if args.anthropic else 'excluded'}")
     if do_teams:
         print(f"  configs        {', '.join(c.name for c in configs)}")
@@ -1545,6 +1556,7 @@ def main(argv: list[str]) -> int:
         "budget": args.budget,
         "node_deadline": args.node_deadline,
         "builder_deadline": args.builder_deadline,
+        "llm_timeout": config.LLM_TIMEOUT_SECONDS,
         "tool_turns": args.tool_turns,
         "anthropic_included": args.anthropic,
         "interrupted": interrupted,

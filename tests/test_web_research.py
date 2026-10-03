@@ -558,6 +558,67 @@ def test_one_unreachable_page_does_not_cost_the_others(monkeypatch):
     assert any("500" in error for error in answer["errors"])
 
 
+def test_a_malformed_url_costs_that_page_alone(monkeypatch):
+    """`InvalidURL` is not an `httpx.HTTPError`, so it escaped the fetch that
+    promised never to raise, and `pool.map` took every other page with it."""
+    _standard_web(monkeypatch, {"https://example.com/good": ON_TOPIC})
+    real_rank = web_research._rank_urls
+
+    def ranked(client, queries, should_stop=None):  # type: ignore[no-untyped-def]
+        urls, titles, errors = real_rank(client, queries, should_stop)
+        return ["https://example.com:99999/bad", *urls], titles, errors
+
+    monkeypatch.setattr(web_research, "_rank_urls", ranked)
+
+    answer = search_web(GOAL)
+
+    assert [page["url"] for page in answer["pages"]] == ["https://example.com/good"]
+    assert any("example.com:99999" in error for error in answer["errors"])
+
+
+def test_a_page_the_reader_chokes_on_costs_that_page_alone(monkeypatch):
+    _standard_web(monkeypatch, {
+        "https://example.com/good": ON_TOPIC, "https://example.com/odd": ON_TOPIC,
+    })
+    real_extract = web_research.extract
+
+    def extract(html):  # type: ignore[no-untyped-def]
+        if extract.calls == 0:
+            extract.calls += 1
+            raise RecursionError("maximum recursion depth exceeded")
+        return real_extract(html)
+
+    extract.calls = 0  # type: ignore[attr-defined]
+    monkeypatch.setattr(web_research, "WEB_FETCH_WORKERS", 1)
+    monkeypatch.setattr(web_research, "extract", extract)
+
+    answer = search_web(GOAL)
+
+    assert len(answer["pages"]) == 1
+    assert any("RecursionError" in error for error in answer["errors"])
+
+
+def test_a_stop_reaches_the_searches_and_the_fetches(monkeypatch, kb, tmp_path):
+    """The stop was asked only once every query had been sent and every page
+    fetched -- minutes, with retries -- after the operator pressed it."""
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        if "duckduckgo" in request.url.host:
+            return httpx.Response(200, text=_results_html("https://example.com/retrieval"))
+        return httpx.Response(200, text=_page_html(ON_TOPIC), headers={"content-type": "text/html"})
+
+    _serve(monkeypatch, handler)
+    stop_after_first = lambda: len(requests) >= 1  # noqa: E731
+
+    report = research_online(lambda: kb, GOAL, str(tmp_path), should_stop=stop_after_first)
+
+    assert report["stopped"]
+    assert len(requests) == 1, "a query or a fetch was sent after the stop"
+    assert kb.added == []
+
+
 # ---------------------------------------------------------------------------
 # The phase as a whole
 # ---------------------------------------------------------------------------

@@ -12,6 +12,8 @@ import functools
 import hashlib
 import json
 import os
+import re
+import threading
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -30,6 +32,7 @@ from langgraph_agent.corpus_spectral import (
     CorpusSpectralMixin,
 )
 from langgraph_agent.corpus_store import (
+    POSTGRES,
     PgCorpusStore,
     create_corpus_store,
     database_unreachable,
@@ -40,7 +43,12 @@ from langgraph_agent.lexical import (
     lexical_order,
     reciprocal_rank_fusion,
 )
-from langgraph_agent.projects import PROJECTS_DIR, embedded_projects, held_out_of_corpus
+from langgraph_agent.projects import (
+    PROJECTS_DIR,
+    embedded_projects,
+    held_out_of_corpus,
+    skipped_dir,
+)
 from langgraph_agent.self_healing import Circuit, CircuitOpenError, call_with_retry
 
 # The embedding model that builds and searches the corpus, served by the local
@@ -291,9 +299,25 @@ def resolve_persist_dir(persist_dir: str | Path | None = None) -> Path:
     return Path(persist_dir or DEFAULT_PERSIST_DIR)
 
 
-# The questions the relevance floor is measured with, in JSON because the walk
-# never indexes JSON: indexed, the unanswerable ones would answer themselves.
+# The questions the relevance floor's unanswered side is measured with, in JSON
+# because the walk never indexes JSON: indexed, they would answer themselves.
 FLOOR_CALIBRATION_QUESTIONS = Path(__file__).with_name("embedding_calibration.json")
+
+# The search window the floor is measured through. The gates read it off a
+# search of the Researcher's width (`RESEARCH_RESULTS`, 5 by default) and the
+# Planner's map (6); the statistic, the best cosine a search returned, is the
+# dense best in either, since BM25 only re-orders the dense window.
+FLOOR_SEARCH_RESULTS = 5
+
+# Fewer questions than this that the corpus answers by construction, and it
+# cannot say where its own answers score: no floor until it has grown.
+FLOOR_MIN_ANSWERED = 3
+
+# The line a fetched page's header records its goal on (`_render_document`).
+_RESEARCHED_FOR = re.compile(r"^- Researched for: (.+)$", re.MULTILINE)
+
+# How much of a document is read to find the question it answers.
+_QUESTION_SOURCE_CHARS = 4096
 
 
 def open_store(persist_dir: str | Path | None = None) -> PgCorpusStore | None:
@@ -337,30 +361,101 @@ def relevance_floor(persist_dir: str | Path | None = None) -> float | None:
     return floor_from_calibration(floor_calibration(persist_dir))
 
 
-def calibrate_relevance_floor(kb: "GraphRAGKnowledgeBase") -> dict[str, Any]:
-    """Take the relevance floor for this corpus's embedding model, and keep it.
+def best_score(results: list[dict[str, Any]]) -> float:
+    """The number the relevance floor is measured on and compared with.
 
-    Twelve questions this corpus answers against twelve it cannot. The floor is
-    the midpoint of the gap between the lowest answered score and the highest
-    unanswered one; when the populations overlap there is no floor, since any
-    number inside the overlap would misfile some question silently.
+    The best dense cosine among a search's hits -- not the first hit's, since
+    BM25 can rank a lower-cosine passage first, and the floor would then be
+    read off a different statistic at every gate than at calibration.
     """
-    questions = json.loads(FLOOR_CALIBRATION_QUESTIONS.read_text(encoding="utf-8"))
+    return max((float(hit.get("score") or 0.0) for hit in results), default=0.0)
+
+
+def corpus_signature(kb: "GraphRAGKnowledgeBase") -> str:
+    """What the corpus holds, as one fingerprint: every document and its content hash.
+
+    A floor is a property of the embedding model on these texts; measured on
+    other ones, it is stale.
+    """
+    fingerprints = kb.collection.fingerprints()
+    digest = hashlib.sha256()
+    for doc_id in sorted(fingerprints):
+        digest.update(f"{doc_id}\0{fingerprints[doc_id]}\n".encode())
+    return digest.hexdigest()[:16]
+
+
+def _question_for(doc_id: str) -> str | None:
+    """A question the document answers by construction, or None.
+
+    A fetched page's header names the goal it was researched for; anything
+    else offers its first heading, else its first line. Under three words is no
+    question.
+    """
+    try:
+        with open(doc_id, encoding="utf-8") as handle:
+            head = handle.read(_QUESTION_SOURCE_CHARS)
+    except (OSError, UnicodeDecodeError):
+        return None
+    match = _RESEARCHED_FOR.search(head)
+    if match:
+        question = match.group(1)
+    else:
+        lines = [line.strip() for line in head.splitlines() if line.strip()]
+        heading = next((line.lstrip("#").strip() for line in lines if line.startswith("#")), "")
+        question = heading or (lines[0] if lines else "")
+    question = " ".join(question.split())[:200]
+    return question if len(question.split()) >= 3 else None
+
+
+def answered_questions(kb: "GraphRAGKnowledgeBase", limit: int) -> list[str]:
+    """Up to `limit` distinct questions this corpus answers, spread across it."""
+    documents = sorted(
+        str(node) for node, attrs in kb.graph.nodes(data=True) if attrs.get("type") == "document"
+    )
+    questions = list(dict.fromkeys(q for q in map(_question_for, documents) if q))
+    if len(questions) <= limit:
+        return questions
+    # Evenly spaced, so one research topic filed together cannot be all of it.
+    return [questions[round(i * (len(questions) - 1) / (limit - 1))] for i in range(limit)]
+
+
+def calibrate_relevance_floor(
+    kb: "GraphRAGKnowledgeBase", top_k: int = FLOOR_SEARCH_RESULTS
+) -> dict[str, Any]:
+    """Take the relevance floor for this corpus and its embedding model, and keep it.
+
+    Questions the corpus answers by construction -- drawn from its own
+    documents -- against as many it cannot, from `embedding_calibration.json`.
+    The floor is the midpoint of the gap between the lowest answered score and
+    the highest unanswered one; when the populations overlap there is no floor,
+    since any number inside the overlap would misfile some question silently.
+    The record carries the corpus's signature, so a corpus that has changed is
+    measured again rather than judged by a floor taken on other texts.
+    """
+    unanswerable_questions = json.loads(
+        FLOOR_CALIBRATION_QUESTIONS.read_text(encoding="utf-8")
+    )["unanswerable"]
+    answered_qs = answered_questions(kb, len(unanswerable_questions))
 
     def best(question: str) -> float:
-        hits = kb.search(question, 1)
-        return round(float(hits[0].get("score") or 0.0), 3) if hits else 0.0
+        return round(best_score(kb.search(question, top_k)), 3)
 
-    answered = [best(question) for question in questions["answered"]]
-    unanswerable = [best(question) for question in questions["unanswerable"]]
-    low, high = max(unanswerable), min(answered)
     record: dict[str, Any] = {
         "model": EMBEDDING_MODEL_NAME,
-        "answered": answered,
-        "unanswerable": unanswerable,
-        "floor": round((low + high) / 2, 3) if high > low else None,
+        "corpus": corpus_signature(kb),
         "measured_at": datetime.now(UTC).isoformat(),
     }
+    if len(answered_qs) < FLOOR_MIN_ANSWERED:
+        record.update(answered=[], unanswerable=[], floor=None, too_small=len(answered_qs))
+    else:
+        answered = [best(question) for question in answered_qs]
+        unanswerable = [best(question) for question in unanswerable_questions]
+        low, high = max(unanswerable), min(answered)
+        record.update(
+            answered=answered,
+            unanswerable=unanswerable,
+            floor=round((low + high) / 2, 3) if high > low else None,
+        )
     kb.collection.set_floor_record(record)
     return record
 
@@ -582,6 +677,19 @@ def _document_node(
     return attrs, entities
 
 
+def _place_document(
+    graph: nx.DiGraph, doc_id: str, attrs: dict[str, Any], entities: set[str]
+) -> None:
+    """One document's node and `mentions` edges, replacing any edges it had, as the store's do."""
+    if doc_id in graph:
+        graph.remove_edges_from(list(graph.out_edges(doc_id)))
+    graph.add_node(doc_id, **attrs)
+    for entity in entities:
+        if entity not in graph:
+            graph.add_node(entity, type="entity")
+        graph.add_edge(doc_id, entity, relation="mentions")
+
+
 class GraphRAGKnowledgeBase(CorpusSpectralMixin):
     """The corpus: a NetworkX document/entity graph beside a pgvector chunk store.
 
@@ -600,8 +708,15 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
     # must read as "not loaded yet" there.
     _embedder: "OllamaEmbedder | None" = None
 
-    # (nodes, edges) -> the connectivity computed at that shape.
-    _connectivity_cache: "tuple[tuple[int, int], dict[str, Any]] | None" = None
+    # The graph the connectivity was computed on, and the result. Keyed on the
+    # graph object itself: a published graph is never changed in place, so a
+    # graph that is still `self.graph` is the one that was measured.
+    _connectivity_cache: "tuple[nx.DiGraph, dict[str, Any]] | None" = None
+
+    # Serializes the writers of `graph`. Readers take none: every change builds
+    # a new graph and swaps it in (`_place_in_graph`), so a reader iterating
+    # the one it holds never sees it change size under it.
+    _graph_lock = threading.Lock()
 
     # The lexical half of search, built on first use and dropped on every
     # change.
@@ -742,11 +857,20 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
                 fitted.append(chunk[: offsets[CHUNK_MAX_TOKENS - 1][1]])
         return fitted
 
-    def add_document(self, doc_id: str, content: str, metadata: dict[str, Any] | None = None) -> int:
+    def add_document(
+        self,
+        doc_id: str,
+        content: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        graph: nx.DiGraph | None = None,
+    ) -> int:
         """Add a document: its chunks to the store, one node and its entities to the graph.
 
         Chunks are stored as `doc_id#0000`, `doc_id#0001`, ...; the graph still gets
-        one node per document, with entities drawn from the whole text.
+        one node per document, with entities drawn from the whole text. `graph`
+        is a graph being built off to the side (a rebuild's); without one the
+        node goes into the published graph.
 
         Returns:
             How many chunks the document became -- the number that says it is
@@ -782,7 +906,7 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
             self.collection.save_document_graph(doc_id, attrs, entities)
 
         # Memory follows the store only once the store has committed.
-        self._place_in_graph(doc_id, attrs, entities)
+        self._place_in_graph(doc_id, attrs, entities, graph=graph)
 
         # The lexical index now describes a corpus that no longer exists; the
         # next search rebuilds it.
@@ -790,30 +914,48 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         return len(chunks)
 
     def _add_to_graph(
-        self, doc_id: str, content: str, metadata: dict[str, Any] | None = None
+        self,
+        doc_id: str,
+        content: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        graph: nx.DiGraph | None = None,
     ) -> None:
         """The half of `add_document` that costs nothing: the node and its entities.
 
         In memory only. Separate because a rebuild that keeps a document's
-        vectors still has to put it back in the graph it cleared, and writes the
-        rebuilt graph once at the end.
+        vectors still has to put it back in the graph it is building, and
+        writes the rebuilt graph once at the end.
         """
-        self._place_in_graph(doc_id, *_document_node(doc_id, content, metadata))
+        self._place_in_graph(doc_id, *_document_node(doc_id, content, metadata), graph=graph)
 
     def _place_in_graph(
-        self, doc_id: str, attrs: dict[str, Any], entities: set[str]
+        self,
+        doc_id: str,
+        attrs: dict[str, Any],
+        entities: set[str],
+        *,
+        graph: nx.DiGraph | None = None,
     ) -> None:
-        """Put one document's node and `mentions` edges in the in-memory graph.
+        """Put one document's node and `mentions` edges in a graph.
 
-        The edges replace any the document had, as the store's do.
+        Into `graph` when one is being built off to the side. Otherwise into a
+        copy of the published graph, which then replaces it: the console's
+        threads iterate the published one without a lock, and a graph changed
+        under them raised "dictionary changed size during iteration".
         """
-        if doc_id in self.graph:
-            self.graph.remove_edges_from(list(self.graph.out_edges(doc_id)))
-        self.graph.add_node(doc_id, **attrs)
-        for entity in entities:
-            if entity not in self.graph:
-                self.graph.add_node(entity, type="entity")
-            self.graph.add_edge(doc_id, entity, relation="mentions")
+        if graph is not None:
+            _place_document(graph, doc_id, attrs, entities)
+            return
+        with self._graph_lock:
+            updated = self.graph.copy()
+            _place_document(updated, doc_id, attrs, entities)
+            self.graph = updated
+
+    def _publish_graph(self, graph: nx.DiGraph) -> None:
+        """Make `graph` the one every reader sees; nothing changes it after this."""
+        with self._graph_lock:
+            self.graph = graph
 
 
     def search(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
@@ -1040,9 +1182,9 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         candidates.sort()
         return candidates[0][3], [c[3] for c in candidates[1 : 1 + MAX_MATCH_ALTERNATIVES]]
 
-    def _node_record(self, node_id: str) -> dict[str, Any]:
+    def _node_record(self, node_id: str, graph: nx.DiGraph | None = None) -> dict[str, Any]:
         """One graph node in the shape the console draws."""
-        attrs = dict(self.graph.nodes[node_id])
+        attrs = dict((self.graph if graph is None else graph).nodes[node_id])
         node_type = attrs.pop("type", "entity")
 
         # The content snippet is for retrieval, not for hovering.
@@ -1066,9 +1208,10 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
 
     def list_documents(self) -> dict[str, Any]:
         """Every document node -- the centres the console sweeps from."""
+        graph = self.graph
         documents = [
-            {"id": node_id, "title": self._node_record(node_id)["label"], "node_type": "document"}
-            for node_id, attrs in self.graph.nodes(data=True)
+            {"id": node_id, "title": self._node_record(node_id, graph)["label"], "node_type": "document"}
+            for node_id, attrs in graph.nodes(data=True)
             if attrs.get("type") == "document"
         ]
         documents.sort(key=lambda doc: str(doc["title"]))
@@ -1216,10 +1359,11 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         call. A document linked to nothing in it is left out unless asked for, and
         counted in `unlinked_documents`.
         """
-        undirected = self.graph.to_undirected(as_view=True)
+        graph = self.graph
+        undirected = graph.to_undirected(as_view=True)
         keep = {
             node
-            for node, attrs in self.graph.nodes(data=True)
+            for node, attrs in graph.nodes(data=True)
             if attrs.get("type") == "document" or undirected.degree(node) >= min_degree
         }
         edges = [
@@ -1230,14 +1374,14 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
                 "relationship": data.get("relation", "related_to"),
                 "weight": data.get("weight", 1.0),
             }
-            for source, target, data in self.graph.edges(data=True)
+            for source, target, data in graph.edges(data=True)
             if source in keep and target in keep
         ]
         linked = {edge["source_id"] for edge in edges} | {edge["target_id"] for edge in edges}
         unlinked = {node for node in keep if node not in linked}
         if not include_isolated:
             keep -= unlinked
-        nodes = [self._node_record(node) for node in sorted(keep, key=str)]
+        nodes = [self._node_record(node, graph) for node in sorted(keep, key=str)]
         return {
             "nodes": nodes,
             "edges": edges,
@@ -1247,35 +1391,43 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         }
 
     def stats(self) -> dict[str, Any]:
-        """Counters for the console header, plus the connectivity health check."""
+        """Counters for the console header, plus the connectivity health check.
+
+        `total_chunks` is None when the store could not be asked, with the
+        reason in `store_error`: a corpus whose database is down is
+        unavailable, not empty.
+        """
+        graph = self.graph
         documents = sum(
-            1 for _, attrs in self.graph.nodes(data=True) if attrs.get("type") == "document"
+            1 for _, attrs in graph.nodes(data=True) if attrs.get("type") == "document"
         )
+        store_error: str | None = None
+        chunks: int | None
         try:
             chunks = self.collection.count()
-        except Exception:
+        except Exception as exc:
             # A database failure must not take the in-memory counts with it.
-            chunks = 0
+            chunks, store_error = None, f"{type(exc).__name__}: {exc}"
 
-        nodes = self.graph.number_of_nodes()
-        edges = self.graph.number_of_edges()
-
-        # Cached against (nodes, edges): the header polls every five seconds,
-        # and nothing in this class changes the graph's structure without
-        # changing one of the two.
-        if self._connectivity_cache is not None and self._connectivity_cache[0] == (nodes, edges):
-            connectivity = self._connectivity_cache[1]
+        # Cached against the graph itself: the header polls every five
+        # seconds, and a published graph never changes.
+        cache = self._connectivity_cache
+        if cache is not None and cache[0] is graph:
+            connectivity = cache[1]
         else:
             connectivity = self.connectivity()
-            self._connectivity_cache = ((nodes, edges), connectivity)
+            self._connectivity_cache = (graph, connectivity)
 
-        return {
+        stats: dict[str, Any] = {
             "total_documents": documents,
             "total_chunks": chunks,
-            "total_nodes": nodes,
-            "total_edges": edges,
+            "total_nodes": graph.number_of_nodes(),
+            "total_edges": graph.number_of_edges(),
             **connectivity,
         }
+        if store_error is not None:
+            stats["store_error"] = store_error
+        return stats
 
     def clear(self) -> dict[str, Any]:
         """Empty the knowledge base, keeping the schema that holds it.
@@ -1294,7 +1446,7 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
 
         removed = self.collection.clear()
 
-        self.graph.clear()
+        self._publish_graph(nx.DiGraph())
         self._lexical_index = None
         removed_floor = bool(removed["removed_floor"])
 
@@ -1359,15 +1511,6 @@ INDEXABLE_SUFFIXES = (
     ".sh", ".toml", ".txt", ".yaml", ".yml",
 )
 
-# Directories the walk never enters, wherever they sit under a corpus root:
-# version control, virtualenvs, tool caches and build output -- what a generated
-# project accumulates without anyone writing it. Matched against whole directory
-# names (plus the `.egg-info` suffix), never as substrings, so `rebuild/` is not
-# `build/` and a project's own `src/` and `tests/` are indexed like any others.
-CORPUS_SKIP_DIRS = frozenset({
-    "__pycache__", ".git", ".venv", "venv", "node_modules",
-    ".pytest_cache", ".mypy_cache", "build", "dist",
-})
 
 # Above this size a file is not a document -- a dump, a minified bundle, a log.
 # Chunking means a long document takes one result slot however many chunks it
@@ -1553,10 +1696,6 @@ def store_uploaded_document(
     return report
 
 
-def _skipped_dir(name: str) -> bool:
-    return name in CORPUS_SKIP_DIRS or name.endswith(".egg-info")
-
-
 def iter_corpus_files(root: str = ".", roots: tuple[str, ...] | None = None) -> list[Path]:
     """The files a rebuild indexes, spelled the way it stores them.
 
@@ -1571,7 +1710,7 @@ def iter_corpus_files(root: str = ".", roots: tuple[str, ...] | None = None) -> 
     files: set[Path] = set()
     for corpus_root in CORPUS_ROOTS if roots is None else roots:
         for directory, subdirs, names in os.walk(root_path / corpus_root):
-            subdirs[:] = [name for name in subdirs if not _skipped_dir(name)]
+            subdirs[:] = [name for name in subdirs if not skipped_dir(name)]
             for name in names:
                 path = Path(directory, name)
                 if name.endswith(INDEXABLE_SUFFIXES) and not held_out_of_corpus(
@@ -1592,45 +1731,53 @@ def index_corpus_files(
 
     A rebuild, not an accumulation: rows whose document left the walk are pruned
     first, and a document whose text still hashes to what the store holds keeps
-    its vectors and only rejoins the graph -- so a rebuild costs what changed.
+    its vectors and only rejoins the graph -- so a rebuild costs what changed. A
+    file still on the walk that can no longer be indexed -- grown past
+    `MAX_INDEXABLE_BYTES`, or no longer UTF-8 -- loses what the store held of it
+    too, so search never answers with text the file no longer has.
+
+    The graph is rebuilt off to the side and published when the pass ends, so
+    the console reads the previous graph whole until then rather than one being
+    emptied and refilled under it.
 
     `progress(done, total)` follows each file; `should_stop` is asked before each
     file and between embedding batches. A stop, or a circuit the embedder needs
     opening -- the daemon's, or `EMBEDDER_LOAD` -- ends the pass early: `stopped`,
     or `unavailable` with the circuit named in `unavailable_circuit`. Either
-    leaves the corpus part-built for the next rebuild to finish.
+    leaves the corpus part-built for the next rebuild to finish. A database that
+    cannot be reached is `unavailable` before anything is embedded; any other
+    failure to read what the store holds raises, rather than re-embedding the
+    whole archive as though it held nothing.
     """
     files = iter_corpus_files(root)
     wanted = {str(path) for path in files}
 
-    # One transaction: every document that left the walk is deleted by set
-    # difference, and the fingerprints of the ones that stayed are read from
-    # what survived it.
-    stored_sha: dict[str, str] = {}
+    # One transaction, retried like every store call: every document that left
+    # the walk is deleted by set difference, and the fingerprints of the ones
+    # that stayed are read from what survived it.
     try:
-        with kb.collection.transaction():
-            # Counted in documents, not rows: how many files stopped answering.
-            dropped = len(kb.collection.prune_documents(wanted))
-            stored_sha = kb.collection.fingerprints()
-    except CircuitOpenError as exc:
+        pruned, stored_sha = kb.collection.prune_and_fingerprint(wanted)
+    except Exception as exc:
+        if not (isinstance(exc, CircuitOpenError) or database_unreachable(exc)):
+            raise
         # The database is gone: nothing below could be stored either.
-        kb.graph.clear()
+        kb._publish_graph(nx.DiGraph())
         refused: dict[str, Any] = {
-            "stopped": False, "unavailable": str(exc), "unavailable_circuit": exc.circuit,
+            "stopped": False, "unavailable": str(exc),
+            "unavailable_circuit": getattr(exc, "circuit", POSTGRES.name),
             "indexed": 0, "embedded": 0, "reused": 0, "dropped": 0, "skipped": 0,
             "errors": [],
         }
         refused.update(kb.stats())
         return refused
-    except Exception as exc:
-        errors_pre = [f"pruning stale documents: {exc}"]
-        dropped = 0
-    else:
-        errors_pre = []
-    kb.graph.clear()
+    # Counted in documents, not rows: how many files stopped answering.
+    dropped = len(pruned)
 
+    building = nx.DiGraph()
     indexed = embedded = reused = skipped = 0
-    errors: list[str] = list(errors_pre)
+    errors: list[str] = []
+    # On the walk, but nothing the store holds of them may answer a search.
+    unindexable: set[str] = set()
 
     stopped = False
     unavailable = unavailable_circuit = ""
@@ -1639,20 +1786,25 @@ def index_corpus_files(
         if should_stop is not None and should_stop():
             stopped = True
             break
+        doc_id = str(file_path)
         try:
-            content = file_path.read_text(encoding="utf-8")
+            try:
+                content = file_path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, FileNotFoundError):
+                unindexable.add(doc_id)
+                raise
             if len(content) > MAX_INDEXABLE_BYTES:
+                unindexable.add(doc_id)
                 skipped += 1
                 continue
 
-            doc_id = str(file_path)
             metadata = _document_metadata(file_path)
             if stored_sha.get(doc_id) == _content_sha(content):
-                # Unchanged: only the cleared graph needs it back.
-                kb._add_to_graph(doc_id, content, metadata)
+                # Unchanged: only the graph being built needs it back.
+                kb._add_to_graph(doc_id, content, metadata, graph=building)
                 reused += 1
             else:
-                kb.add_document(doc_id, content, metadata)
+                kb.add_document(doc_id, content, metadata, graph=building)
                 embedded += 1
             indexed += 1
         except EmbeddingStopped:
@@ -1673,8 +1825,17 @@ def index_corpus_files(
         if progress is not None:
             progress(position, len(files))
 
-    # Persisted unconditionally: a rebuild that embedded nothing must still
-    # save the cleared graph and drop the lexical index built before the prune.
+    stale = sorted(doc for doc in unindexable if doc in stored_sha)
+    if stale:
+        try:
+            dropped += len(kb.collection.prune_documents(wanted - unindexable))
+        except Exception as exc:
+            errors.append(f"dropping what no longer indexes: {exc}")
+
+    # Published and persisted unconditionally: a rebuild that embedded nothing
+    # must still replace the previous graph, and drop the lexical index built
+    # before the prune.
+    kb._publish_graph(building)
     kb._lexical_index = None
     kb._should_stop = None
     try:

@@ -15,6 +15,7 @@ from typing import Any
 
 import numpy as np
 import psycopg
+import psycopg.errors
 import pytest
 from test_chunking import _FakeEmbedder
 
@@ -146,13 +147,78 @@ def test_pruning_is_a_set_difference_reported_in_documents(store):
     assert store.count() == 1
 
 
-def test_get_and_delete_by_metadata(store):
-    _put(store, "a.md", _vector(1, 0, 0, 0), _vector(0, 1, 0, 0))
+def test_get_reads_every_row_or_the_ids_asked_for_in_document_order(store):
     _put(store, "b.md", _vector(0, 0, 1, 0))
+    _put(store, "a.md", _vector(1, 0, 0, 0), _vector(0, 1, 0, 0))
 
-    assert store.get(where={"doc_id": "a.md"}, include=[])["ids"] == ["a.md#0000", "a.md#0001"]
-    assert store.delete(where={"doc_id": "a.md"}) == 2
-    assert store.get(include=[])["ids"] == ["b.md#0000"]
+    assert store.get(include=[])["ids"] == ["a.md#0000", "a.md#0001", "b.md#0000"]
+    assert store.get(ids=["b.md#0000", "a.md#0001"], include=["documents"]) == {
+        "ids": ["a.md#0001", "b.md#0000"],
+        "documents": ["a.md passage 1", "b.md passage 0"],
+    }
+
+
+def test_no_index_is_kept_that_nothing_queries(store):
+    """A GIN index on metadata served `delete(where=...)`, which nothing called."""
+    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+        indexes = {
+            row[0]
+            for row in conn.execute(
+                "SELECT indexname FROM pg_indexes WHERE schemaname = %s", (store.schema,)
+            )
+        }
+    assert "chunks_metadata" not in indexes
+    assert "chunks_doc_id" in indexes
+
+
+# -- a database that restarts, and one that answers ---------------------------
+
+
+def _postgres_circuit() -> dict[str, Any]:
+    from langgraph_agent.self_healing import circuit_states
+
+    return next(c for c in circuit_states() if c["name"] == "postgres")
+
+
+def test_a_server_restart_costs_one_retry_not_the_circuit(store, monkeypatch):
+    """Idle connections outlive the server's restart. The retry took the next
+    stale one, so three of them opened the circuit against a healthy server."""
+    monkeypatch.setattr(corpus_store, "POSTGRES_RETRY_WAIT_SECONDS", 0.0)
+    database = store.database
+    database.close()
+    held = [database._take() for _ in range(4)]
+    for conn in held:
+        database._give_back(conn, broken=False)
+    with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as admin:
+        for conn in held:
+            admin.execute("SELECT pg_terminate_backend(%s)", (conn.info.backend_pid,))
+
+    assert store.count() == 0
+
+    circuit = _postgres_circuit()
+    assert (circuit["state"], circuit["failures"]) == ("closed", 0)
+    assert all(conn.closed for conn in held)
+
+
+def test_a_deadlock_is_retried_and_never_counts_toward_the_circuit(store, monkeypatch):
+    """A deadlock is the server answering over a working connection: it used
+    to count toward the circuit and get that connection closed as broken."""
+    monkeypatch.setattr(corpus_store, "POSTGRES_RETRY_WAIT_SECONDS", 0.0)
+    backends: list[int] = []
+    failures_seen: list[int] = []
+
+    def work(conn: Any) -> str:
+        backends.append(conn.info.backend_pid)
+        failures_seen.append(_postgres_circuit()["failures"])
+        if len(backends) < 3:
+            raise psycopg.errors.DeadlockDetected()
+        return "done"
+
+    assert store.database.run(work, name="deadlocked") == "done"
+    assert failures_seen == [0, 0, 0]
+    assert len(set(backends)) == 1, "a healthy connection was closed as broken"
+    circuit = _postgres_circuit()
+    assert (circuit["state"], circuit["failures"]) == ("closed", 0)
 
 
 # -- the graph, the floor, and all of it at once -------------------------------

@@ -673,6 +673,65 @@ def test_a_document_that_left_the_project_is_dropped_and_counted_once(
     assert not [i for i in counting_kb.collection.rows if "a.md" in i]
 
 
+def test_a_file_grown_past_the_limit_takes_its_old_chunks_with_it(
+    counting_kb, tmp_path, monkeypatch
+):
+    """It stayed on the walk, so the prune kept its chunks, and the rebuild
+    then skipped it: search answered from text the file no longer had."""
+    from langgraph_agent import graphrag_server
+
+    root = _project(tmp_path, a_md="The Planner interprets goals.",
+                    b_md="The Architect rules.")
+    index_corpus_files(counting_kb, str(root))
+    path = str(root / "a.md")
+    assert [i for i in counting_kb.collection.rows if i.startswith(path)]
+
+    monkeypatch.setattr(graphrag_server, "MAX_INDEXABLE_BYTES", 40)
+    (root / "a.md").write_text("The Planner interprets goals. " * 10, encoding="utf-8")
+    report = index_corpus_files(counting_kb, str(root))
+
+    assert (report["skipped"], report["dropped"], report["indexed"]) == (1, 1, 1)
+    assert not [i for i in counting_kb.collection.rows if i.startswith(path)]
+    assert path not in counting_kb.graph
+
+
+def test_a_file_that_stopped_decoding_takes_its_old_chunks_with_it(counting_kb, tmp_path):
+    root = _project(tmp_path, a_md="The Planner interprets goals.")
+    index_corpus_files(counting_kb, str(root))
+    path = str(root / "a.md")
+
+    (root / "a.md").write_bytes(b"\xff\xfe not UTF-8 \x80")
+    report = index_corpus_files(counting_kb, str(root))
+
+    assert report["dropped"] == 1
+    assert any("a.md" in error for error in report["errors"])
+    assert not [i for i in counting_kb.collection.rows if i.startswith(path)]
+
+
+def test_the_console_reads_the_previous_graph_whole_until_the_rebuild_ends(
+    counting_kb, tmp_path
+):
+    """The rebuild emptied the published graph and refilled it document by
+    document, while the console's threads iterated it."""
+    root = _project(tmp_path, a_md="The Planner interprets goals.",
+                    b_md="The Architect rules on plans.")
+    index_corpus_files(counting_kb, str(root))
+    before = counting_kb.graph
+    size = before.number_of_nodes()
+    seen: list[tuple[bool, int]] = []
+
+    index_corpus_files(
+        counting_kb, str(root),
+        progress=lambda done, total: seen.append(
+            (counting_kb.graph is before, before.number_of_nodes())
+        ),
+    )
+
+    assert seen == [(True, size), (True, size)]
+    assert counting_kb.graph is not before
+    assert counting_kb.graph.number_of_nodes() == size
+
+
 def test_the_fingerprint_is_written_by_the_store_not_by_the_caller(counting_kb):
     """Every chunk carries it, whichever door the document came in through.
 

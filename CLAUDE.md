@@ -61,7 +61,7 @@ python example_usage.py
 │   ├── control.py             # RUN_CONTROL (the emergency stop), GPU_ARBITER, activity meters
 │   ├── graphrag_server.py     # GraphRAG knowledge base: entity graph + chunked vector store
 │   ├── corpus_store.py        # Where the corpus lives: PostgreSQL + pgvector, one schema per corpus
-│   ├── embedding_calibration.json # Floor questions for a new embedding model (JSON: never indexed)
+│   ├── embedding_calibration.json # The floor's off-domain questions (JSON: never indexed)
 │   ├── mcp_client.py          # The agents' tool belts, served in-process
 │   ├── lexical.py             # BM25 + rank fusion: the lexical half of search
 │   ├── web_research.py        # Online research: keyless search, our own selection gate
@@ -71,7 +71,7 @@ python example_usage.py
 │   ├── projects.py            # Generated projects: where a run writes, and opting one into the corpus
 │   └── self_healing/          # Retries, circuit breakers and the healing journal (see Self-healing)
 │       ├── logger.py          # SelfHealingLogger: severity-levelled healing log + event journal
-│       └── decorators.py      # call_with_retry, Circuit, retry_with_backoff, circuit_breaker
+│       └── decorators.py      # call_with_retry, Circuit, circuit_states, reset_circuit
 ├── prompts/
 │   ├── architect.txt          # System prompt (loaded by nodes.py)
 │   ├── planner.txt
@@ -134,7 +134,7 @@ python example_usage.py
 ├── .dockerignore              # the venv, the caches, and every per-machine artifact
 ├── install.sh                 # Arch / Omarchy: everything, from nothing to a running console
 ├── cuda-embed-ollama.sh       # NVIDIA cards below compute 7.5: Ollama's CUDA 12 build, model 100% on the GPU
-├── launch_console.sh          # starts serve.py and waits on /api/status before opening a browser
+├── launch_console.sh          # builds .venv on first launch, starts serve.py, waits on /api/status, opens a browser
 ├── serve.py                   # Python HTTP server + API backend + the self-healing monitor
 ├── example_usage.py           # Demo script
 ├── ollama_client.py           # one prompt to the local daemon, bounded by the project's own timeout
@@ -190,7 +190,7 @@ Every node reads/writes `AgentState`:
   "research_status": "ready_for_builder" | "need_replan" |
   "no_relevant_knowledge", "blockers": str, "files_changed": list[str],
   "failed_verification": list[str], "unverified": list[str],
-  "builder_cut_off": "" | "turn_cap" | "deadline", "lint_failed": list[str],
+  "builder_cut_off": "" | "turn_cap" | "deadline" | "no_tools", "lint_failed": list[str],
   "expect_failures": bool, "discuss_only": bool, "output_dir": str,
   "step_count": int,
 }
@@ -202,8 +202,9 @@ write, not how the run ended.
 
 The Architect writes `architecture` and `verdict`; the verdict is what routes
 the loop and what ends it. `step_count` is incremented by the Architect gate,
-not by the Builder — every cycle passes the gate, but a Planner/Researcher loop
-never reaches the Builder and would otherwise run uncounted.
+not by the Builder, and by a Researcher that sends the Planner back
+(`need_replan`): that loop never reaches the gate or the Builder, and would
+otherwise run uncounted. Either way `MAX_STEPS` ends the run.
 
 ## Common Tasks
 
@@ -262,27 +263,39 @@ a Builder that runs programs. No CORS header is sent; the page is same-origin.
   commit, push, pr, merge -- whatever order the caller lists them in, and it
   will not commit onto the default branch. The default pipeline ends at
   `merge` (`--squash --delete-branch`); naming `stages` without it stops at
-  `pr`. Nothing staged is a success, and `paths` commits only what it names.
+  `pr`. Nothing staged is a success, and `paths` commits only what it names
+  (a pathspec on the commit, not just on the add). On a run given a project
+  the git tools act in `projects/<name>`, and `git_dwell` refuses unless that
+  is a repository of its own: git climbs to the checkout otherwise, where
+  `projects/` is ignored and only the operator's own work could be staged.
 - **`expect_failures`, `research_web` and `discuss_only` are per-run flags set
   by the caller, never by an agent.** A discussion run binds no tools at all
   and forces online research off.
 - **Work run under `_with_deadline` must not write to state** -- the abandoned
-  worker cannot be cancelled and may finish after the node returned. The
+  worker cannot be cancelled and may finish after the node returned. It is
+  told instead (`control.abandoned`): a streamed seat call stops at its next
+  token and lets go of `GPU_ARBITER`, since the socket timeout bounds only the
+  gap between tokens. The
   Builder's deadline never abandons a tool call. A timed-out Architect can
   never rule `approved`, and a timed-out or off-format Planner must leave a
   non-empty `plan` (`_PLANNER_TIMED_OUT`, `_PLANNER_NO_STEPS`), since the gate
   counts a step only while a plan exists.
 - **A silent Researcher is not research**: `_said_nothing` routes to the
-  Builder and names the seat's model. Every exit from `researcher_node` sets
-  `research_status`, and `_route_from_planner` forces the opening cycle through
-  the Researcher.
+  Builder and names the seat's model. Every exit from `researcher_node` but the
+  emergency stop's (which ends the run anyway) sets `research_status`, and
+  `_route_from_planner` forces the opening cycle through the Researcher.
 - **Retrieval decides whether a seat is consulted at all.** `_gather_research`
   returns the retrieved chunks without invoking the Researcher's model whenever
-  the top hit clears `relevance_floor()`, marking any passage under it; below
-  it, the seat judges the passages that came back (`_retrieval_for_the_seat`).
-  The floor is measured per corpus into the corpus's own row in the
-  database, `None` until it has been, and never borrowed
-  between embedding models. Search is hybrid: BM25 re-ranks the dense window
+  the best hit (`best_score`, the statistic the floor is measured on) clears
+  `relevance_floor()`, marking any passage under it; below it, the seat judges
+  the passages that came back (`_retrieval_for_the_seat`). The floor is
+  measured per corpus into the corpus's own row in the database -- questions
+  drawn from the corpus's own documents (a fetched page's goal, else a
+  heading) against the off-domain ones in `embedding_calibration.json` --
+  `None` until it has been, measured again once the corpus has changed
+  (`corpus_signature`), and never borrowed between embedding models. The
+  Planner's map asks for the floor before it searches. Search is hybrid:
+  BM25 re-ranks the dense window
   (`lexical.py`), ranks fused rather than scores, so every result keeps the
   cosine the floor is read off.
 - **Documents are embedded in chunks** (`CHUNK_MAX_TOKENS` 254 against a
@@ -384,13 +397,17 @@ a Builder that runs programs. No CORS header is sent; the page is same-origin.
 
 `self_healing` wraps calls rather than living inside them: `call_with_retry`
 retries what its policy calls transient, a named `Circuit` stops calling a
-service that keeps failing until one trial call after its cooldown succeeds,
+service that keeps failing until one trial call after its cooldown succeeds
+(half-open, it admits that one and refuses the rest; it keeps the books under
+its lock and never holds it across a call, so it never serializes them),
 and every action lands in the healing journal (`get_healing_logger()`), which
 the console reads and a run's snapshot carries (each run is one healing
 session). Where it is used:
 
 - **The database is one circuit, `POSTGRES`** (`corpus_store.py`), opened only
-  by a server that cannot be reached (`database_unreachable`). A store call
+  by a server that cannot be reached (`database_unreachable`: no SQLSTATE, or a
+  connection one) -- a deadlock or serialization failure is retried and never
+  counted, and a broken connection takes the idle pool with it. A store call
   is one transaction, retried briefly while unreachable -- safe, since a
   transaction the connection dropped under was rolled back -- and a rebuild
   that meets the open circuit ends as `unavailable` naming it; the monitor

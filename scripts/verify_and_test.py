@@ -211,7 +211,7 @@ def main():
     parser.add_argument(
         "--run-example",
         action="store_true",
-        help="Run a live agent run (writes files into the repository)",
+        help="Run a live agent run (writes into its own project, projects/example/)",
     )
     parser.add_argument(
         "--run-tests",

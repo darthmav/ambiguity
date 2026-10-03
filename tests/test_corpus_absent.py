@@ -413,7 +413,7 @@ def test_the_phase_opens_the_door_only_for_a_page_it_keeps(monkeypatch):
     from langgraph_agent import web_research
 
     opened = []
-    monkeypatch.setattr(web_research, "search_web", lambda goal: {
+    monkeypatch.setattr(web_research, "search_web", lambda goal, **kwargs: {
         "goal": goal, "pages": [], "queries": [goal], "source": "duckduckgo",
         "note": "", "errors": []})
     monkeypatch.setattr(web_research, "store_web_document",

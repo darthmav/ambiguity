@@ -204,25 +204,27 @@ def test_a_reindex_that_indexes_something_persists_what_it_built(pg_kb, tmp_path
     """The ordinary path must not have been broken to fix the empty one.
 
     The stand-in for `add_document` does what the real one does to the graph
-    and to the index -- adds the document, mints an entity, saves, invalidates
-    -- and only skips the embedder this suite avoids throughout. A stub that
-    merely counted would leave this test passing on the new unconditional save
-    alone, which is not the claim being made.
+    and to the index -- adds the document to the graph the rebuild is building,
+    mints an entity, invalidates -- and only skips the embedder this suite
+    avoids throughout. A stub that merely counted would leave this test passing
+    on the new unconditional save alone, which is not the claim being made.
     """
     kb = pg_kb
     root = tmp_path / "project"
     root.mkdir()
     (root / "notes.md").write_text("The Planner interprets goals.", encoding="utf-8")
 
-    def fake_add(path: str, content: str, metadata: dict[str, Any]) -> int:
+    def fake_add(
+        path: str, content: str, metadata: dict[str, Any], *, graph: nx.DiGraph | None = None
+    ) -> int:
         kb.collection.upsert(
             ids=[path], embeddings=[np.ones(EMBEDDING_DIMENSIONS)], documents=[content],
             metadatas=[{**metadata, "doc_id": path}],
         )
-        kb.graph.add_node(path, type="document", path=path)
-        kb.graph.add_node("Planner", type="entity")
-        kb.graph.add_edge(path, "Planner", relation="mentions")
-        kb._save_graph()
+        target = kb.graph if graph is None else graph
+        target.add_node(path, type="document", path=path)
+        target.add_node("Planner", type="entity")
+        target.add_edge(path, "Planner", relation="mentions")
         kb._lexical_index = None
         return 1
 
@@ -584,24 +586,58 @@ def test_connectivity_is_defined_on_an_empty_and_a_single_node_graph(kb):
     assert "fewer than 2 nodes" in single["lambda_2_unavailable"]
 
 
-def test_stats_caches_connectivity_against_the_graph_shape(kb):
+def test_stats_caches_connectivity_against_the_graph_itself(kb):
     """`stats()` is polled every five seconds; the eigendecomposition is not free."""
-    kb.graph = _bipartite_corpus(10, 20)
+    kb._publish_graph(_bipartite_corpus(10, 20))
     kb._connectivity_cache = None
 
     first = kb.stats()
     assert kb._connectivity_cache is not None
-    cached_at, _ = kb._connectivity_cache
-    assert cached_at == (kb.graph.number_of_nodes(), kb.graph.number_of_edges())
+    cached_on, _ = kb._connectivity_cache
+    assert cached_on is kb.graph
 
-    # A second call at the same shape reuses it rather than recomputing.
+    # A second call on the same graph reuses it rather than recomputing.
     marker = {"components": -1, "largest_component": -1, "isolated_nodes": -1, "lambda_2": -1.0}
-    kb._connectivity_cache = (cached_at, marker)
+    kb._connectivity_cache = (cached_on, marker)
     assert kb.stats()["components"] == -1
 
-    # Changing the graph changes the key, so the stale entry cannot survive.
-    kb.graph.add_node("fresh", type="document")
+    # A change publishes a new graph, so the stale entry cannot survive.
+    kb._place_in_graph("fresh", {"type": "document"}, set())
     assert kb.stats()["components"] == first["components"] + 1
+
+
+def test_a_change_that_keeps_both_counts_is_still_a_change(kb):
+    """The cache was keyed on (nodes, edges): a document whose one entity was
+    swapped for another kept both counts, and the old reading with them."""
+    graph = nx.DiGraph()
+    for doc, entity in (("d1.md", "Alpha"), ("d2.md", "Bravo")):
+        graph.add_node(doc, type="document")
+        graph.add_node(entity, type="entity")
+        graph.add_edge(doc, entity, relation="mentions")
+    kb._publish_graph(graph)
+    kb._connectivity_cache = None
+    before = kb.stats()
+
+    kb._place_in_graph("d1.md", {"type": "document"}, {"Bravo"})
+
+    after = kb.stats()
+    assert (after["total_nodes"], after["total_edges"]) == (
+        before["total_nodes"], before["total_edges"]
+    )
+    assert after["isolated_nodes"] == before["isolated_nodes"] + 1  # Alpha, left alone
+
+
+def test_a_published_graph_is_never_changed_under_a_reader(kb):
+    """The rebuild emptied and refilled the graph the console's threads iterate."""
+    kb._publish_graph(_bipartite_corpus(4, 8))
+    held = kb.graph
+    nodes_before = held.number_of_nodes()
+
+    kb._place_in_graph("late.md", {"type": "document"}, {"Newcomer"})
+    kb.clear()
+
+    assert held.number_of_nodes() == nodes_before
+    assert kb.graph is not held
 
 
 def test_stats_still_reports_counters_when_lambda_2_cannot_be_computed(kb, monkeypatch):

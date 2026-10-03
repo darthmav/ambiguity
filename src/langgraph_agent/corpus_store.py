@@ -43,7 +43,7 @@ from psycopg import sql
 from psycopg.pq import TransactionStatus
 from psycopg.types.json import Jsonb
 
-from langgraph_agent.self_healing import Circuit, call_with_retry
+from langgraph_agent.self_healing import Circuit, call_with_retry, exception_chain
 
 # The database install.sh runs: postgres18, pgvector's build of postgres:18,
 # published on loopback with trust authentication.
@@ -90,21 +90,39 @@ def redacted_url(url: str) -> str:
     return re.sub(r"(://[^:/@]+:)[^@]*@", r"\1***@", url)
 
 
+# SQLSTATEs a server sends when it is the connection that failed, not the
+# statement: class 08 (connection exception), the server shutting down or not
+# yet accepting (57P01-57P03), and no connection slot left (53300).
+_UNREACHABLE_SQLSTATES = ("08", "57P01", "57P02", "57P03", "53300")
+
+# A transaction the server rolled back to break a deadlock or a serialization
+# conflict: the server answering, and a second attempt can succeed.
+_ROLLED_BACK_SQLSTATES = ("40001", "40P01")
+
+
 def database_unreachable(exc: BaseException) -> bool:
     """Whether a failure means the database could not be reached at all.
 
-    A connection refused, dropped or timed out (`OperationalError`). An error
-    the server raised over a working connection -- a constraint, bad SQL -- is
-    the server answering.
+    A connection refused, dropped or timed out: an `OperationalError` with no
+    SQLSTATE (the client's own, no server said anything) or one of the
+    connection states above. `OperationalError` also covers a deadlock, a
+    statement timeout, a lock not granted and a full disk, which arrive over a
+    working connection: the server answering, like a constraint or bad SQL.
     """
-    current: BaseException | None = exc
-    seen: list[BaseException] = []
-    while current is not None and all(current is not s for s in seen):
-        seen.append(current)
-        if isinstance(current, psycopg.OperationalError):
-            return True
-        current = current.__cause__ or current.__context__
+    for cause in exception_chain(exc):
+        if isinstance(cause, psycopg.OperationalError):
+            state = cause.sqlstate
+            if state is None or state.startswith(_UNREACHABLE_SQLSTATES):
+                return True
     return False
+
+
+def transaction_rolled_back(exc: BaseException) -> bool:
+    """Whether the server rolled a transaction back to resolve a conflict with another."""
+    return any(
+        isinstance(cause, psycopg.Error) and cause.sqlstate in _ROLLED_BACK_SQLSTATES
+        for cause in exception_chain(exc)
+    )
 
 
 POSTGRES = Circuit(
@@ -130,21 +148,22 @@ def corpus_schema(persist_dir: str | Path) -> str:
 def _configure(conn: psycopg.Connection[Any]) -> None:
     """Make every pooled connection speak pgvector.
 
-    The extension is database-wide and created here once, before the type it
-    adds can be registered; a role that may not create it still works against
-    a database where someone else has.
+    The extension is database-wide, so it is created only when the type is
+    missing -- once per database, not once per connection. A role that may not
+    create it still works against a database where someone else has.
     """
-    try:
-        conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-        conn.commit()
-    except psycopg.Error:
-        conn.rollback()
     try:
         register_vector(conn)
     except psycopg.ProgrammingError:
-        # No pgvector in this database: the health check says so by name,
-        # rather than every connection failing as though it were unreachable.
         conn.rollback()
+        try:
+            conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            conn.commit()
+            register_vector(conn)
+        except psycopg.Error:
+            # No pgvector in this database: the health check says so by name,
+            # rather than every connection failing as though it were unreachable.
+            conn.rollback()
     conn.commit()
 
 
@@ -155,8 +174,10 @@ class CorpusDatabase:
     reason: a library pool answers a refused connection by retrying it in the
     background while the caller waits out its timeout, so a database that is
     down cost every call seconds before the circuit could open. Here a
-    connection is opened on demand, so a refusal raises at once; one that
-    breaks is closed rather than handed on, and the retry opens a fresh one.
+    connection is opened on demand, so a refusal raises at once. One that turns
+    out to be broken is closed, and so is every idle one with it: they share
+    the server whose restart broke it, so the retry opens a fresh connection
+    rather than taking the next stale one.
     """
 
     def __init__(self, url: str) -> None:
@@ -170,23 +191,24 @@ class CorpusDatabase:
         )
 
     def _take(self) -> psycopg.Connection[Any]:
-        """An idle connection, or a new one: through the circuit, never waiting."""
+        """An idle connection, or a new one, never waiting.
+
+        Not through the circuit itself: every caller is already inside it, and
+        a failed connect counted twice opened it at half its threshold.
+        """
         with self._idle_lock:
             while self._idle:
                 conn = self._idle.pop()
                 if not conn.closed:
                     return conn
 
-        def connect() -> psycopg.Connection[Any]:
-            conn = psycopg.connect(self.url, connect_timeout=POSTGRES_CONNECT_TIMEOUT_SECONDS)
-            try:
-                _configure(conn)
-            except BaseException:
-                conn.close()
-                raise
-            return conn
-
-        return POSTGRES.call(connect)
+        conn = psycopg.connect(self.url, connect_timeout=POSTGRES_CONNECT_TIMEOUT_SECONDS)
+        try:
+            _configure(conn)
+        except BaseException:
+            conn.close()
+            raise
+        return conn
 
     def _give_back(self, conn: psycopg.Connection[Any], broken: bool) -> None:
         """Keep a healthy, idle connection; close anything else."""
@@ -226,13 +248,16 @@ class CorpusDatabase:
             raise
         finally:
             self._give_back(conn, broken)
+            if broken:
+                self.close()
 
     def run(self, work: Callable[[psycopg.Connection[Any]], _T], *, name: str) -> _T:
         """`work(conn)` inside one transaction, committed when it returns.
 
         Inside a transaction already open on this context, `work` joins it and
-        commits with it. Otherwise it goes through the `POSTGRES` circuit, and
-        is retried briefly while the database cannot be reached.
+        commits with it. Otherwise it goes through the `POSTGRES` circuit -- one
+        count per attempt -- and is retried briefly while the database cannot
+        be reached, or when the server rolled it back to break a deadlock.
         """
         active = self._active.get()
         if active is not None:
@@ -247,7 +272,7 @@ class CorpusDatabase:
             max_attempts=POSTGRES_CONNECT_ATTEMPTS,
             min_wait=POSTGRES_RETRY_WAIT_SECONDS,
             max_wait=POSTGRES_RETRY_WAIT_SECONDS * 2,
-            retry_if=database_unreachable,
+            retry_if=lambda exc: database_unreachable(exc) or transaction_rolled_back(exc),
             name=f"postgres:{name}",
         )
 
@@ -256,13 +281,14 @@ class CorpusDatabase:
         """One transaction every store call inside the block joins.
 
         Not retried: the block is the caller's code, which may have done
-        things a second attempt would repeat.
+        things a second attempt would repeat. Through the `POSTGRES` circuit,
+        as one call.
         """
         active = self._active.get()
         if active is not None:
             yield active
             return
-        with self._transaction() as conn:
+        with POSTGRES.guarding(), self._transaction() as conn:
             yield conn
 
     def health(self) -> dict[str, str]:
@@ -336,7 +362,7 @@ class PgCorpusStore:
     """One corpus: its chunks, its entity graph and its floor, in one schema.
 
     The chunk half answers the slice of a vector-collection API the knowledge
-    base reads with -- `count`, `get`, `query`, `delete`, `upsert`, rows shaped
+    base reads with -- `count`, `get`, `query`, `upsert`, rows shaped
     `{"ids": [...], "documents": [...], ...}` -- and adds the writes only a
     database gives: replacing a document's chunks in one transaction, pruning
     by set difference, and reading every document's fingerprint in one query.
@@ -411,10 +437,10 @@ class PgCorpusStore:
         # A document's chunks are replaced, pruned and fingerprinted by doc_id.
         conn.execute(sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} (doc_id, chunk_index)").format(
             sql.Identifier("chunks_doc_id"), self._table("chunks")))
-        # `delete(where=...)` is metadata containment.
-        conn.execute(sql.SQL(
-            "CREATE INDEX IF NOT EXISTS {} ON {} USING gin (metadata jsonb_path_ops)"
-        ).format(sql.Identifier("chunks_metadata"), self._table("chunks")))
+        # Nothing queries by metadata any more; a schema built when something
+        # did loses the index every chunk write was paying for.
+        conn.execute(sql.SQL("DROP INDEX IF EXISTS {}.{}").format(
+            sql.Identifier(self.schema), sql.Identifier("chunks_metadata")))
         conn.execute(self._q(
             "CREATE TABLE IF NOT EXISTS {nodes} ("
             " id text PRIMARY KEY, attrs jsonb NOT NULL DEFAULT '{{}}'::jsonb)",
@@ -471,27 +497,23 @@ class PgCorpusStore:
     def get(
         self,
         ids: Sequence[str] | None = None,
-        where: Mapping[str, Any] | None = None,
         include: Sequence[str] | None = None,
     ) -> dict[str, Any]:
-        """Rows by id or metadata, in document order; ids always, the rest on request.
+        """Rows (every one, or by id), in document order; ids always, the rest on request.
 
         `include` names `documents`, `metadatas` and `embeddings`; left out, it
         is documents and metadatas.
         """
         wanted = set(include if include is not None else ("documents", "metadatas"))
-        clauses: list[sql.Composable] = []
         params: list[Any] = []
+        where = sql.SQL("")
         if ids is not None:
-            clauses.append(sql.SQL("id = ANY(%s)"))
+            where = sql.SQL(" WHERE id = ANY(%s)")
             params.append(list(ids))
-        if where:
-            clauses.append(sql.SQL("metadata @> %s"))
-            params.append(Jsonb(dict(where)))
         query = sql.SQL("SELECT id, content, metadata, {} FROM {}{} ORDER BY doc_id, chunk_index").format(
             sql.SQL("embedding" if "embeddings" in wanted else "NULL"),
             self._table("chunks"),
-            sql.SQL(" WHERE ") + sql.SQL(" AND ").join(clauses) if clauses else sql.SQL(""),
+            where,
         )
 
         rows = self.database.run(lambda conn: conn.execute(query, params).fetchall(), name="get")
@@ -529,25 +551,6 @@ class PgCorpusStore:
             "metadatas": [[r[2] for r in rows] for rows in answers],
             "distances": [[float(r[3]) for r in rows] for rows in answers],
         }
-
-    def delete(
-        self, ids: Sequence[str] | None = None, where: Mapping[str, Any] | None = None
-    ) -> int:
-        """Delete rows by id and/or metadata containment; how many went."""
-        def remove(conn: psycopg.Connection[Any]) -> int:
-            removed = 0
-            if ids:
-                removed += conn.execute(
-                    self._q("DELETE FROM {chunks} WHERE id = ANY(%s)", chunks="chunks"), (list(ids),)
-                ).rowcount
-            if where:
-                removed += conn.execute(
-                    self._q("DELETE FROM {chunks} WHERE metadata @> %s", chunks="chunks"),
-                    (Jsonb(dict(where)),),
-                ).rowcount
-            return removed
-
-        return self.database.run(remove, name="delete")
 
     def upsert(
         self,
@@ -621,6 +624,17 @@ class PgCorpusStore:
             return sorted({str(r[0]) for r in rows})
 
         return self.database.run(prune, name="prune_documents")
+
+    def prune_and_fingerprint(self, keep: Collection[str]) -> tuple[list[str], dict[str, str]]:
+        """`prune_documents(keep)`, then `fingerprints()` of what survived, in one transaction.
+
+        A store call like any other -- retried while the database cannot be
+        reached -- since doing it twice changes nothing a first time did not.
+        """
+        return self.database.run(
+            lambda conn: (self.prune_documents(keep), self.fingerprints()),
+            name="prune_and_fingerprint",
+        )
 
     def fingerprints(self) -> dict[str, str]:
         """Each stored document's content fingerprint, from its first chunk.

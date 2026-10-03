@@ -29,6 +29,32 @@ PROJECTS_DIR = "projects"
 # Which projects the operator has opted into the corpus: a JSON list of names.
 EMBEDDED_PROJECTS_FILE = f"{PROJECTS_DIR}/embedded.json"
 
+# Names a project cannot take: the record above and the temporary file it is
+# written through sit beside the project directories, and a project named after
+# either would collide with it. Compared case-blind, as some filesystems are.
+_RESERVED_NAMES = frozenset({
+    PurePosixPath(EMBEDDED_PROJECTS_FILE).name,
+    f"{PurePosixPath(EMBEDDED_PROJECTS_FILE).name}.tmp",
+})
+
+# Directories the walk never enters, wherever they sit under a corpus root:
+# version control, virtualenvs, tool caches and build output -- what a generated
+# project accumulates without anyone writing it. Matched against whole directory
+# names (plus the `.egg-info` suffix), never as substrings, so `rebuild/` is not
+# `build/` and a project's own `src/` and `tests/` are indexed like any others.
+# Here rather than beside the walk in `graphrag_server`, which imports this
+# module, so a project's file count skips what the walk skips.
+CORPUS_SKIP_DIRS = frozenset({
+    "__pycache__", ".git", ".venv", "venv", "node_modules",
+    ".pytest_cache", ".mypy_cache", "build", "dist",
+})
+
+
+def skipped_dir(name: str) -> bool:
+    """Whether the walk prunes a directory of this name."""
+    return name in CORPUS_SKIP_DIRS or name.endswith(".egg-info")
+
+
 # A project name is one path component a person would type: no separators, no
 # leading dot (a hidden directory the console would never list), no `..`.
 _PROJECT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -36,6 +62,8 @@ _PROJECT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 def project_name_error(name: Any) -> str | None:
     """Why `name` cannot name a project, or None when it can."""
+    if isinstance(name, str) and name.lower() in _RESERVED_NAMES:
+        return f"{name!r} is reserved: the record of embedded projects sits under that name."
     if not isinstance(name, str) or not _PROJECT_NAME.match(name) or ".." in name:
         return (
             f"{name!r} is not a project name: use letters, digits, '.', '_' or "
@@ -108,9 +136,12 @@ def list_projects(root: str | Path = ".") -> list[dict[str, Any]]:
     for entry in sorted(base.iterdir()):
         if not entry.is_dir() or project_name_error(entry.name) is not None:
             continue
-        files = sum(
-            1 for p in entry.rglob("*") if p.is_file() and "__pycache__" not in p.parts
-        )
+        # Pruned as the walk prunes: a project's own .venv or node_modules is
+        # tens of thousands of files the corpus will never read.
+        files = 0
+        for _, subdirs, names in os.walk(entry):
+            subdirs[:] = [name for name in subdirs if not skipped_dir(name)]
+            files += len(names)
         projects.append({
             "name": entry.name,
             "path": project_dir(entry.name),

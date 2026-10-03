@@ -376,11 +376,16 @@ def _query_label(query: str) -> str:
     return f"{query[:_QUERY_LABEL_CHARS].rstrip()!r}... ({len(query)} chars)"
 
 
-def _rank_urls(client: httpx.Client, queries: list[str]) -> tuple[list[str], dict[str, str], list[str]]:
+def _rank_urls(
+    client: httpx.Client,
+    queries: list[str],
+    should_stop: Callable[[], bool] | None = None,
+) -> tuple[list[str], dict[str, str], list[str]]:
     """Search every derived query and fuse the orderings into one.
 
     Returns `(urls, titles, errors)`: a failed query is an error in the list, not
-    an exception, so no single search decides the phase.
+    an exception, so no single search decides the phase. `should_stop` is asked
+    before each query and through every retry wait.
     """
     rankings: list[list[str]] = []
     titles: dict[str, str] = {}
@@ -390,6 +395,8 @@ def _rank_urls(client: httpx.Client, queries: list[str]) -> tuple[list[str], dic
     circuit = _search_circuit(name)
 
     for position, query in enumerate(queries):
+        if should_stop is not None and should_stop():
+            break
         label = _query_label(query)
         unsent = len(queries) - position - 1
         skipped = f" The other {unsent} search(es) were not sent." if unsent else ""
@@ -404,6 +411,7 @@ def _rank_urls(client: httpx.Client, queries: list[str]) -> tuple[list[str], dic
                 min_wait=WEB_RETRY_WAIT_SECONDS,
                 max_wait=WEB_RETRY_WAIT_SECONDS,
                 retry_if=_quick_transient,
+                give_up=should_stop,
                 name=f"web-search:{name}",
             )
         except _SearchBlocked as exc:
@@ -435,8 +443,15 @@ def _rank_urls(client: httpx.Client, queries: list[str]) -> tuple[list[str], dic
     return reciprocal_rank_fusion(*rankings), titles, errors
 
 
-def _fetch_and_extract(url: str, client: httpx.Client, deadline: float) -> dict[str, Any]:
+def _fetch_and_extract(
+    url: str,
+    client: httpx.Client,
+    deadline: float,
+    should_stop: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
     """Fetch one page and read it. Returns a result dict, never raises."""
+    if should_stop is not None and should_stop():
+        return {"url": url, "error": "skipped: the run was stopped"}
     remaining = deadline - time.monotonic()
     if remaining <= 1.0:
         return {"url": url, "error": "skipped: the research budget ran out first"}
@@ -458,7 +473,8 @@ def _fetch_and_extract(url: str, client: httpx.Client, deadline: float) -> dict[
             min_wait=WEB_RETRY_WAIT_SECONDS,
             max_wait=WEB_RETRY_WAIT_SECONDS,
             retry_if=_quick_transient,
-            give_up=lambda: deadline - time.monotonic() <= 1.0,
+            give_up=lambda: deadline - time.monotonic() <= 1.0
+            or (should_stop is not None and should_stop()),
             name="web-fetch",
         )
         # A PDF or an image would extract as whatever its bytes decode to,
@@ -469,7 +485,10 @@ def _fetch_and_extract(url: str, client: httpx.Client, deadline: float) -> dict[
         page = extract(response.text)
     except httpx.HTTPStatusError as exc:
         return {"url": url, "error": f"HTTP {exc.response.status_code}"}
-    except httpx.HTTPError as exc:
+    except Exception as exc:
+        # Not only httpx's own errors: a malformed URL raises `InvalidURL`, an
+        # Exception of its own, and a page the reader chokes on raises what it
+        # raises. Any of them escaping would take every other fetch with it.
         return {"url": url, "error": f"{type(exc).__name__}: {exc}"}
 
     return {
@@ -558,15 +577,21 @@ def _fit_to_index_limit(document: str, url: str) -> str:
     return document[: MAX_INDEXABLE_BYTES - len(note)].rstrip() + note
 
 
-def search_web(goal: str, fetch_limit: int | None = None) -> dict[str, Any]:
+def search_web(
+    goal: str,
+    fetch_limit: int | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
     """Search, fetch and read: everything before deciding what to keep.
 
     Never raises for a network failure. "The web said nothing", "we never asked"
     and "we asked and it broke" are distinct `source` values, each with a `note`.
+    `should_stop` is asked before each query and each fetch, and through their
+    retry waits; `stopped` says it ended the phase early.
 
     Returns:
-        `{"goal", "queries", "pages", "source", "note", "errors"}`, `source` one of
-        `duckduckgo`, `searxng`, `disabled` or `error`.
+        `{"goal", "queries", "pages", "source", "note", "errors", "stopped"}`,
+        `source` one of `duckduckgo`, `searxng`, `disabled` or `error`.
     """
     if not WEB_SEARCH_ENABLED:
         return {
@@ -576,15 +601,19 @@ def search_web(goal: str, fetch_limit: int | None = None) -> dict[str, Any]:
             "source": "disabled",
             "note": WEB_SEARCH_DISABLED_NOTE,
             "errors": [],
+            "stopped": False,
         }
 
     backend = "searxng" if SEARXNG_URL else "duckduckgo"
     deadline = time.monotonic() + WEB_RESEARCH_BUDGET_SECONDS
     queries = expand_queries(goal)
 
+    def stopped() -> bool:
+        return should_stop is not None and should_stop()
+
     with httpx.Client() as client:
-        urls, titles, errors = _rank_urls(client, queries)
-        if not urls:
+        urls, titles, errors = _rank_urls(client, queries, should_stop)
+        if not urls or stopped():
             note = (
                 "No derived search succeeded; nothing was researched online. "
                 + "; ".join(errors)
@@ -595,16 +624,19 @@ def search_web(goal: str, fetch_limit: int | None = None) -> dict[str, Any]:
                 "goal": goal,
                 "queries": queries,
                 "pages": [],
-                "source": "error" if errors else backend,
-                "note": note,
+                "source": "error" if errors and not urls else backend,
+                "note": "Stopped before anything was fetched." if stopped() else note,
                 "errors": errors,
+                "stopped": stopped(),
             }
 
         wanted = urls[: max(1, fetch_limit or WEB_FETCH_LIMIT)]
         # Fetching is the phase's latency, all of it waiting on sockets; the
         # pool is joined, never abandoned.
         with ThreadPoolExecutor(max_workers=max(1, WEB_FETCH_WORKERS)) as pool:
-            fetched = list(pool.map(lambda url: _fetch_and_extract(url, client, deadline), wanted))
+            fetched = list(pool.map(
+                lambda url: _fetch_and_extract(url, client, deadline, should_stop), wanted
+            ))
 
     pages = []
     for page in fetched:
@@ -624,6 +656,7 @@ def search_web(goal: str, fetch_limit: int | None = None) -> dict[str, Any]:
         "source": backend,
         "note": None if pages else "No page fetched for this goal had readable text.",
         "errors": errors,
+        "stopped": stopped(),
     }
 
 
@@ -690,12 +723,17 @@ def research_online(
     for one batch rather than for every page left; `stopped` says it happened.
     """
     started = time.monotonic()
-    answer = search_web(goal)
-    selected = select_pages(goal, answer["pages"], keep or WEB_SEARCH_MAX_RESULTS)
+    answer = search_web(goal, should_stop=should_stop)
+    # A phase stopped while searching keeps nothing it fetched: the operator
+    # asked for it to end, not for what it had so far.
+    selected = (
+        [] if answer.get("stopped")
+        else select_pages(goal, answer["pages"], keep or WEB_SEARCH_MAX_RESULTS)
+    )
 
     stored: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
-    stopped = False
+    stopped = bool(answer.get("stopped"))
     kb: GraphRAGKnowledgeBase | None = None
     try:
         for page in selected:

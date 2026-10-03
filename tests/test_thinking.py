@@ -38,7 +38,7 @@ def _fresh_seats(monkeypatch):
     monkeypatch.setattr(config, "_seat_failures", {})
     monkeypatch.setattr(config, "_ollama_caps_cache", {})
     monkeypatch.setattr(
-        config, "list_ollama_models", lambda: ["thinks:cloud", "plain:latest"]
+        config, "ollama_daemon_tags", lambda: ["thinks:cloud", "plain:latest"]
     )
 
 

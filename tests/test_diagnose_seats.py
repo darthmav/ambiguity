@@ -7,6 +7,7 @@ thing it must never do is report a failing seat as a working one.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -204,3 +205,27 @@ def test_an_unprobed_role_is_not_reported_as_a_failed_one(diag):
     assert best == {}
     assert any("Phase 1 did not run" in note for note in notes)
     assert not any("No model passed" in note for note in notes)
+
+
+def test_the_socket_timeout_flag_reaches_the_seats(monkeypatch, capsys):
+    """`os.environ.setdefault("LLM_TIMEOUT_SECONDS", ...)` ran after `config`
+    had already been imported at the top of the script, so it changed nothing:
+    seat calls kept the console's socket timeout whatever the flag said."""
+    import logging
+
+    from langgraph_agent import config, nodes
+
+    for name in ("NODE_DEADLINE_SECONDS", "BUILDER_DEADLINE_SECONDS",
+                 "VERIFY_RESERVE_SECONDS", "TQDM_DISABLE"):
+        monkeypatch.setenv(name, os.environ.get(name, "unset"))
+    monkeypatch.setattr(config, "LLM_TIMEOUT_SECONDS", config.LLM_TIMEOUT_SECONDS)
+    monkeypatch.setattr(nodes, "MAX_BUILDER_TOOL_TURNS", nodes.MAX_BUILDER_TOOL_TURNS)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    root = logging.getLogger()
+    monkeypatch.setattr(root, "level", root.level)
+    diag = _load_diag()
+
+    assert diag.main(["--phase", "probe", "--dry-run", "--llm-timeout", "200"]) == 0
+
+    assert config.LLM_TIMEOUT_SECONDS == 200
+    assert "socket 200s" in capsys.readouterr().out

@@ -67,8 +67,9 @@ class AgentState(TypedDict):
             whatever expect_failures says: that opt-out is for a file meant to
             fail, not for a gap in the evidence.
         builder_cut_off: Why the Builder's last pass ended before it finished
-            -- "turn_cap" or "deadline" -- or empty when it finished. While it
-            is set the Architect cannot approve.
+            -- "turn_cap" or "deadline" -- or could not start: "no_tools", a
+            model refused its tools on a run that needed them. Empty when it
+            finished. While it is set the Architect cannot approve.
         lint_failed: Python files the Builder wrote or carried that still fail
             `ruff check` after the fixes it is allowed to make. Re-linted every
             pass until clean, and blocking approval whatever expect_failures
@@ -94,7 +95,7 @@ class AgentState(TypedDict):
     files_changed: list[str]
     failed_verification: list[str]
     unverified: list[str]
-    builder_cut_off: str  # "" | "turn_cap" | "deadline"
+    builder_cut_off: str  # "" | "turn_cap" | "deadline" | "no_tools"
     lint_failed: list[str]
     discuss_only: bool
     output_dir: str  # "" | "projects/<name>"

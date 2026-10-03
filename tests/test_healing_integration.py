@@ -15,11 +15,13 @@ from typing import Any
 
 import httpx
 import networkx as nx
+import psycopg
+import psycopg.errors
 import pytest
 from store_doubles import StoreDoubleMixin
 
 import serve
-from langgraph_agent import config, web_research
+from langgraph_agent import config, corpus_store, web_research
 from langgraph_agent import graphrag_server as gs
 from langgraph_agent.control import RUN_CONTROL
 from langgraph_agent.mcp_client import MCPClient
@@ -102,6 +104,82 @@ def test_only_an_outage_counts_against_a_cloud_provider(exc, down):
     assert config.provider_unavailable(exc) is down
 
 
+@pytest.mark.parametrize(
+    ("exc", "unreachable"),
+    [
+        (psycopg.OperationalError("connection refused"), True),  # no server said anything
+        (psycopg.errors.ConnectionFailure(), True),
+        (psycopg.errors.AdminShutdown(), True),
+        (psycopg.errors.TooManyConnections(), True),
+        # OperationalError too, but the server answering over a working connection
+        (psycopg.errors.DeadlockDetected(), False),
+        (psycopg.errors.SerializationFailure(), False),
+        (psycopg.errors.QueryCanceled(), False),
+        (psycopg.errors.LockNotAvailable(), False),
+        (psycopg.errors.DiskFull(), False),
+        (psycopg.errors.InvalidPassword(), False),
+        (psycopg.errors.UniqueViolation(), False),
+    ],
+)
+def test_only_a_connection_failure_counts_as_the_database_unreachable(exc, unreachable):
+    """Every OperationalError used to: a deadlock between two consoles opened the circuit."""
+    assert corpus_store.database_unreachable(exc) is unreachable
+    wrapped = RuntimeError("store call failed")
+    wrapped.__cause__ = exc
+    assert corpus_store.database_unreachable(wrapped) is unreachable
+
+
+def test_a_deadlock_is_worth_another_attempt():
+    assert corpus_store.transaction_rolled_back(psycopg.errors.DeadlockDetected())
+    assert corpus_store.transaction_rolled_back(psycopg.errors.SerializationFailure())
+    assert not corpus_store.transaction_rolled_back(psycopg.errors.UniqueViolation())
+
+
+def test_an_unreachable_database_counts_once_per_attempt(monkeypatch):
+    """The connect was counted inside the attempt and again around it, so the
+    circuit opened at its second failed attempt and refused the third."""
+    monkeypatch.setattr(corpus_store, "POSTGRES_CONNECT_ATTEMPTS", 3)
+    monkeypatch.setattr(corpus_store, "POSTGRES_RETRY_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(corpus_store, "POSTGRES_CONNECT_TIMEOUT_SECONDS", 1)
+    database = corpus_store.CorpusDatabase("postgresql://postgres@127.0.0.1:1/nothing")
+
+    with pytest.raises(psycopg.OperationalError):
+        database.run(lambda conn: None, name="probe")
+
+    assert _circuit("postgres")["failures"] == corpus_store.POSTGRES_CIRCUIT_THRESHOLD
+    assert _circuit("postgres")["state"] == "open"
+
+
+def test_the_extension_is_created_only_when_its_type_is_missing(monkeypatch):
+    """It was created, and committed, on every connection the console opened."""
+    executed: list[str] = []
+    registered: list[int] = []
+
+    class Connection:
+        def execute(self, query: str, *args: Any) -> None:
+            executed.append(query)
+
+        def commit(self) -> None:
+            pass
+
+        def rollback(self) -> None:
+            pass
+
+    monkeypatch.setattr(corpus_store, "register_vector", lambda conn: registered.append(1))
+    corpus_store._configure(Connection())  # type: ignore[arg-type]
+    assert (executed, registered) == ([], [1])
+
+    def missing_then_there(conn: Any) -> None:
+        registered.append(1)
+        if len(registered) == 2:
+            raise psycopg.ProgrammingError("vector type not found in the database")
+
+    monkeypatch.setattr(corpus_store, "register_vector", missing_then_there)
+    corpus_store._configure(Connection())  # type: ignore[arg-type]
+    assert executed == ["CREATE EXTENSION IF NOT EXISTS vector"]
+    assert len(registered) == 3
+
+
 # ---------------------------------------------------------------------------
 # The daemon's circuit
 # ---------------------------------------------------------------------------
@@ -123,6 +201,24 @@ def test_a_dead_daemon_opens_its_circuit_and_is_then_not_asked(monkeypatch):
 
     assert config.list_ollama_models() == []
     assert len(calls) == config.OLLAMA_CIRCUIT_THRESHOLD, "an open circuit still asked"
+
+
+def test_a_daemon_with_nothing_pulled_is_not_called_unreachable(monkeypatch):
+    """Both used to be an empty list, so every seat on a fresh daemon read
+    OFFLINE "daemon unreachable" and sent the operator after the wrong thing."""
+    monkeypatch.setattr(config, "_seat_failures", {})
+    monkeypatch.setattr(config, "_ollama_tags_cache", (0.0, None))
+    monkeypatch.setattr(config, "daemon_request", lambda path, payload=None, *, timeout: {})
+
+    assert config.get_agent_status("planner")["badge"] == "NOT PULLED"
+
+    monkeypatch.setattr(config, "_ollama_tags_cache", (0.0, None))
+
+    def refused(path: str, payload: Any = None, *, timeout: float) -> Any:
+        raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+    monkeypatch.setattr(config, "daemon_request", refused)
+    assert config.get_agent_status("planner")["badge"] == "OFFLINE"
 
 
 def test_a_daemon_answering_with_an_error_is_up(monkeypatch):
@@ -256,7 +352,9 @@ class _IndexingKB:
         self._lexical_index = None
         self.added: list[str] = []
 
-    def add_document(self, doc_id: str, content: str, metadata: dict[str, Any]) -> int:
+    def add_document(
+        self, doc_id: str, content: str, metadata: dict[str, Any], **kwargs: Any
+    ) -> int:
         self.added.append(doc_id)
         if len(self.added) > 1:
             raise CircuitOpenError("ollama-daemon", 12)
@@ -264,6 +362,9 @@ class _IndexingKB:
 
     def _save_graph(self) -> None:
         pass
+
+    def _publish_graph(self, graph: nx.DiGraph) -> None:
+        self.graph = graph
 
     def stats(self) -> dict[str, Any]:
         return {}
@@ -281,6 +382,43 @@ def test_a_rebuild_stops_when_the_embedder_cannot_be_reached(tmp_path):
     assert len(kb.added) == 2, "the third document was tried against an open circuit"
     assert report["indexed"] == 1
     assert "ollama-daemon is unavailable" in report["unavailable"]
+
+
+class _PruneFailsStore(_EmptyStore):
+    def __init__(self, failure: Exception) -> None:
+        self.failure = failure
+
+    def prune_and_fingerprint(self, keep: Any) -> Any:
+        raise self.failure
+
+
+def test_a_rebuild_that_cannot_reach_the_store_embeds_nothing(tmp_path):
+    """A failed prune left the rebuild believing the store held nothing, so it
+    re-embedded the whole archive -- on the GPU, evicting the seat -- for
+    transactions that then failed."""
+    uploads = tmp_path / gs.UPLOADS_DIR
+    uploads.mkdir()
+    (uploads / "a.md").write_text("a.md text", encoding="utf-8")
+    kb = _IndexingKB()
+    kb.collection = _PruneFailsStore(psycopg.OperationalError("server closed the connection"))
+
+    report = gs.index_corpus_files(kb, str(tmp_path))  # type: ignore[arg-type]
+
+    assert kb.added == []
+    assert report["unavailable_circuit"] == "postgres"
+    assert "server closed the connection" in report["unavailable"]
+
+
+def test_a_rebuild_that_cannot_read_the_store_for_another_reason_raises(tmp_path):
+    uploads = tmp_path / gs.UPLOADS_DIR
+    uploads.mkdir()
+    (uploads / "a.md").write_text("a.md text", encoding="utf-8")
+    kb = _IndexingKB()
+    kb.collection = _PruneFailsStore(psycopg.errors.UndefinedTable("relation does not exist"))
+
+    with pytest.raises(psycopg.errors.UndefinedTable):
+        gs.index_corpus_files(kb, str(tmp_path))  # type: ignore[arg-type]
+    assert kb.added == []
 
 
 def test_an_unavailable_rebuild_is_its_own_outcome(monkeypatch):
@@ -301,10 +439,69 @@ def test_an_unavailable_rebuild_is_its_own_outcome(monkeypatch):
     assert serve._last_rebuild["source"] == "unavailable"
 
 
+def test_a_startup_rebuild_that_meets_a_dead_database_is_redone(monkeypatch):
+    """It returned `error` before recording anything, so the monitor -- which
+    redoes a rebuild recorded `unavailable` -- never heard of it."""
+    monkeypatch.setattr(serve, "iter_corpus_files", lambda: ["uploads/a.md"])
+    monkeypatch.setattr(serve, "corpus_state", lambda: ("indexed", gs.EMBEDDING_MODEL_NAME))
+    monkeypatch.setattr(serve, "_last_rebuild", {})
+
+    def no_database() -> Any:
+        raise psycopg.OperationalError("connection refused")
+
+    monkeypatch.setattr(serve, "_kb_for_indexing", no_database)
+
+    report = serve._rebuild_the_corpus(announce=lambda n: None, progress=lambda d, t: None,
+                                       should_stop=lambda: False)
+
+    assert report["source"] == "unavailable"
+    assert serve._last_rebuild["unavailable_circuit"] == "postgres"
+    corpus = serve._check_health()["corpus"]
+    assert corpus["status"] == "unhealthy" and "database" in corpus["details"]
+
+
+def test_a_rebuild_that_fails_otherwise_is_still_recorded(monkeypatch):
+    monkeypatch.setattr(serve, "iter_corpus_files", lambda: ["uploads/a.md"])
+    monkeypatch.setattr(serve, "corpus_state", lambda: ("indexed", gs.EMBEDDING_MODEL_NAME))
+    monkeypatch.setattr(serve, "_last_rebuild", {})
+
+    def broken() -> Any:
+        raise ValueError("a bug")
+
+    monkeypatch.setattr(serve, "_kb_for_indexing", broken)
+
+    report = serve._rebuild_the_corpus(announce=lambda n: None, progress=lambda d, t: None,
+                                       should_stop=lambda: False)
+
+    assert report == {"source": "error", "corpus": "indexed", "note": "a bug"}
+    assert serve._last_rebuild == report
+
+
+def test_a_corpus_whose_database_is_down_reads_unavailable_not_empty(monkeypatch):
+    class _DownStore(_EmptyStore):
+        def count(self) -> int:
+            raise psycopg.OperationalError("connection refused")
+
+    kb = gs.GraphRAGKnowledgeBase.__new__(gs.GraphRAGKnowledgeBase)
+    kb.collection = _DownStore()
+    kb.graph = nx.DiGraph()
+    kb.graph.add_node("uploads/a.md", type="document")
+    monkeypatch.setattr(serve, "kb", kb)
+
+    stats = serve.rpc_rag_stats({})
+
+    assert stats["corpus"] == "unavailable"
+    assert "connection refused" in stats["note"]
+    assert stats["total_documents"] == 1
+    assert stats["staleness"]["stale"] is False
+
+
 class _UnloadableKB(_IndexingKB):
     """The model's load fails its whole schedule on the first document."""
 
-    def add_document(self, doc_id: str, content: str, metadata: dict[str, Any]) -> int:
+    def add_document(
+        self, doc_id: str, content: str, metadata: dict[str, Any], **kwargs: Any
+    ) -> int:
         self.added.append(doc_id)
         raise gs.EmbedderLoadFailed(
             "Ollama could not embed with the model (after 5 attempts): cudaMalloc failed: "
@@ -432,7 +629,9 @@ def test_a_page_that_hiccups_is_fetched_again(monkeypatch, no_waits):
 
 
 def _vcs(outcomes: list[tuple[bool, str]], calls: list[tuple[str, ...]]):
-    def run(self: MCPClient, *argv: str, timeout: float = 60.0) -> tuple[bool, str]:
+    def run(
+        self: MCPClient, *argv: str, timeout: float = 60.0, cwd: str | None = None
+    ) -> tuple[bool, str]:
         calls.append(argv)
         if argv[:2] == ("git", "push"):
             return outcomes.pop(0)

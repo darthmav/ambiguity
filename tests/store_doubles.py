@@ -80,6 +80,9 @@ class StoreDoubleMixin:
             self.delete(ids=doomed)
         return sorted(documents)
 
+    def prune_and_fingerprint(self, keep: Collection[str]) -> tuple[list[str], dict[str, str]]:
+        return self.prune_documents(keep), self.fingerprints()
+
     def fingerprints(self) -> dict[str, str]:
         stored = self.get(include=["metadatas"])
         metadatas = stored.get("metadatas") or [None] * len(stored["ids"])

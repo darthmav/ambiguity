@@ -11,6 +11,7 @@ Verifies:
 
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -384,7 +385,6 @@ def test_builder_offers_only_its_own_tools(monkeypatch, tmp_path):
 
 def test_builder_does_not_credit_unwritten_files(monkeypatch):
     """A seat that cannot call tools reports, but claims no file changes."""
-    from langgraph_agent.config import StubLLM
     from langgraph_agent.nodes import builder_node
 
     monkeypatch.setattr(
@@ -408,7 +408,7 @@ def test_moving_a_seat_clears_its_recorded_failure(monkeypatch):
     """
     from langgraph_agent import config
 
-    monkeypatch.setattr(config, "list_ollama_models", lambda: ["kimi-k3:cloud"])
+    monkeypatch.setattr(config, "ollama_daemon_tags", lambda: ["kimi-k3:cloud"])
 
     config.set_agent_llm("architect", "anthropic", "claude-opus-5")
     config._seat_failures["architect"] = "Anthropic credit balance too low"
@@ -738,6 +738,55 @@ def test_an_unknown_cut_off_still_blocks(monkeypatch):
 
     assert result["verdict"] == Verdict.REVISE.value
     assert "something_new" in result["messages"][-1]
+
+
+class _NoToolsLLM:
+    """A real model the daemon says cannot call tools: it can only describe work."""
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> Any:
+        raise AttributeError("bind_tools: dolphin:latest cannot call tools")
+
+    def invoke(self, messages: Any) -> Any:
+        from langchain_core.messages import AIMessage
+
+        return AIMessage(content="## Changes Made\nWrote main.py.\n\n## Files Modified\n- main.py")
+
+
+def test_a_builder_whose_model_cannot_call_tools_blocks_approval(monkeypatch, tmp_path):
+    """It wrote nothing, set no blocker, and said "Implementation complete",
+    which the Architect was then free to approve."""
+    monkeypatch.chdir(tmp_path)
+    from langgraph_agent.nodes import builder_node
+
+    monkeypatch.setattr(
+        "langgraph_agent.nodes.get_agent_llm", lambda agent, temperature=0.1: _NoToolsLLM()
+    )
+
+    result = builder_node(initial_state("Write a module"))
+
+    assert result["builder_cut_off"] == "no_tools"
+    assert "dolphin:latest cannot call tools" in result["blockers"]
+    assert "Implementation complete" not in result["messages"][-1]
+    assert "Could not act" in result["messages"][-1]
+    assert result["files_changed"] == []
+
+    gated = _gate_with(monkeypatch, builder_cut_off=result["builder_cut_off"])
+    assert gated["verdict"] == Verdict.REVISE.value
+    assert "cannot call tools" in gated["messages"][-1]
+
+
+def test_a_stubbed_builder_is_not_a_model_without_tools(monkeypatch, tmp_path):
+    """A keyless seat answers in canned text by design; that is not a fault."""
+    monkeypatch.chdir(tmp_path)
+    from langgraph_agent.nodes import builder_node
+
+    monkeypatch.setattr(
+        "langgraph_agent.nodes.get_agent_llm", lambda agent, temperature=0.1: StubLLM()
+    )
+
+    result = builder_node(initial_state("Write a module"))
+
+    assert result["builder_cut_off"] == ""
 
 
 class _WritesNothingLLM:
@@ -1728,7 +1777,7 @@ def _builder_with_unverified_file(monkeypatch, tmp_path, **state_overrides):
     monkeypatch.setattr(
         nodes,
         "_verify_written_files",
-        lambda paths, log, deadline=None: [
+        lambda paths, log, deadline=None, cwd="": [
             (str(target), "unverified", nodes.VERIFY_DEADLINE_SKIP_REASON)
         ],
     )
@@ -2045,6 +2094,56 @@ def test_an_off_format_planner_run_still_terminates(monkeypatch):
 
     assert result["step_count"] >= 1           # the loop was counted at all
     assert result["step_count"] <= graph_module.MAX_STEPS
+
+
+def test_a_replan_counts_a_step_and_the_ceiling_ends_the_loop():
+    """Planner and Researcher could alternate forever: the loop never passed
+    the gate that counts steps, so MAX_STEPS never applied to it."""
+    from langgraph_agent import graph as graph_module
+
+    below = {"research_status": "need_replan", "step_count": graph_module.MAX_STEPS - 1}
+    at = {"research_status": "need_replan", "step_count": graph_module.MAX_STEPS}
+    assert graph_module._route_from_researcher(below) == "planner"  # type: ignore[arg-type]
+    assert graph_module._route_from_researcher(at) == "__end__"  # type: ignore[arg-type]
+    assert graph_module._route_from_researcher(  # type: ignore[arg-type]
+        {"research_status": "ready_for_builder", "step_count": graph_module.MAX_STEPS}
+    ) == "builder"
+
+
+def test_the_researcher_counts_the_replan_it_asks_for(monkeypatch):
+    from langgraph_agent import nodes
+
+    monkeypatch.setattr(nodes, "_gather_research", lambda state: ("findings", "need_replan"))
+    state = initial_state("g")
+    state["step_count"] = 2
+
+    result = nodes.researcher_node(state)
+
+    assert result["next_agent"] == "Planner"
+    assert result["step_count"] == 3
+
+
+def test_a_researcher_that_always_wants_a_replan_still_terminates(monkeypatch):
+    """End to end: the run ends at the step ceiling, not the recursion limit."""
+    from langgraph_agent import graph as graph_module
+    from langgraph_agent import nodes
+
+    monkeypatch.setattr(
+        nodes, "_gather_research",
+        lambda state: ("## Key Findings\n- unclear\n\n## Status\nneed_replan", "need_replan"),
+    )
+    monkeypatch.setattr(
+        nodes, "_make_plan", lambda state: {"plan": "1. Look again", "next_agent": "Researcher"}
+    )
+
+    result = create_agent_graph().invoke(
+        initial_state("Do the thing"),
+        {"recursion_limit": graph_module.RECURSION_LIMIT},
+    )
+
+    assert result["step_count"] == graph_module.MAX_STEPS
+    assert result["verdict"] != Verdict.APPROVED.value
+    assert result["builder_report"] == ""
 
 
 def test_a_stalling_architect_run_still_terminates(monkeypatch):
