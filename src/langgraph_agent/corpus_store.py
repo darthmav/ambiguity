@@ -151,18 +151,29 @@ def _configure(conn: psycopg.Connection[Any]) -> None:
     The extension is database-wide, so it is created only when the type is
     missing -- once per database, not once per connection. A role that may not
     create it still works against a database where someone else has.
+
+    Creation is serialized by an advisory lock: `IF NOT EXISTS` is no guard
+    against a concurrent creator, and on a fresh database the startup rebuild
+    and the monitor's first health check connect in the same second -- the
+    loser failed on pg_extension's unique index and went into the pool with no
+    vector type registered.
     """
     try:
         register_vector(conn)
     except psycopg.ProgrammingError:
         conn.rollback()
         try:
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext('create-extension:vector'))")
             conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
             conn.commit()
-            register_vector(conn)
         except psycopg.Error:
-            # No pgvector in this database: the health check says so by name,
-            # rather than every connection failing as though it were unreachable.
+            # No pgvector in this database, or a role that may not create it:
+            # the health check says so by name, rather than every connection
+            # failing as though it were unreachable.
+            conn.rollback()
+        try:
+            register_vector(conn)
+        except psycopg.ProgrammingError:
             conn.rollback()
     conn.commit()
 

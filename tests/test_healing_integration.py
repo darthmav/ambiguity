@@ -176,8 +176,38 @@ def test_the_extension_is_created_only_when_its_type_is_missing(monkeypatch):
 
     monkeypatch.setattr(corpus_store, "register_vector", missing_then_there)
     corpus_store._configure(Connection())  # type: ignore[arg-type]
-    assert executed == ["CREATE EXTENSION IF NOT EXISTS vector"]
+    assert executed == [
+        "SELECT pg_advisory_xact_lock(hashtext('create-extension:vector'))",
+        "CREATE EXTENSION IF NOT EXISTS vector",
+    ]
     assert len(registered) == 3
+
+
+def test_a_connection_that_lost_the_creation_race_still_speaks_pgvector(monkeypatch):
+    """Two connections on a fresh database both found the type missing; the
+    loser's CREATE failed on pg_extension's unique index, and it was pooled
+    without the vector type registered."""
+    registered: list[int] = []
+
+    class Connection:
+        def execute(self, query: str, *args: Any) -> None:
+            if query.startswith("CREATE EXTENSION"):
+                raise psycopg.errors.UniqueViolation("Key (extname)=(vector) already exists.")
+
+        def commit(self) -> None:
+            pass
+
+        def rollback(self) -> None:
+            pass
+
+    def missing_then_there(conn: Any) -> None:
+        registered.append(1)
+        if len(registered) == 1:
+            raise psycopg.ProgrammingError("vector type not found in the database")
+
+    monkeypatch.setattr(corpus_store, "register_vector", missing_then_there)
+    corpus_store._configure(Connection())  # type: ignore[arg-type]
+    assert len(registered) == 2
 
 
 # ---------------------------------------------------------------------------
