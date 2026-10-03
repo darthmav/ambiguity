@@ -143,6 +143,10 @@ services:
       # also exports it to everything it runs, so a script the Builder writes
       # finds the database here.
       DATABASE_URL: "postgresql://postgres@127.0.0.1:${AMBIGUITY_DB_PORT:-5433}/postgres"
+      # A GitHub token for git_dwell, when started as
+      # GH_TOKEN="$(gh auth token)" docker compose up -- the way when gh keeps
+      # its login in the keyring, which a ~/.config/gh mount does not carry.
+      GH_TOKEN: "${GH_TOKEN:-}"
 
     # A console is something you start and watch, not a service that should come
     # back by itself: a run holds process-global state (the stop flag, the corpus

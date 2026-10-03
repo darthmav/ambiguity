@@ -129,7 +129,10 @@ python example_usage.py
 │   └── embedding.py           # spectral embedding via Laplacian eigenvectors
 ├── experimental/              # an agent run's own notes; never in the corpus
 ├── docker/
-│   └── entrypoint.sh          # the container's start: git identity, and what it can reach
+│   ├── entrypoint.sh          # the container's start: git identity, GitHub login, and what it can reach
+│   ├── install.sh             # Docker-only install: no host Python; the image runs baked-in code
+│   ├── up.sh                  # starts it, passing your gh login and git identity at every start
+│   └── compose.yml            # the Docker-only stack: ~/Projects mounted, no code mounted
 ├── dockerfile                 # the console as an Arch image; the daemon stays on the host
 ├── docker-compose.yml         # host networking: the daemon, the database and SearxNG are on it
 ├── .dockerignore              # the venv, the caches, and every per-machine artifact

@@ -98,3 +98,7 @@ projects/
 # used on this checkout. `.claude/` itself is tracked on purpose — the plan and
 # the skills are project material — so only this one file is ignored.
 .claude/settings.local.json
+
+# docker/install.sh's SearxNG config, with its secret key. (docker/.env is
+# covered by .env above.)
+docker/searxng/

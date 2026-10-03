@@ -257,6 +257,33 @@ dependency is missing -- so a pull that changes the dependencies needs no
 step of its own. The log is `/tmp/ambiguity-install.log`. It does none of the
 system half: Ollama, its models, PostgreSQL and SearxNG are `install.sh`'s.
 
+### Docker-only install
+
+To run the console in Docker without setting up Python on the host, and have
+it work on your own repositories:
+
+```bash
+./docker/install.sh              # once: Docker, Ollama + models, gh login, build, start
+./docker/up.sh                   # every start after that  (--build after a git pull, --down to stop)
+```
+
+The image runs the code it was built from; nothing in the checkout is mounted.
+Instead, your projects folder (`~/Projects`, or `--projects DIR`) is mounted
+at `/app/projects`. Each repository in it is a project the console offers, and
+a run given `silver_surfer` works in `~/Projects/silver_surfer` itself. Your
+GitHub login is gh's on the host. Because gh keeps the token in your keyring,
+not in `~/.config/gh`, `up.sh` reads it (`gh auth token`) and your git name
+and email at every start and passes them to the container in its environment.
+They are never written to a file. The entrypoint then makes gh git's
+credential helper, so `git_dwell` pushes, opens the PR and merges as you.
+Settings are in `docker/.env` (from `.env.example`, ignored by git and by the
+image build). If a SearxNG already answers on 8888 it is used; otherwise the
+stack runs its own. This stack and the one below share a compose project name,
+and with it the database: starting either replaces the other's console.
+
+The Builder runs programs. With this setup it can write anywhere in your
+projects folder and push with your GitHub account.
+
 ### Running in a container
 
 An Arch image of the console and the database its corpus lives in, as one
@@ -308,7 +335,11 @@ document, upload it through its console. It runs as uid 1000
 `git_dwell`'s remote stages -- `push` through `cleanup` -- need your own
 credentials: uncomment the `~/.gitconfig` and `~/.config/gh` mounts in
 `docker-compose.yml`. Without them commits carry a fallback identity and `gh`
-has no account. On a run given a project (the console's default) the git tools
+has no account. A gh that keeps its token in the system keyring (`gh auth
+status` says `(keyring)`) leaves none in `~/.config/gh`, and a `~/.gitconfig`
+helper path that exists only on the host breaks the push: start this stack
+with `GH_TOKEN="$(gh auth token)" docker compose up`, or use the Docker-only
+install above, which does this for you. On a run given a project (the console's default) the git tools
 act in that project's own repository on the `projects` volume -- the Builder
 `git init`s it -- which has no remote, so there `git_dwell` commits and skips
 the remote stages. Either way it acts on the container's copies: a merge it

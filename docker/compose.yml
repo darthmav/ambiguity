@@ -1,0 +1,116 @@
+# The Docker-only console: the image runs the code it was built with, and
+# works in your own projects folder with your own GitHub login.
+#
+#   ./docker/install.sh        sets up the host, builds, starts (run once)
+#   ./docker/up.sh             starts it again, e.g. after a reboot
+#
+# The other stack, ../docker-compose.yml, is for working *on* this project: it
+# mounts the checkout's code read-only so an edit shows up on restart, and
+# keeps generated projects in a volume. This one mounts no code at all -- what
+# runs is what `docker/install.sh` (or `up.sh --build`) baked in -- and
+# instead mounts the folder your projects live in, so a run given project
+# `silver_surfer` works in $AMBIGUITY_PROJECTS/silver_surfer on the host.
+#
+# Same compose project name as the other stack, so they are one console, not
+# two: starting either replaces the other's console container, and both use
+# the same database volume. The `projects` volume is the one thing the other
+# stack has that this one does not use.
+#
+# Settings come from docker/.env, which install.sh writes from .env.example
+# (and which neither git nor the image build ever sees). Compose reads it for
+# the ${...} below, and env_file passes it into the console, where an
+# environment variable wins over the image's own .env.
+
+name: ambiguity
+
+services:
+  postgres:
+    # As in ../docker-compose.yml, which says why each line is what it is:
+    # pgvector's postgres:18, trust auth, published on loopback only.
+    image: pgvector/pgvector:pg18-trixie
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "127.0.0.1:${AMBIGUITY_DB_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-h", "127.0.0.1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: "no"
+
+  searxng:
+    # Online research. Only started when install.sh found no SearxNG already
+    # answering (the host install runs one under podman on the same port), by
+    # writing COMPOSE_PROFILES=searxng into docker/.env.
+    profiles: ["searxng"]
+    image: docker.io/searxng/searxng:latest
+    ports:
+      - "127.0.0.1:${SEARXNG_PORT:-8888}:8080"
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - searxng-data:/var/cache/searxng
+    environment:
+      FORCE_OWNERSHIP: "false"
+      SEARXNG_BASE_URL: "http://127.0.0.1:${SEARXNG_PORT:-8888}/"
+    restart: unless-stopped
+
+  console:
+    build:
+      context: ..
+      dockerfile: dockerfile
+    image: ambiguity-console:latest
+    # Host networking for the reason ../docker-compose.yml gives: the Ollama
+    # daemon and SearxNG listen on the host's loopback only.
+    network_mode: host
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Your uid, so what a run writes into your projects is yours.
+    user: "${AMBIGUITY_UID:-1000}:${AMBIGUITY_GID:-1000}"
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      PORT: "${AMBIGUITY_PORT:-8081}"
+      OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
+      DATABASE_URL: "postgresql://postgres@127.0.0.1:${AMBIGUITY_DB_PORT:-5433}/postgres"
+      # GitHub, as you. up.sh reads the token from gh's login on the host
+      # (your keyring) at every start, so it is never written to disk here;
+      # the entrypoint makes gh git's credential helper when it is set, which
+      # is what lets git_dwell push, open the PR, read CI and merge.
+      GH_TOKEN: "${GH_TOKEN:-}"
+      # Commits carry your name: up.sh reads it from your global git config.
+      GIT_AUTHOR_NAME: "${GIT_AUTHOR_NAME:-}"
+      GIT_AUTHOR_EMAIL: "${GIT_AUTHOR_EMAIL:-}"
+      GIT_COMMITTER_NAME: "${GIT_AUTHOR_NAME:-}"
+      GIT_COMMITTER_EMAIL: "${GIT_AUTHOR_EMAIL:-}"
+    volumes:
+      # Your projects folder, read-write: every directory in it is a project
+      # the console offers, and a run on one works on the real repository.
+      - type: bind
+        source: "${AMBIGUITY_PROJECTS:?set AMBIGUITY_PROJECTS in docker/.env}"
+        target: /app/projects
+        bind:
+          create_host_path: false
+      - runs:/app/runs
+      - uploads:/app/uploads
+      - research-web:/app/research/web
+      - diagnostics:/app/reports/diagnostics
+      - experimental:/app/experimental
+    restart: "no"
+    # As ../docker-compose.yml: outlasts BUILDER_DEADLINE_SECONDS, so a stop
+    # lets the run write its snapshot.
+    stop_grace_period: 900s
+
+volumes:
+  pgdata:
+  runs:
+  uploads:
+  research-web:
+  diagnostics:
+  experimental:
+  searxng-data:

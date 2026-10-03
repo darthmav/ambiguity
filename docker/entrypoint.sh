@@ -35,6 +35,29 @@ export GIT_CONFIG_COUNT=1
 export GIT_CONFIG_KEY_0=safe.directory
 export GIT_CONFIG_VALUE_0='*'
 
+# GitHub, as the operator. docker/up.sh passes GH_TOKEN, read from gh's login
+# on the host, and gh honours it as it is; git does not, so gh becomes git's
+# credential helper for github.com -- the same thing `gh auth setup-git` does
+# on the host, whose helper path does not exist in here. The empty value first
+# clears any helper a mounted ~/.gitconfig names, since a helper that cannot
+# run fails the push before the next one is tried.
+if [ -n "${GH_TOKEN:-}" ]; then
+    export GIT_CONFIG_COUNT=3
+    export GIT_CONFIG_KEY_1=credential.https://github.com.helper
+    export GIT_CONFIG_VALUE_1=''
+    export GIT_CONFIG_KEY_2=credential.https://github.com.helper
+    export GIT_CONFIG_VALUE_2='!gh auth git-credential'
+    if gh auth status --hostname github.com >/dev/null 2>&1; then
+        echo "  github: signed in from the host's gh login"
+    else
+        echo "  github: GH_TOKEN was passed but github.com does not accept it;"
+        echo "          on the host: gh auth status, then ./docker/up.sh"
+    fi
+else
+    echo "  github: no login passed, so git_dwell commits locally and stops"
+    echo "          before push (start with ./docker/up.sh after gh auth login)"
+fi
+
 # An identity only if the mounted config (or the environment) has not supplied
 # one. Without it `git_dwell`'s commit stage fails at the last moment, after
 # branching and staging -- the half-finished sequence that tool exists to

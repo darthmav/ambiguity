@@ -47,3 +47,8 @@ experimental/
 *.swp
 *~
 *.log
+
+# The Docker-only install's own settings and SearxNG config (docker/install.sh):
+# this machine's, never the image's.
+docker/.env
+docker/searxng/
