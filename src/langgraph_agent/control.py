@@ -66,6 +66,14 @@ class RunControl:
         """Whether the armed run has been asked to stop. Lock-free: it is asked often."""
         return self._event.is_set()
 
+    def wait(self, seconds: float) -> bool:
+        """Sleep up to `seconds`, waking the moment a stop arrives; True if one did.
+
+        For work that polls something outside -- `git_dwell` waiting on CI -- so
+        a stop ends the wait rather than the poll after it.
+        """
+        return self._event.wait(max(0.0, seconds))
+
     def reason(self) -> str:
         with self._lock:
             return self._reason

@@ -28,6 +28,11 @@ from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from langgraph_agent.config import get_agent_llm
 from langgraph_agent.control import RUN_CONTROL, abandonable
+from langgraph_agent.dwell import (
+    DWELL_CHECKS_WAIT_SECONDS,
+    DWELL_DEFAULT_STAGES,
+    SHIPPING_STAGES,
+)
 from langgraph_agent.mcp_client import (
     TERMINAL_TIMEOUT_MAX_SECONDS,
     TERMINAL_TIMEOUT_SECONDS,
@@ -171,8 +176,81 @@ Failed verification: {_fmt("failed_verification")}
 Never executed: {_fmt("unverified")}
 Builder cut off: {_fmt("builder_cut_off")}
 Lint failures: {_fmt("lint_failed")}
+Pull request: {_dwell_summary(state.get("dwell")) or "(empty)"}
 Step: {state.get("step_count", 0)}
 """
+
+
+def _dwell_summary(record: dict[str, Any] | None) -> str:
+    """One line on where the run's git work stands, from its `dwell` record; "" for none."""
+    if not record:
+        return ""
+    status = record.get("status")
+    pr = f"#{record['number']}" if record.get("number") else "the pull request"
+    url = f" ({record['url']})" if record.get("url") else ""
+    branch = record.get("branch") or "its branch"
+    if status == "merged":
+        landed = f" as {str(record['merge_commit'])[:7]}" if record.get("merge_commit") else ""
+        return f"{pr}{url} merged into {record.get('default_branch') or 'the default'}{landed}"
+    if status == "pending":
+        return f"{pr}{url} open, waiting: {record.get('pending')}"
+    if status == "checks_failed":
+        failing = ", ".join(record.get("checks_failed") or []) or "a check"
+        return f"{pr}{url} open, and its checks fail: {failing}"
+    if status == "open":
+        return f"{pr}{url} open"
+    if status == "local":
+        return f"committed on {branch}; there is no remote, so nothing was pushed"
+    if status == "committed":
+        return f"committed on {branch}"
+    reason = str(record.get("error") or "").splitlines()[0] if record.get("error") else ""
+    return f"git_dwell stopped at {record.get('stopped_at') or '?'}" + (
+        f": {reason}" if reason else ""
+    )
+
+
+# How much of a stopped dwell's error the record keeps: its first lines say
+# which stage and why; the tool result already carried the rest.
+MAX_DWELL_ERROR_CHARS = 500
+
+
+def _dwell_record(result: dict[str, Any]) -> dict[str, Any]:
+    """What the run's git work is and where it stands, from one `git_dwell` result.
+
+    `status` is what the gate and the console read: "merged", "pending" (open,
+    waiting on its checks or a review -- the console finishes it), "checks_failed"
+    (blocks approval), "open", "committed", "local" (no remote), or "failed".
+    """
+    pr = result.get("pull_request") or {}
+    if result.get("merged"):
+        status = "merged"
+    elif result.get("checks_failed"):
+        status = "checks_failed"
+    elif not result.get("success"):
+        status = "failed"
+    elif result.get("pending"):
+        status = "pending"
+    elif result.get("local_only"):
+        status = "local"
+    elif pr.get("number") or pr.get("url"):
+        status = "open"
+    else:
+        status = "committed"
+    return {
+        "status": status,
+        "cwd": str(result.get("cwd") or ""),
+        "branch": str(result.get("branch") or ""),
+        "default_branch": str(result.get("default_branch") or ""),
+        "number": pr.get("number"),
+        "url": str(pr.get("url") or ""),
+        "head": str(result.get("head") or ""),
+        "pending": str(result.get("pending") or ""),
+        "checks_failed": [str(name) for name in (result.get("checks_failed") or [])],
+        "merge_commit": str(result.get("merge_commit") or ""),
+        "stopped_at": str(result.get("stopped_at") or ""),
+        "error": str(result.get("error") or "")[:MAX_DWELL_ERROR_CHARS],
+    }
+
 
 
 # What may stand between a one-word section's heading and its word: a colon on
@@ -483,8 +561,9 @@ def architect_node(state: AgentState) -> AgentState:
     # Work without evidence is not approved, whatever the Architect concluded
     # -- the one place its ruling is overridden, rewritten in the verdict
     # itself so state says what happened. Blocking: a file that ran and failed
-    # (unless the run expects failures), a file nobody ran, a lint failure, and
-    # a Builder pass cut off before it finished.
+    # (unless the run expects failures), a file nobody ran, a lint failure, a
+    # Builder pass cut off before it finished, and a pull request whose checks
+    # fail.
     unverified = list(state.get("unverified") or [])
     failed_files = [
         path for path in (state.get("failed_verification") or []) if path not in unverified
@@ -507,6 +586,11 @@ def architect_node(state: AgentState) -> AgentState:
         reasons.append(
             _CUT_OFF_REASONS.get(raw_cut_off, f"the Builder did not finish ({raw_cut_off})")
         )
+    dwell = state.get("dwell") or {}
+    if dwell.get("status") == "checks_failed":
+        # CI is the same evidence the proof is, run where the change will land.
+        failing = ", ".join(dwell.get("checks_failed") or []) or "a check"
+        reasons.append(f"the pull request's checks fail ({failing})")
     overridden = bool(reasons) and state["verdict"] == Verdict.APPROVED.value
     if overridden:
         state["verdict"] = Verdict.REVISE.value
@@ -1096,16 +1180,24 @@ BUILDER_TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "git_dwell",
             "description": (
-                "Run the whole git flow in order: survey, branch, stage, "
-                "commit, push, open a pull request, merge it. Prefer this over "
-                "a series of terminal git commands -- it runs the stages in "
-                "the only order that works, stops at the first failure and "
-                "says which stage stopped it. It never commits onto the "
-                "default branch: it creates a branch instead. The default runs "
-                "every stage, so the change lands on the default branch as one "
-                "squashed commit and the branch is deleted. To stop short of "
-                "that -- to leave the pull request open for someone to read -- "
-                "name the stages you want and leave 'merge' out."
+                "Carry your change all the way to the default branch: survey, "
+                "branch, stage, commit, update (merge the default branch in), "
+                "push, open a pull request, wait for its CI checks, merge it, and "
+                "clean up the branch. Prefer this over a series of terminal git "
+                "commands -- it runs the stages in the only order that works, "
+                "stops at the first one that cannot go on and says which. It "
+                "never commits onto the default branch, never force-pushes, and "
+                "never merges past a failing check or one it did not read. "
+                "Before anything is pushed, what you wrote this pass is linted "
+                "and run; if that fails the call stops at 'prove' with nothing "
+                "committed. A failing check stops it at 'checks' with the failing "
+                "jobs and the tail of the log in failed_log: fix them and call "
+                "git_dwell again, which commits the fix and pushes it. Checks "
+                "still running when the time runs out are not a failure: the "
+                "result says 'pending', the pull request stays open, and the "
+                "console merges it once they pass. With no remote the commit "
+                "stays in the repository. To leave the pull request open for "
+                "someone to read, name the stages you want and leave 'merge' out."
             ),
             "parameters": {
                 "type": "object",
@@ -1123,10 +1215,12 @@ BUILDER_TOOLS: list[dict[str, Any]] = [
                         "items": {"type": "string"},
                         "description": (
                             "Stages to run, from: survey, branch, stage, "
-                            "commit, push, pr, merge. They always run in that "
-                            "order. Defaults to all of them; pass a shorter "
-                            "list to stop early, e.g. everything up to 'pr' to "
-                            "leave the pull request unmerged."
+                            "commit, update, push, pr, checks, merge, cleanup. "
+                            "They always run in that order. Defaults to all of "
+                            "them; pass a shorter list to stop early, e.g. "
+                            "everything up to 'pr' to leave the pull request "
+                            "unmerged, or ['checks', 'merge', 'cleanup'] to "
+                            "finish one left pending."
                         ),
                     },
                     "paths": {
@@ -1140,8 +1234,17 @@ BUILDER_TOOLS: list[dict[str, Any]] = [
                     "branch": {
                         "type": "string",
                         "description": (
-                            "Branch to create when HEAD is the default branch. "
-                            "Derived from the message when omitted."
+                            "Branch to create when HEAD is the default branch, "
+                            "or when this branch's pull request has already "
+                            "merged. Derived from the message when omitted."
+                        ),
+                    },
+                    "checks_timeout": {
+                        "type": "number",
+                        "description": (
+                            "Seconds to wait for the pull request's checks. "
+                            "Bounded by what is left of your deadline; 0 reads "
+                            "them once without waiting."
                         ),
                     },
                 },
@@ -1330,6 +1433,101 @@ def _failure_reason(result: Any) -> str:
     return line
 
 
+# Held back from a `git_dwell` call's checks wait for the stages after it --
+# the merge and the cleanup -- and for the push and pull request before the
+# wait begins, all of which finish inside the Builder's deadline.
+DWELL_TAIL_RESERVE_SECONDS = 45.0
+
+
+def _checks_budget(requested: Any, deadline: _Deadline) -> float:
+    """How long a `git_dwell` call may wait on CI: what was asked, within the deadline.
+
+    A tool call is never abandoned, so the wait has to end inside the pass on
+    its own. Checks still running past it are not a failure: the pull request is
+    left pending, for the console to finish.
+    """
+    try:
+        wanted = DWELL_CHECKS_WAIT_SECONDS if requested is None else float(requested)
+    except (TypeError, ValueError):
+        wanted = DWELL_CHECKS_WAIT_SECONDS
+    if wanted != wanted:  # NaN
+        wanted = DWELL_CHECKS_WAIT_SECONDS
+    return max(0.0, min(wanted, deadline.remaining() - DWELL_TAIL_RESERVE_SECONDS))
+
+
+def _dwell_gate(
+    state: AgentState, files_changed: list[str], tool_log: list[str], deadline: _Deadline
+) -> Callable[[dict[str, Any]], str]:
+    """The proof a `git_dwell` call must pass before anything leaves the machine.
+
+    The pass's own proof (`_prove`) runs after the tool loop, so a dwell called
+    mid-pass would push what nobody had linted or run. This runs the same proof
+    first, on what the pass has written so far and what an earlier pass left
+    failing, and returns why the call may not go ahead, or "". Only a call
+    that ships -- push, pr, checks or merge -- is held to it: a commit that
+    stays local is not seen by anyone.
+    """
+
+    def gate(args: dict[str, Any]) -> str:
+        stages = {str(x) for x in (args.get("stages") or DWELL_DEFAULT_STAGES)}
+        if not stages & SHIPPING_STAGES:
+            return ""
+        scratch: list[str] = []
+        verification, (lint_failures, _, _) = _prove(state, files_changed, scratch, deadline)
+        if not verification and not lint_failures:
+            return ""
+        expected = bool(state.get("expect_failures"))
+        problems = [
+            f"{path} does not run ({detail.splitlines()[-1] if detail else 'no output'})"
+            for path, status, detail in verification
+            if status == "failed" and not expected
+        ]
+        problems += [
+            f"{path} was not run before the deadline or the stop"
+            for path, status, _ in verification
+            if status == "unverified"
+        ]
+        problems += [
+            f"{path} fails lint ({', '.join(sorted({code for _, code, _ in findings}))})"
+            for path, findings in lint_failures
+        ]
+        if not problems:
+            tool_log.append(f"prove(before git_dwell) -> clean ({len(verification)} run)")
+            return ""
+        tool_log.append(f"prove(before git_dwell) -> {len(problems)} problem(s)")
+        return (
+            "nothing was committed or pushed, because what this run wrote is not "
+            "proven: " + "; ".join(problems) + ". Fix them and call git_dwell again, or "
+            "name stages that stop at 'commit' to commit without pushing."
+        )
+
+    return gate
+
+
+def _dwell_line(args: dict[str, Any], result: Any, outcome: str) -> str:
+    """A `git_dwell` call's report line: the stages asked for, how far it got, how it ended.
+
+    One call is a whole pipeline, so a push that failed after a commit must not
+    read as one that never committed, and a pull request left waiting on its
+    checks must not read as merged.
+    """
+    record = result if isinstance(result, dict) else {}
+    target = ",".join(str(x) for x in (args.get("stages") or [])) or "default"
+    done = [
+        entry["stage"] for entry in (record.get("stages") or [])
+        if isinstance(entry, dict) and entry.get("ok")
+    ]
+    reached = f" [{' -> '.join(done)}]" if done else ""
+    if not record.get("success"):
+        outcome = f"{outcome} at {record.get('stopped_at', '?')}"
+    elif record.get("pending"):
+        outcome = f"ok, pending: {record['pending']}"
+    elif record.get("merged"):
+        number = (record.get("pull_request") or {}).get("number")
+        outcome = f"ok, merged #{number}" if number else "ok, merged"
+    return f"git_dwell({target}){reached} -> {outcome}"
+
+
 def _run_builder_tools(
     llm: Any,
     messages: list[Any],
@@ -1337,12 +1535,16 @@ def _run_builder_tools(
     tool_log: list[str],
     deadline: _Deadline,
     output_dir: str = "",
+    gate: Callable[[dict[str, Any]], str] | None = None,
+    dwells: list[dict[str, Any]] | None = None,
 ) -> tuple[str, bool, bool, bool]:
     """Let the Builder call tools until it stops asking for them.
 
     Returns its closing message, and whether it ran out of turns, ran out of
     time, or was stopped. `files_changed` grows only when a write reports
-    success.
+    success. A `git_dwell` call is held to `gate` (`_dwell_gate`), given a
+    checks wait that ends inside `deadline`, and its result appended to
+    `dwells`.
 
     Only the model's own call is abandoned at the deadline. A tool call never
     is -- a worker abandoned mid-write would keep writing after the node
@@ -1378,6 +1580,8 @@ def _run_builder_tools(
                 # `projects/` is ignored there, so `git add -A` could only stage
                 # the operator's own work -- and the default pipeline merges.
                 args["cwd"] = output_dir
+            if name == "git_dwell":
+                args["checks_timeout"] = _checks_budget(args.get("checks_timeout"), deadline)
 
             if name not in BUILDER_TOOL_NAMES:
                 # Refused, not run: the client serves the Researcher's tools
@@ -1389,6 +1593,11 @@ def _run_builder_tools(
                 and (outside := _outside_output_dir(str(args.get("path", "")), output_dir))
             ):
                 result = {"success": False, "error": outside}
+            elif name == "git_dwell" and gate is not None and (refusal := gate(args)):
+                result = {
+                    "success": False, "error": f"prove: {refusal}",
+                    "stopped_at": "prove", "stages": [],
+                }
             else:
                 try:
                     result = _call_tool(name, args)
@@ -1411,17 +1620,9 @@ def _run_builder_tools(
                 reason = _failure_reason(result)
                 outcome = f"failed: {reason}" if reason else "failed"
             if name == "git_dwell":
-                # One call, a whole pipeline: the line names the stages asked
-                # for and how far it got, since a push that failed after a
-                # commit is not one that never committed.
-                target = ",".join(str(x) for x in (args.get("stages") or [])) or "default"
-                done = [
-                    e["stage"] for e in (result.get("stages") or [])
-                    if isinstance(e, dict) and e.get("ok")
-                ]
-                reached = f" [{' -> '.join(done)}]" if done else ""
-                outcome = outcome if ok else f"{outcome} at {result.get('stopped_at', '?')}"
-                tool_log.append(f"{name}({target}){reached} -> {outcome}")
+                tool_log.append(_dwell_line(args, result, outcome))
+                if dwells is not None and isinstance(result, dict):
+                    dwells.append({**result, "cwd": str(args.get("cwd") or "")})
             else:
                 tool_log.append(f"{name}({target}){where} -> {outcome}")
 
@@ -1784,15 +1985,17 @@ def _seat_pass(
     files_changed: list[str],
     tool_log: list[str],
     deadline: _Deadline,
+    dwells: list[dict[str, Any]] | None = None,
 ) -> tuple[str, bool, bool, bool, str]:
     """The Builder's seat at work.
 
     Returns (closing message, out of turns, out of time, stopped, why it could
-    not act). A discussion run binds no tools, so it takes the path of a model
-    that cannot call any: there is no tool loop for it to act through. The last
-    element is empty unless a real model was refused its tools on a run that
-    needed them -- such a pass can only describe work, so it must not read as
-    having done it. A stub answers in canned text by design and is exempt.
+    not act), and appends each `git_dwell` result to `dwells`. A discussion run
+    binds no tools, so it takes the path of a model that cannot call any: there
+    is no tool loop for it to act through. The last element is empty unless a
+    real model was refused its tools on a run that needed them -- such a pass
+    can only describe work, so it must not read as having done it. A stub
+    answers in canned text by design and is exempt.
     """
     discuss_only = bool(state.get("discuss_only"))
     note = (
@@ -1825,8 +2028,12 @@ def _seat_pass(
             lambda: _as_text(llm.invoke(messages).content), deadline.remaining(), None
         )
         return reply or "", False, reply is None, False, no_tools
+    gate = _dwell_gate(state, files_changed, tool_log, deadline)
     return (
-        *_run_builder_tools(tool_llm, messages, files_changed, tool_log, deadline, output_dir),
+        *_run_builder_tools(
+            tool_llm, messages, files_changed, tool_log, deadline, output_dir,
+            gate=gate, dwells=dwells,
+        ),
         "",
     )
 
@@ -1921,13 +2128,14 @@ def builder_node(state: AgentState) -> AgentState:
     output_dir = "" if discuss_only else str(state.get("output_dir") or "")
     files_changed: list[str] = []  # this pass alone; the state field is the run's
     tool_log: list[str] = []
+    dwells: list[dict[str, Any]] = []
 
     # The tool loop gets the budget less the verification reserve, and whatever
     # it leaves unspent is added to the reserve: a slow build cannot starve the
     # proof.
     loop_deadline = _Deadline(max(0.0, BUILDER_DEADLINE_SECONDS - VERIFY_RESERVE_SECONDS))
     content, exhausted, out_of_time, stopped, no_tools = _seat_pass(
-        state, output_dir, files_changed, tool_log, loop_deadline
+        state, output_dir, files_changed, tool_log, loop_deadline, dwells
     )
     verification, lint = _prove(
         state,
@@ -1952,6 +2160,15 @@ def builder_node(state: AgentState) -> AgentState:
         else "No report produced."
     )
     builder_report += _proof_report(verification, stopped, lint)
+    # The pass's last git_dwell says where the change stands; a pass that ran
+    # none leaves the record of an earlier one, so failing checks keep blocking
+    # until a dwell sees them pass.
+    dwell = _dwell_record(dwells[-1]) if dwells else dict(state.get("dwell") or {})
+    if dwells:
+        builder_report += f"\n\nPull request: {_dwell_summary(dwell)}"
+        failed_log = str(dwells[-1].get("failed_log") or "")
+        if failed_log:
+            builder_report += f"\nThe failing job's log ends:\n{failed_log[-MAX_VERIFY_DETAIL_CHARS:]}"
     if tool_log:
         builder_report += "\n\nTool calls:\n" + "\n".join(f"- {c}" for c in tool_log)
 
@@ -2014,6 +2231,11 @@ def builder_node(state: AgentState) -> AgentState:
             for path, findings in lint_failures
         )
         blockers = f"{blockers}. {note}" if blockers else note
+    if dwell.get("status") == "checks_failed":
+        note = "The pull request's checks fail: " + (
+            ", ".join(dwell.get("checks_failed") or []) or "a check"
+        )
+        blockers = f"{blockers}. {note}" if blockers else note
 
     if stopped and not blockers:
         blockers = (
@@ -2055,6 +2277,7 @@ def builder_node(state: AgentState) -> AgentState:
     )
     state["lint_failed"] = lint_failed
     state["blockers"] = blockers
+    state["dwell"] = dwell
 
     # The Architect rules on this line, so it never says "Implementation
     # complete" for a pass that wrote a broken file, was cut off or stopped, or
@@ -2098,6 +2321,8 @@ def builder_node(state: AgentState) -> AgentState:
     # pass that wrote nothing does not read as the run losing its files.
     if len(all_files_changed) > len(files_changed):
         summary += f" ({len(all_files_changed)} changed so far this run)"
+    if dwells:
+        summary += f"; pull request: {_dwell_summary(dwell)}"
     state["messages"].append(f"[Builder] {summary}")
 
     return state

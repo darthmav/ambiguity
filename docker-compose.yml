@@ -96,8 +96,9 @@ services:
     # the host's branch. On a run given a project -- the console's default --
     # they act in that project's own repository instead, on the `projects`
     # volume, which the Builder makes with `git init`; it has no remote, so
-    # git_dwell commits there and stops at push. To let git_dwell finish its
-    # default pipeline as you rather than as the container's fallback
+    # git_dwell commits there and skips push, pr, checks, merge and cleanup.
+    # To let git_dwell finish its default pipeline as you rather than as the
+    # container's fallback
     # identity, add your own credentials, read-only -- the entrypoint supplies
     # safe.directory through the environment precisely so these need no
     # writes, and either repository takes them. Both must exist on the host

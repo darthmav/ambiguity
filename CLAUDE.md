@@ -63,6 +63,7 @@ python example_usage.py
 │   ├── corpus_store.py        # Where the corpus lives: PostgreSQL + pgvector, one schema per corpus
 │   ├── embedding_calibration.json # The floor's off-domain questions (JSON: never indexed)
 │   ├── mcp_client.py          # The agents' tool belts, served in-process
+│   ├── dwell.py               # git_dwell: working tree to merged PR, through CI; the console's finish
 │   ├── lexical.py             # BM25 + rank fusion: the lexical half of search
 │   ├── web_research.py        # Online research: keyless search, our own selection gate
 │   ├── html_text.py           # HTML → text by link density. No library, no dependency
@@ -79,7 +80,7 @@ python example_usage.py
 │   └── builder.txt
 ├── tests/
 │   ├── conftest.py            # Forces StubLLM; switches the web phase off; closes every circuit
-│   ├── test_git_dwell.py      # The ordered git pipeline, and its two refusals
+│   ├── test_git_dwell.py      # The git pipeline against a real remote and a stub GitHub
 │   ├── test_claims.py         # Documentation claims, made executable
 │   ├── test_corpus_absent.py  # The two doors: reading never creates a corpus
 │   ├── test_corpus_roots.py   # The corpus is research and deliberate embeds, never the checkout
@@ -191,6 +192,7 @@ Every node reads/writes `AgentState`:
   "no_relevant_knowledge", "blockers": str, "files_changed": list[str],
   "failed_verification": list[str], "unverified": list[str],
   "builder_cut_off": "" | "turn_cap" | "deadline" | "no_tools", "lint_failed": list[str],
+  "dwell": dict,  # status: merged | pending | checks_failed | open | committed | local | failed
   "expect_failures": bool, "discuss_only": bool, "output_dir": str,
   "step_count": int,
 }
@@ -259,15 +261,39 @@ a Builder that runs programs. No CORS header is sent; the page is same-origin.
   replaces `cd` (validated by `_resolve_cwd`), and a requested `timeout` is
   clamped by `TERMINAL_TIMEOUT_MAX_SECONDS`. A timeout reports the tail of what
   the file printed.
-- **`git_dwell` runs its stages in fixed order** -- survey, branch, stage,
-  commit, push, pr, merge -- whatever order the caller lists them in, and it
-  will not commit onto the default branch. The default pipeline ends at
-  `merge` (`--squash --delete-branch`); naming `stages` without it stops at
-  `pr`. Nothing staged is a success, and `paths` commits only what it names
-  (a pathspec on the commit, not just on the add). On a run given a project
-  the git tools act in `projects/<name>`, and `git_dwell` refuses unless that
-  is a repository of its own: git climbs to the checkout otherwise, where
+- **`git_dwell` runs its stages in fixed order** (`dwell.py`) -- survey, branch,
+  stage, commit, update, push, pr, checks, merge, cleanup -- whatever order the
+  caller lists them in, and it will not commit onto the default branch (or a
+  detached HEAD); a repository's first commit, with no base to branch from,
+  founds its branch instead. A branch whose pull request already merged is
+  finished: the work moves to a fresh branch from `origin/<default>`. `update`
+  merges the default branch in before the push, so CI tests what will land; a
+  push refused because the branch moved there merges it in and pushes once
+  more. Never a rebase, never a force-push. Nothing staged is a success, and
+  the rest still runs when the branch has commits to ship; `paths` commits
+  only what it names (a pathspec on the commit, not just on the add). No
+  `origin` skips every remote stage, as a success: the commit stays local.
+- **`git_dwell` never merges past a check it did not read.** `checks` waits
+  for the PR's CI on the pushed head, bounded: the node passes what is left of
+  the Builder's deadline (`_checks_budget`), since a tool call is never
+  abandoned. Red stops at `checks` with the failing jobs and `failed_log`;
+  still running is *pending* -- success, PR left open, merge skipped. `merge`
+  reads the checks itself when `checks` did not run, waits on people (changes
+  requested, a required review, a draft) as pending, stops on a conflict, hands
+  a protected branch to GitHub's auto-merge, and squash-merges with
+  `--match-head-commit`, so a push after the checks were read is refused.
+  `cleanup` runs only once GitHub says merged: the branch deleted there (a
+  refusal is a warning) and here (`-D`, safe only because it merged), and the
+  default branch here fast-forwarded to what landed. On a run given a project
+  the git tools act in `projects/<name>`, and `git_dwell` refuses unless that is
+  a repository of its own: git climbs to the checkout otherwise, where
   `projects/` is ignored and only the operator's own work could be staged.
+- **A dwell that ships is proven first.** `_dwell_gate` runs the pass's own
+  proof (`_prove`) before a call with push, pr, checks or merge reaches git; a
+  failure stops it at `prove` with nothing committed. The pass's last dwell is
+  `state["dwell"]` (`_dwell_record`): `checks_failed` blocks approval until a
+  dwell sees them pass, and a run that ends `pending` hands the PR to the
+  console, which finishes it (`_follow_pull_requests`, below).
 - **`expect_failures`, `research_web` and `discuss_only` are per-run flags set
   by the caller, never by an agent.** A discussion run binds no tools at all
   and forces online research off.
@@ -431,8 +457,17 @@ session). Where it is used:
 - **Online research**: one circuit per search backend; a DuckDuckGo bot check
   trips it at once. Searches and page fetches retry only failures a second try
   can fix (refused, dropped, 502-504), never a timeout.
-- **`git_dwell`'s push** is retried when it never reached the remote; nothing
-  else a Builder tool does is ever retried, since every other tool has effects.
+- **`git_dwell`'s push and fetch** are retried when they never reached the
+  remote; nothing else a Builder tool does is ever retried, since every other
+  tool has effects.
+- **A pull request a run left pending** is followed by the monitor
+  (`_follow_pull_requests`, kept in `runs/pull_requests.json`): every
+  `PULL_REQUEST_FOLLOW_SECONDS` it runs `finish_pull_request` -- checks, merge,
+  cleanup, no waiting -- on the branch, number and head the run recorded, and
+  merges only that head. Never while a run is in flight, and a run is refused
+  while one is being finished. A red check is journalled and shown, never
+  fixed; repeated trouble or `PULL_REQUEST_FOLLOW_HOURS` stops it. The header
+  shows each as a chip.
 - **The monitor** (`_self_healing_monitor` in `serve.py`) checks the daemon,
   SearxNG and the corpus every `HEALTH_CHECK_SECONDS`, logs each change of
   health, re-probes open circuits, and rebuilds a corpus whose last rebuild

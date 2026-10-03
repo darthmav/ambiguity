@@ -67,6 +67,7 @@ from langgraph_agent.corpus_store import (  # noqa: E402
     get_database,
     rebuild_claim,
 )
+from langgraph_agent.dwell import finish_pull_request  # noqa: E402
 from langgraph_agent.graph import RECURSION_LIMIT  # noqa: E402
 from langgraph_agent.graphrag_server import (  # noqa: E402
     EMBEDDER_LOAD,
@@ -88,6 +89,7 @@ from langgraph_agent.graphrag_server import (  # noqa: E402
     resolve_persist_dir,
     store_uploaded_document,
 )
+from langgraph_agent.mcp_client import MCPClient  # noqa: E402
 from langgraph_agent.projects import (  # noqa: E402
     embedded_projects,
     list_projects,
@@ -745,6 +747,9 @@ def rpc_status(_: dict[str, Any]) -> dict[str, Any]:
         # What an upload may be, for the console's pickers and tooltips. From
         # the walk's own list, so the page cannot promise a different one.
         "indexable_suffixes": list(INDEXABLE_SUFFIXES),
+        # Pull requests a run left waiting on their checks, which the monitor
+        # merges once they pass, and the last word on each.
+        "pull_requests": pull_requests_snapshot(),
     }
 
 
@@ -1677,6 +1682,12 @@ def rpc_run_goal(params: dict[str, Any]) -> dict[str, Any]:
                 f"The corpus is being {_corpus_change['action']} right now; start the "
                 "run when that has finished."
             )
+        if _pull_request_follow["running"]:
+            # Its cleanup may switch the branch this run's Builder would work on.
+            raise ValueError(
+                f"The console is finishing pull request #{_pull_request_follow['number']} "
+                "right now; start the run in a moment."
+            )
         RUN_CONTROL.arm(run_id)
         # Under the lock `run_progress` reads the record through, so no reply
         # can hand this run's console the last run's turns.
@@ -1786,6 +1797,9 @@ def rpc_run_goal(params: dict[str, Any]) -> dict[str, Any]:
         ))
         raise
     finally:
+        # Whatever ended the run, a pull request it left waiting on its checks
+        # is the console's to finish.
+        _track_pull_request(last.get("dwell") or {}, run_id, goal)
         _finish_run()
 
 
@@ -1863,6 +1877,9 @@ def _heal() -> None:
         if result["status"] != previous.get(component, {}).get("status"):
             HEALING.log_health_check(component, result["status"], result["details"])
 
+    # A pull request a run left waiting on its checks is merged once they pass.
+    _follow_pull_requests()
+
     # A rebuild stopped by an unreachable embedder or database is finished once
     # what stopped it is back. Nothing else rebuilds on its own: any other
     # failure is not one waiting on a service, and a run rebuilds before it
@@ -1890,6 +1907,216 @@ def _heal() -> None:
                 "rebuild corpus", "corpus", recovered,
                 _corpus_feed_line(report, when=when) or str(report.get("source", "")),
             )
+
+
+# --------------------------------------------------------------------------
+# Pull requests a run left waiting on their checks
+# --------------------------------------------------------------------------
+
+# CI routinely outlasts the Builder's deadline, so a run's `git_dwell` ends
+# with its pull request open and its checks still running -- "pending", not
+# failed. The monitor finishes it: it reads the checks without waiting, merges
+# exactly the head the run pushed once they pass, and cleans up, as the run
+# would have (`finish_pull_request`). A red check is reported, never fixed: a
+# fix is a run, and the operator starts it.
+
+# How often one pull request is asked about, and how long before the console
+# stops: CI that has not finished in a day is not going to by itself.
+PULL_REQUEST_FOLLOW_SECONDS = float(os.getenv("PULL_REQUEST_FOLLOW_SECONDS", "60"))
+PULL_REQUEST_FOLLOW_HOURS = float(os.getenv("PULL_REQUEST_FOLLOW_HOURS", "24"))
+
+# Answers in a row that were neither a verdict nor "still running" -- gh signed
+# out, GitHub down, a push by someone else -- before the console stops asking.
+PULL_REQUEST_FOLLOW_FAILURES = 3
+
+# Followed pull requests live on disk only, read and written whole under this
+# lock: the file is a handful of entries, and a restart goes on following them.
+_pull_requests_lock = threading.Lock()
+
+# Set under `_run_lock` while the monitor finishes one: a run is refused
+# meanwhile, since the cleanup may switch the branch its Builder would use.
+_pull_request_follow: dict[str, Any] = {"running": False, "number": None}
+
+# The fields the console shows; the rest is the monitor's bookkeeping.
+_PULL_REQUEST_FIELDS = (
+    "key", "cwd", "branch", "number", "url", "status", "detail", "goal",
+    "checks_failed", "merge_commit", "warnings", "since",
+)
+
+
+def _pull_requests_path() -> Path:
+    return RUNS_DIR / "pull_requests.json"
+
+
+def _read_pull_requests() -> list[dict[str, Any]]:
+    """Every followed pull request. The caller holds `_pull_requests_lock`."""
+    try:
+        loaded = json.loads(_pull_requests_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return [entry for entry in loaded if isinstance(entry, dict)] if isinstance(loaded, list) else []
+
+
+def _write_pull_requests(entries: list[dict[str, Any]]) -> None:
+    """Replace the file whole, through a rename. The caller holds `_pull_requests_lock`."""
+    try:
+        RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", dir=RUNS_DIR, suffix=".tmp", delete=False, encoding="utf-8"
+        ) as handle:
+            json.dump(entries, handle, indent=2)
+            temp_name = handle.name
+        os.replace(temp_name, _pull_requests_path())
+    except OSError as exc:
+        HEALING.warning(f"Could not save the followed pull requests: {exc}",
+                        action="pull_request_save_failed")
+
+
+def _track_pull_request(dwell: Mapping[str, Any], run_id: str, goal: str) -> None:
+    """Follow the pull request a run left pending. Never raises: the run is over."""
+    try:
+        if dwell.get("status") != "pending" or not dwell.get("number") or not dwell.get("head"):
+            return
+        entry = {
+            "key": f"{dwell.get('cwd') or '.'}#{dwell['number']}",
+            "cwd": str(dwell.get("cwd") or ""),
+            "branch": str(dwell.get("branch") or ""),
+            "number": int(dwell["number"]),
+            "url": str(dwell.get("url") or ""),
+            "head": str(dwell["head"]),
+            "status": "pending",
+            "detail": str(dwell.get("pending") or ""),
+            "goal": goal[:200],
+            "run_id": run_id,
+            "checks_failed": [],
+            "merge_commit": "",
+            "warnings": [],
+            "since": time.time(),
+            "next_check": 0.0,
+            "failures": 0,
+        }
+        with _pull_requests_lock:
+            entries = [e for e in _read_pull_requests() if e.get("key") != entry["key"]]
+            _write_pull_requests([*entries, entry])
+        HEALING.info(
+            f"Following pull request #{entry['number']} until its checks finish: "
+            f"{entry['detail']}",
+            action="pull_request_followed",
+        )
+    except Exception as exc:
+        HEALING.warning(f"Could not follow the run's pull request: {exc}",
+                        action="pull_request_save_failed")
+
+
+def pull_requests_snapshot() -> list[dict[str, Any]]:
+    """What the header shows: each followed pull request and where it stands."""
+    with _pull_requests_lock:
+        entries = _read_pull_requests()
+    return [{field: entry.get(field) for field in _PULL_REQUEST_FIELDS} for entry in entries]
+
+
+def _finish_one(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """Ask GitHub once about one followed pull request; return what changed."""
+    number, now = entry.get("number"), time.time()
+    cwd = str(entry.get("cwd") or "") or None
+    if cwd is not None and not Path(cwd).is_dir():
+        return {"status": "stopped", "detail": f"{cwd} is gone, and its repository with it"}
+    if now - float(entry.get("since") or now) > PULL_REQUEST_FOLLOW_HOURS * 3600:
+        HEALING.warning(
+            f"Stopped following pull request #{number}: still waiting after "
+            f"{PULL_REQUEST_FOLLOW_HOURS:g}h. Finish it on GitHub.",
+            action="pull_request_stopped",
+        )
+        return {"status": "gave_up", "detail": (
+            f"still waiting after {PULL_REQUEST_FOLLOW_HOURS:g}h: {entry.get('detail')}"
+        )}
+    result = finish_pull_request(
+        MCPClient()._run_vcs,
+        cwd=cwd,
+        branch=str(entry.get("branch") or ""),
+        number=int(number or 0),
+        head=str(entry.get("head") or ""),
+    )
+    warnings_ = list(result.get("warnings") or [])
+    if result.get("merged"):
+        landed = result.get("merge_commit") or ""
+        HEALING.info(
+            f"Pull request #{number} merged into {result.get('default_branch') or 'its base'}"
+            + (f" as {landed[:7]}" if landed else "") + " once its checks passed"
+            + (f" ({'; '.join(warnings_)})" if warnings_ else ""),
+            action="pull_request_merged",
+        )
+        return {"status": "merged", "detail": "merged", "merge_commit": landed,
+                "warnings": warnings_}
+    if result.get("success"):
+        return {"detail": str(result.get("pending") or "waiting"), "failures": 0,
+                "next_check": now + PULL_REQUEST_FOLLOW_SECONDS}
+    error = str(result.get("error") or "git_dwell gave no reason")
+    if "closed without merging" in error:
+        HEALING.warning(f"Stopped following pull request #{number}: it was closed "
+                        "without merging.", action="pull_request_stopped")
+        return {"status": "stopped", "detail": error[:500]}
+    if result.get("checks_failed"):
+        names = ", ".join(result["checks_failed"])
+        HEALING.error(f"Pull request #{number}: its checks fail ({names}). Start a run to fix "
+                      "it; nothing was merged.", action="pull_request_checks_failed")
+        return {"status": "checks_failed", "checks_failed": list(result["checks_failed"]),
+                "detail": error[:500]}
+    failures = int(entry.get("failures") or 0) + 1
+    if failures >= PULL_REQUEST_FOLLOW_FAILURES:
+        HEALING.warning(f"Stopped following pull request #{number}: {error[:300]}",
+                        action="pull_request_stopped")
+        return {"status": "stopped", "detail": error[:500], "failures": failures}
+    return {"detail": error[:500], "failures": failures,
+            "next_check": now + PULL_REQUEST_FOLLOW_SECONDS}
+
+
+def _follow_pull_requests() -> None:
+    """Finish each followed pull request that is due, unless a run is in flight.
+
+    Never while a run is: its Builder may be working in the same repository,
+    and the cleanup switches branches. The lock is not held across GitHub: a
+    finish asks gh several times, and the header reads the list meanwhile.
+    """
+    now = time.time()
+    with _pull_requests_lock:
+        due = [
+            dict(entry) for entry in _read_pull_requests()
+            if entry.get("status") == "pending" and float(entry.get("next_check") or 0) <= now
+        ]
+    for entry in due:
+        with _run_lock:
+            if _run_progress["running"]:
+                return
+            _pull_request_follow.update(running=True, number=entry.get("number"))
+        try:
+            change = _finish_one(entry)
+        except Exception as exc:
+            change = {"detail": f"{type(exc).__name__}: {exc}",
+                      "next_check": time.time() + PULL_REQUEST_FOLLOW_SECONDS}
+        finally:
+            with _run_lock:
+                _pull_request_follow.update(running=False, number=None)
+        with _pull_requests_lock:
+            entries = _read_pull_requests()
+            for stored in entries:
+                if stored.get("key") == entry.get("key"):
+                    stored.update(change)
+            _write_pull_requests(entries)
+
+
+def rpc_dismiss_pull_request(params: dict[str, Any]) -> dict[str, Any]:
+    """Stop showing -- and, if it is still pending, stop following -- one pull request."""
+    key = _str_param(params, "key")
+    if not key:
+        raise ValueError("Name the pull request to dismiss.")
+    with _pull_requests_lock:
+        entries = _read_pull_requests()
+        kept = [entry for entry in entries if entry.get("key") != key]
+        if len(kept) == len(entries):
+            raise ValueError(f"No pull request {key!r} is being followed.")
+        _write_pull_requests(kept)
+    return {"pull_requests": pull_requests_snapshot()}
 
 
 def _self_healing_monitor() -> None:
@@ -1958,6 +2185,7 @@ RPC_METHODS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "last_run": rpc_last_run,
     "healing": rpc_healing,
     "reset_circuit": rpc_reset_circuit,
+    "dismiss_pull_request": rpc_dismiss_pull_request,
     "shutdown": rpc_shutdown,
 }
 

@@ -305,12 +305,14 @@ a rebuild; `docker compose down -v` forgets them. To hand the container a
 document, upload it through its console. It runs as uid 1000
 (`AMBIGUITY_UID`/`AMBIGUITY_GID` for any other account).
 
-`git_dwell`'s `push`, `pr` and `merge` stages need your own credentials:
-uncomment the `~/.gitconfig` and `~/.config/gh` mounts in `docker-compose.yml`.
-Without them commits carry a fallback identity and `gh` has no account. On a
-run given a project (the console's default) the git tools act in that
-project's own repository on the `projects` volume -- the Builder `git init`s it
--- which has no remote, so there `git_dwell` commits and stops at `push`.
+`git_dwell`'s remote stages -- `push` through `cleanup` -- need your own
+credentials: uncomment the `~/.gitconfig` and `~/.config/gh` mounts in
+`docker-compose.yml`. Without them commits carry a fallback identity and `gh`
+has no account. On a run given a project (the console's default) the git tools
+act in that project's own repository on the `projects` volume -- the Builder
+`git init`s it -- which has no remote, so there `git_dwell` commits and skips
+the remote stages. Either way it acts on the container's copies: a merge it
+makes is pulled into your checkout on the host by your own `git pull`.
 
 `docker compose stop` is the console's exit button rather than a kill -- a run
 in flight is stopped and the exit deferred until it has written its snapshot,
@@ -549,7 +551,7 @@ taking a dict of arguments and returning a JSON-serialisable dict:
 | `filesystem_write` | Builder | Write a file |
 | `git_status` | Builder | `git status --porcelain` |
 | `git_diff` | Builder | `git diff` |
-| `git_dwell` | Builder | The whole git flow in order: survey, branch, stage, commit, push, open a PR, merge it. Never commits onto the default branch. Runs every stage by default; name `stages` without `merge` to stop at the PR |
+| `git_dwell` | Builder | The whole git flow in order: survey, branch, stage, commit, update (merge the default branch in), push, open a PR, wait on its CI checks, squash-merge it, clean up the branch and pull the default branch. Never commits onto the default branch, never force-pushes, never merges past a failing check or one it did not read. What the pass wrote is linted and run before anything is pushed. Checks still running past the Builder's deadline leave the PR *pending*, and the console merges it once they pass (a chip in the header). Name `stages` without `merge` to stop at the PR |
 | `terminal_execute` | Builder | Run one program, no shell (killed after `TERMINAL_TIMEOUT_SECONDS`, default 60; pass `timeout` to raise) |
 | `run_tests` | Builder | Run `pytest`, in the project root or in a `cwd` it is given (a generated project's own suite) |
 

@@ -659,8 +659,11 @@ def test_a_push_that_never_reached_the_remote_is_sent_again(monkeypatch):
 
 
 def test_a_rejected_push_is_not_sent_again(monkeypatch):
+    """The remote answered: a hook or a protection rule said no, and asking
+    again gets the same answer. (A push refused because the branch moved there
+    is merged in and sent once more -- test_git_dwell.py, against a real remote.)"""
     calls: list[tuple[str, ...]] = []
-    outcomes = [(False, "! [rejected] feature/x -> feature/x (non-fast-forward)")]
+    outcomes = [(False, "! [remote rejected] feature/x -> feature/x (pre-receive hook declined)")]
     monkeypatch.setattr(MCPClient, "_run_vcs", _vcs(outcomes, calls))
 
     result = MCPClient().call_tool("git_dwell", {"stages": ["push"], "branch": "feature/x"})
@@ -845,3 +848,166 @@ def test_a_run_is_one_healing_session_and_its_snapshot_carries_it(monkeypatch):
     assert HEALING.session_id is None
     saved = json.loads(serve.LAST_RUN_PATH.read_text(encoding="utf-8"))
     assert saved["healing"] == json.loads(json.dumps(result["healing"], default=str))
+
+
+# ---------------------------------------------------------------------------
+# Pull requests a run left waiting on their checks
+# ---------------------------------------------------------------------------
+
+_PENDING = {
+    "status": "pending", "number": 12, "head": "abc123", "branch": "agent/x", "cwd": "",
+    "url": "https://github.com/acme/demo/pull/12", "pending": "waiting on test",
+}
+
+
+@pytest.fixture
+def finishes(monkeypatch):
+    """`finish_pull_request` answering from a list, and what it was asked."""
+    asked: list[dict[str, Any]] = []
+    answers: list[dict[str, Any]] = []
+
+    def finish(run: Any, **kwargs: Any) -> dict[str, Any]:
+        asked.append(kwargs)
+        return answers.pop(0)
+
+    monkeypatch.setattr(serve, "finish_pull_request", finish)
+    return asked, answers
+
+
+def _due_now() -> None:
+    """Every followed pull request due at once, as if its interval had passed."""
+    with serve._pull_requests_lock:
+        entries = serve._read_pull_requests()
+        for entry in entries:
+            entry["next_check"] = 0.0
+        serve._write_pull_requests(entries)
+
+
+def test_only_a_pending_pull_request_is_followed():
+    for status in ("merged", "checks_failed", "open", "local", "failed"):
+        serve._track_pull_request({**_PENDING, "status": status}, "run", "goal")
+    assert serve.pull_requests_snapshot() == []
+
+    serve._track_pull_request(_PENDING, "run", "ship it")
+    [entry] = serve.pull_requests_snapshot()
+    assert (entry["status"], entry["number"], entry["goal"]) == ("pending", 12, "ship it")
+
+
+def test_the_monitor_merges_it_once_its_checks_pass(finishes):
+    asked, answers = finishes
+    serve._track_pull_request(_PENDING, "run", "ship it")
+    answers.append({"success": True, "pending": "waiting on test"})
+
+    serve._follow_pull_requests()
+    serve._follow_pull_requests()  # not due again until its interval is up
+
+    assert len(asked) == 1
+    assert asked[0] == {"cwd": None, "branch": "agent/x", "number": 12, "head": "abc123"}
+    assert serve.pull_requests_snapshot()[0]["status"] == "pending"
+
+    _due_now()
+    answers.append({"success": True, "merged": True, "merge_commit": "def4567890",
+                    "default_branch": "main", "warnings": []})
+    mark = _mark()
+    serve._follow_pull_requests()
+
+    assert serve.pull_requests_snapshot()[0]["status"] == "merged"
+    assert any("Pull request #12 merged into main as def4567" in m for m in _messages_since(mark))
+
+
+def test_red_checks_are_reported_and_never_fixed(finishes):
+    """A fix is a run, and the operator starts it."""
+    asked, answers = finishes
+    serve._track_pull_request(_PENDING, "run", "ship it")
+    answers.append({"success": False, "stopped_at": "checks", "checks_failed": ["CI / test"],
+                    "error": "checks: CI / test failed"})
+    mark = _mark()
+
+    serve._follow_pull_requests()
+    _due_now()
+    serve._follow_pull_requests()
+
+    [entry] = serve.pull_requests_snapshot()
+    assert entry["status"] == "checks_failed"
+    assert entry["checks_failed"] == ["CI / test"]
+    assert len(asked) == 1, "a red pull request is not asked about again"
+    assert any("its checks fail (CI / test)" in m for m in _messages_since(mark))
+
+
+def test_it_stops_following_after_repeated_trouble(finishes):
+    """gh signed out, GitHub down, someone else's push: asked a few times, then
+    handed back to the operator rather than asked every minute for a day."""
+    _, answers = finishes
+    serve._track_pull_request(_PENDING, "run", "ship it")
+
+    for attempt in range(serve.PULL_REQUEST_FOLLOW_FAILURES):
+        assert serve.pull_requests_snapshot()[0]["status"] == "pending", attempt
+        answers.append({"success": False, "stopped_at": "checks",
+                        "error": "checks: gh is not signed in here"})
+        _due_now()
+        serve._follow_pull_requests()
+
+    [entry] = serve.pull_requests_snapshot()
+    assert entry["status"] == "stopped"
+    assert "not signed in" in entry["detail"]
+
+
+def test_a_pull_request_closed_without_merging_is_not_asked_about_again(finishes):
+    asked, answers = finishes
+    serve._track_pull_request(_PENDING, "run", "ship it")
+    answers.append({"success": False, "stopped_at": "merge",
+                    "error": "merge: #12 was closed without merging; reopen it on GitHub"})
+
+    serve._follow_pull_requests()
+    _due_now()
+    serve._follow_pull_requests()
+
+    assert serve.pull_requests_snapshot()[0]["status"] == "stopped"
+    assert len(asked) == 1
+
+
+def test_nothing_is_finished_while_a_run_is_in_flight(finishes, monkeypatch):
+    """The run's Builder may be in the same repository, and cleanup switches branches."""
+    asked, _ = finishes
+    serve._track_pull_request(_PENDING, "run", "ship it")
+    monkeypatch.setitem(serve._run_progress, "running", True)
+
+    serve._follow_pull_requests()
+
+    assert asked == []
+
+
+def test_a_run_waits_while_a_pull_request_is_being_finished(monkeypatch):
+    monkeypatch.setitem(serve._pull_request_follow, "running", True)
+    monkeypatch.setitem(serve._pull_request_follow, "number", 12)
+
+    with pytest.raises(ValueError, match="finishing pull request #12"):
+        serve.rpc_run_goal({"goal": "ship it"})
+
+
+def test_a_followed_pull_request_can_be_dismissed():
+    serve._track_pull_request(_PENDING, "run", "ship it")
+    key = serve.pull_requests_snapshot()[0]["key"]
+
+    assert serve.rpc_dismiss_pull_request({"key": key})["pull_requests"] == []
+    with pytest.raises(ValueError, match="No pull request"):
+        serve.rpc_dismiss_pull_request({"key": key})
+
+
+class _PendingGraph:
+    """A one-node graph whose Builder left its pull request waiting on CI."""
+
+    def stream(self, state: dict[str, Any], config_: dict[str, Any]):
+        yield {"builder": {**state, "dwell": dict(_PENDING),
+                           "messages": ["[Builder] pull request: #12 open, waiting"]}}
+
+
+def test_a_run_hands_its_pending_pull_request_to_the_monitor(monkeypatch):
+    monkeypatch.setattr(serve, "graph", _PendingGraph())
+
+    result = serve.rpc_run_goal({"goal": "ship it"})
+
+    assert result["dwell"]["status"] == "pending"
+    [entry] = serve.pull_requests_snapshot()
+    assert (entry["number"], entry["status"]) == (12, "pending")
+    assert serve.rpc_status({})["pull_requests"] == serve.pull_requests_snapshot()

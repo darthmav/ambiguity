@@ -20,7 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from langgraph_agent.self_healing import call_with_retry
+from langgraph_agent.dwell import git_dwell
 
 if TYPE_CHECKING:
     from langgraph_agent.graphrag_server import GraphRAGKnowledgeBase
@@ -168,41 +168,6 @@ def _unexpanded_hint(argv: list[str], stderr: str) -> str | None:
 # directory, the project root -- so one relative path means one place.
 def _project_root() -> Path:
     return Path.cwd().resolve()
-
-
-# Stages of the `git_dwell` pipeline, in the only order they work in, named so
-# a failure can say which stage it reached.
-DWELL_STAGES = ("survey", "branch", "stage", "commit", "push", "pr", "merge")
-
-# What `git_dwell` runs when the caller names no stages: all of them, merge
-# included. A caller who wants the review point names stages without `merge`.
-DWELL_DEFAULT_STAGES = DWELL_STAGES
-
-# What git says when a push failed on the way to the remote rather than at it.
-# Pushing the same commit again is harmless -- the remote either has it or does
-# not -- so these are retried, briefly; a rejected push is the remote answering
-# and is not, and neither is a timeout, which already spent what a retry would.
-_PUSH_FAILED_IN_TRANSIT = (
-    "could not resolve host", "connection reset", "connection refused",
-    "failed to connect", "the remote end hung up unexpectedly", "early eof", "rpc failed",
-)
-PUSH_ATTEMPTS = 3
-
-
-class _PushFailedInTransit(Exception):
-    """A push that never reached the remote, carrying git's own words."""
-
-
-def _branch_name_from(message: str) -> str:
-    """A branch name from a commit message's first line, for a caller that named none.
-
-    Reduced to characters git accepts, since it reaches a remote.
-    """
-    head = (message.splitlines() or [""])[0].lower()
-    # Drop a conventional-commit prefix: the commit carries the type.
-    head = re.sub(r"^(feat|fix|docs|test|chore|refactor|ci|perf)(\([^)]*\))?:\s*", "", head)
-    slug = re.sub(r"[^a-z0-9]+", "-", head).strip("-")[:48].strip("-")
-    return f"agent/{slug or 'change'}"
 
 
 def _resolve_write_path(requested: Any) -> tuple[Path | None, str | None]:
@@ -448,195 +413,17 @@ class MCPClient:
             return False, f"{' '.join(argv)} timed out after {timeout:g}s"
         return done.returncode == 0, ((done.stdout or "") + (done.stderr or "")).strip()
 
-    def _default_branch(self, cwd: str | None = None) -> str:
-        """The branch a PR targets: `origin/HEAD` first, then the usual names.
-
-        The remote's prefix is removed, not everything up to the last slash, so
-        `release/2.0` survives.
-        """
-        ok, out = self._run_vcs(
-            "git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD", cwd=cwd
-        )
-        if ok and out.startswith("refs/remotes/origin/"):
-            return out.removeprefix("refs/remotes/origin/")
-        for name in ("main", "master"):
-            ok, _ = self._run_vcs("git", "show-ref", "--verify", f"refs/heads/{name}", cwd=cwd)
-            if ok:
-                return name
-        return "main"
-
     def _git_dwell(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Run the git pipeline in order, stopping at the first stage that fails.
+        """The git pipeline, from the working tree to a merged pull request (see dwell.py).
 
-        Every stage is a real command with its output recorded, so the result is an
-        account of what happened; a failure names itself in `stopped_at`, so a retry
-        need not re-run what worked.
-
-        *It will not commit onto the default branch*: `branch` creates one when HEAD
-        is the default, named from the message when the caller named none, so the work
-        always arrives through a pull request. *It merges by default*
-        (`--squash --delete-branch`); a caller wanting the review point names stages
-        without `merge`. A push that never reached the remote is retried briefly --
-        pushing a commit again is harmless; nothing else here is retried.
-
-        *`paths` commits only what it names*, whatever else the index holds. *In
-        `cwd`, only that directory's own repository*: git looks upward for one, so
-        a directory inside another repository is refused rather than committing
-        the one around it.
+        In `cwd` when given -- only that directory's own repository: git looks
+        upward for one, so a directory inside another repository is refused rather
+        than committing the one around it.
         """
         cwd, cwd_error = _resolve_cwd(args.get("cwd"))
         if cwd_error is not None:
             return {"success": False, "error": cwd_error}
-        if cwd is not None:
-            ok, top = self._run_vcs("git", "rev-parse", "--show-toplevel", cwd=cwd)
-            if not ok or Path(top).resolve() != Path(cwd).resolve():
-                return {"success": False, "error": (
-                    f"{cwd} is not a git repository of its own, so git_dwell would act "
-                    "on the repository around it. Run `git init` in it first "
-                    f"(terminal_execute with cwd={cwd})."
-                )}
-        paths: list[str] = []
-        for raw in [str(x) for x in (args.get("paths") or [])]:
-            if cwd is None:
-                paths.append(raw)
-                continue
-            # Spelled from the project root, like every other tool's paths, and
-            # handed to git relative to the repository it runs in.
-            inside = Path(raw).resolve()
-            if not inside.is_relative_to(Path(cwd).resolve()):
-                return {"success": False, "error": f"{raw} is outside {cwd}, the repository "
-                        "this git_dwell runs in."}
-            paths.append(str(inside.relative_to(Path(cwd).resolve())) or ".")
-        message = str(args.get("message") or "").strip()
-        requested = [str(x) for x in (args.get("stages") or DWELL_DEFAULT_STAGES)]
-        unknown = [x for x in requested if x not in DWELL_STAGES]
-        if unknown:
-            return {"success": False, "error":
-                    f"Unknown stage(s): {', '.join(unknown)}. "
-                    f"Valid stages, in order: {', '.join(DWELL_STAGES)}."}
-        # Canonical order whatever the request's: "push then commit" is a typo,
-        # not an instruction.
-        stages = [x for x in DWELL_STAGES if x in requested]
-
-        log: list[dict[str, Any]] = []
-
-        def record(stage: str, ok: bool, detail: str) -> None:
-            log.append({"stage": stage, "ok": ok, "detail": detail[:2000]})
-
-        def stop(stage: str, detail: str) -> dict[str, Any]:
-            record(stage, False, detail)
-            return {"success": False, "error": f"{stage}: {detail}",
-                    "stopped_at": stage, "stages": log}
-
-        default = self._default_branch(cwd)
-        ok, branch = self._run_vcs("git", "rev-parse", "--abbrev-ref", "HEAD", cwd=cwd)
-        if not ok:
-            return stop("survey", f"cannot read the current branch: {branch}")
-
-        if "survey" in stages:
-            ok, dirty = self._run_vcs("git", "status", "--porcelain", cwd=cwd)
-            if not ok:
-                return stop("survey", dirty)
-            record("survey", True, f"on {branch} (default {default}); "
-                                   f"{len(dirty.splitlines())} path(s) changed")
-
-        if "branch" in stages:
-            if branch == default:
-                wanted = str(args.get("branch") or "").strip() or _branch_name_from(message)
-                ok, out = self._run_vcs("git", "checkout", "-b", wanted, cwd=cwd)
-                if not ok:
-                    return stop("branch", out)
-                branch = wanted
-                record("branch", True, f"created {branch} off {default}")
-            else:
-                record("branch", True, f"already on {branch}, which is not {default}")
-        elif branch == default and {"commit", "push", "pr", "merge"} & set(stages):
-            return stop("branch", f"refusing to commit onto {default}; include the "
-                                  "'branch' stage, or check out a branch first")
-
-        if "stage" in stages:
-            ok, out = self._run_vcs("git", "add", *(["--", *paths] if paths else ["-A"]), cwd=cwd)
-            if not ok:
-                return stop("stage", out)
-            record("stage", True, f"staged {', '.join(paths) if paths else 'all changes'}")
-
-        if "commit" in stages:
-            if not message:
-                return stop("commit", "no message given; pass `message`")
-            # Asked of the named paths alone, when there are some: what else the
-            # index holds is not this commit's.
-            ok, staged = self._run_vcs(
-                "git", "diff", "--cached", "--name-only", *(["--", *paths] if paths else []),
-                cwd=cwd,
-            )
-            if ok and not staged.strip():
-                # Nothing to commit is an ordinary outcome, not a failure; the
-                # stages that need a commit are dropped.
-                record("commit", True, "nothing staged to commit")
-                stages = [x for x in stages if x not in ("push", "pr", "merge")]
-            else:
-                ok, out = self._run_vcs(
-                    "git", "commit", "-m", message, *(["--", *paths] if paths else []), cwd=cwd
-                )
-                if not ok:
-                    return stop("commit", out)
-                record("commit", True, out.splitlines()[0] if out else "committed")
-
-        if "push" in stages:
-
-            def push() -> str:
-                ok, out = self._run_vcs(
-                    "git", "push", "-u", "origin", branch, timeout=120, cwd=cwd
-                )
-                if not ok:
-                    if any(mark in out.lower() for mark in _PUSH_FAILED_IN_TRANSIT):
-                        raise _PushFailedInTransit(out)
-                    raise RuntimeError(out)
-                return out
-
-            try:
-                call_with_retry(
-                    push,
-                    max_attempts=PUSH_ATTEMPTS,
-                    min_wait=2.0,
-                    max_wait=4.0,
-                    exceptions=(_PushFailedInTransit,),
-                    name="git push",
-                )
-            except Exception as exc:
-                return stop("push", str(exc))
-            record("push", True, f"pushed {branch} to origin")
-
-        if "pr" in stages:
-            ok, existing = self._run_vcs(
-                "gh", "pr", "view", "--json", "url", "-q", ".url", cwd=cwd
-            )
-            if ok and existing.strip().startswith("http"):
-                # A branch already carrying a PR is the ordinary case on a
-                # second pass.
-                record("pr", True, f"already open: {existing.strip()}")
-            else:
-                title = (message.splitlines() or ["Automated change"])[0]
-                ok, out = self._run_vcs(
-                    "gh", "pr", "create", "--base", default, "--head", branch,
-                    "--title", title,
-                    "--body", message or "Opened by the dwell pipeline.",
-                    timeout=120, cwd=cwd,
-                )
-                if not ok:
-                    return stop("pr", out)
-                record("pr", True, out.splitlines()[-1] if out else "pull request opened")
-
-        if "merge" in stages:
-            ok, out = self._run_vcs("gh", "pr", "merge", "--squash", "--delete-branch",
-                                    timeout=120, cwd=cwd)
-            if not ok:
-                return stop("merge", out)
-            record("merge", True, out.splitlines()[-1] if out else "merged")
-
-        return {"success": True, "branch": branch, "default_branch": default,
-                "stages": log,
-                "summary": "; ".join(f"{e['stage']}: {e['detail']}" for e in log)}
+        return git_dwell(self._run_vcs, args, cwd)
 
     def _terminal_execute(self, args: dict[str, Any]) -> dict[str, Any]:
         """Run one program in the project workspace.

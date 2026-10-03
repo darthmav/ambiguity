@@ -5,11 +5,11 @@ The 4-Agent System:
 - Planner writes: plan, next_agent
 - Researcher writes: research, research_status
 - Builder writes: builder_report, files_changed, blockers, failed_verification,
-  unverified, builder_cut_off, lint_failed
+  unverified, builder_cut_off, lint_failed, dwell
 """
 
 from enum import Enum
-from typing import TypedDict
+from typing import Any, TypedDict
 
 
 class ResearchStatus(str, Enum):
@@ -74,6 +74,12 @@ class AgentState(TypedDict):
             `ruff check` after the fixes it is allowed to make. Re-linted every
             pass until clean, and blocking approval whatever expect_failures
             says.
+        dwell: Where the run's git work stands, from the Builder's last
+            `git_dwell`: its `status` ("merged", "pending", "checks_failed",
+            "open", "committed", "local" or "failed"), the branch, the pull
+            request's number and URL, and the head it carries. Empty until a
+            dwell runs. "checks_failed" blocks approval until a dwell sees the
+            checks pass; "pending" is what the console finishes after the run.
         expect_failures: Per-run opt-out, set by the caller and never by an
             agent. A file that runs and fails is still executed, still reported
             and still listed in failed_verification -- it just stops blocking
@@ -97,6 +103,7 @@ class AgentState(TypedDict):
     unverified: list[str]
     builder_cut_off: str  # "" | "turn_cap" | "deadline" | "no_tools"
     lint_failed: list[str]
+    dwell: dict[str, Any]
     discuss_only: bool
     output_dir: str  # "" | "projects/<name>"
     expect_failures: bool
@@ -132,6 +139,7 @@ def initial_state(
         unverified=[],
         builder_cut_off="",
         lint_failed=[],
+        dwell={},
         discuss_only=discuss_only,
         output_dir=output_dir,
         expect_failures=expect_failures,

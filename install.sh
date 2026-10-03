@@ -564,20 +564,20 @@ else
     fi
 
     # A project's own repository starts with no remote, so there git_dwell
-    # commits on a branch and stops at push until someone adds one; what is
+    # commits and skips its remote stages until someone adds one; what is
     # asked below is this checkout's.
     origin="$(git remote get-url origin 2>/dev/null || true)"
     if [ -z "$origin" ]; then
         # A checkout with no remote is legitimate; the pipeline just ends early.
-        echo "  no origin remote: git_dwell will commit on a branch and stop at push"
+        echo "  no origin remote: git_dwell will commit on a branch and skip push, pr, checks and merge"
     elif [[ "$origin" != *github.com[:/]* ]]; then
-        echo "  origin is not on github.com: git_dwell's pr and merge stages use gh and will stop there"
+        echo "  origin is not on github.com: git_dwell's pr, checks and merge stages use gh and will stop there"
     elif ! command -v gh >/dev/null; then
         problem "gh is not installed, so git_dwell stops at its pr stage (drop --no-system, or: sudo pacman -S github-cli)"
     else
         gh_signed_in() { gh auth status --hostname github.com >/dev/null 2>&1; }
         if ! gh_signed_in && interactive; then
-            echo "  gh is not signed in to github.com; git_dwell opens and merges pull requests with it"
+            echo "  gh is not signed in to github.com; git_dwell opens pull requests, reads their checks and merges them with it"
             if gh auth login --hostname github.com --git-protocol https; then
                 # Makes gh git's credential helper for github.com, which is
                 # what lets git_dwell's plain `git push` authenticate. Only
@@ -587,7 +587,7 @@ else
             fi
         fi
         if gh_signed_in; then
-            ok "gh signed in to github.com (git_dwell can open and merge pull requests)"
+            ok "gh signed in to github.com (git_dwell can open, check and merge pull requests)"
         else
             problem "gh is not signed in: run 'gh auth login', then re-run ./install.sh"
         fi

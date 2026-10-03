@@ -86,6 +86,16 @@ body::before{
    the next call through at once instead of waiting out the cooldown. */
 #stats .circuit{color:#ffb4b4;border:1px solid #f8717155;border-radius:4px;
   padding:0 6px;cursor:pointer}
+/* A pull request a run left waiting on its checks: amber while they run, red
+   when they fail or the console stopped following it, green once merged. The
+   number opens it on GitHub; the x clears the chip and stops following it. */
+#stats .pr{color:#f2b544;border:1px solid #f2b54455;border-radius:4px;padding:0 6px;
+  white-space:nowrap}
+#stats .pr.bad{color:#ffb4b4;border-color:#f8717155}
+#stats .pr.ok{color:var(--ok);border-color:#4ade8055}
+#stats .pr a{color:inherit;text-decoration:none}
+#stats .pr button{all:unset;cursor:pointer;margin-left:6px;opacity:.7}
+#stats .pr button:hover{opacity:1}
 #healing td.ok{color:var(--ok)}
 #healing td.bad{color:var(--err)}
 #healing .ev{cursor:default}
@@ -2503,7 +2513,34 @@ function takeHealing(h){
   renderHealing(h);
 }
 
+/* ---------- pull requests ---------- */
+// What the monitor follows: a run's pull request left waiting on its checks,
+// which it merges once they pass. Read whole from `status` every poll; what
+// happened to each also reaches the telemetry through the healing journal.
+const PR_WORDS = {pending: "waiting on CI", merged: "merged", checks_failed: "CI red",
+                  stopped: "needs you", gave_up: "needs you"};
+
+function pullRequestChips(prs){
+  return (prs || []).map(p => {
+    const tone = p.status === "merged" ? " ok" : p.status === "pending" ? "" : " bad";
+    const label = `PR #${p.number} ${PR_WORDS[p.status] || p.status}`;
+    const why = [p.goal ? `Run: ${p.goal}` : "", p.detail || "", ...(p.warnings || [])]
+      .filter(Boolean).join("\n");
+    const link = p.url
+      ? `<a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(label)}</a>` : esc(label);
+    const clear = p.status === "pending" ? "Stop following this pull request" : "Clear this";
+    return `<span class="pr${tone}" title="${esc(why)}">${link}`
+      + `<button data-dismiss-pr="${esc(p.key)}" title="${clear}">&times;</button></span>`;
+  }).join("");
+}
+
 $("#stats").addEventListener("click", async e => {
+  const dismiss = e.target.closest("[data-dismiss-pr]");
+  if(dismiss){
+    try{ await rpc("dismiss_pull_request", {key: dismiss.dataset.dismissPr}); }catch(err){ /* told in telemetry */ }
+    poll(true);
+    return;
+  }
   const chip = e.target.closest("[data-circuit]");
   if(!chip) return;
   try{ await rpc("reset_circuit", {name: chip.dataset.circuit}); }catch(err){ /* told in telemetry */ }
@@ -2544,7 +2581,7 @@ async function pollOnce(quiet){
     // An emptied corpus is the same sentence with a different first clause:
     // counting to zero four times says less than naming the state, and it is
     // what the operator has just this second asked for by pressing Clear.
-    const indexing = indexingChip(st) + healingChip(healing);
+    const indexing = indexingChip(st) + healingChip(healing) + pullRequestChips(st.pull_requests);
     $("#stats").innerHTML = CORPUS === "absent"
       ? `<span class="nocorpus">no corpus &mdash; ${BUILDS_ON_RUN ? "a restart or the next run rebuilds it from the archive" : "nothing indexed"}</span>`+indexing
       : CORPUS === "unavailable"

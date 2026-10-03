@@ -144,7 +144,7 @@ request, so both come back 200.
 
 | Method | Params | Returns |
 |---|---|---|
-| `status` | — | embedding model and device, corpus state, whether a rebuild or a run is in flight |
+| `status` | — | embedding model and device, corpus state, whether a rebuild or a run is in flight, and the pull requests the console is following |
 | `rag_stats` | — | documents, chunks, nodes, edges, graph health, staleness |
 | `list_documents` | — | every document node |
 | `query_graph` | `node_id`, `max_depth`, `min_degree`, `split` | `center_node`, `related_nodes`, `edges` |
@@ -170,6 +170,7 @@ request, so both come back 200.
 | `last_run` | — | the last run's snapshot |
 | `healing` | `since` | circuits, service health, and the healing journal after `since` |
 | `reset_circuit` | `name` | the circuits after closing `name` |
+| `dismiss_pull_request` | `key` | the followed pull requests after dropping `key` (and no longer following it) |
 | `shutdown` | `stop_first` | whether the server is exiting |
 
 `GET /api/status` answers the same payload as `status`: `launch_console.sh`
@@ -206,6 +207,14 @@ ticked. Check `rag_stats` reports non-zero nodes afterwards.
 **The header shows `ollama-daemon down`** — the daemon stopped answering and its
 circuit opened. It closes on its own once a trial call succeeds; click the chip
 to send one now.
+
+**The header shows `PR #N waiting on CI`** — a run's `git_dwell` pushed and
+opened a pull request whose checks outlasted the Builder's deadline. The
+console asks GitHub about it every `PULL_REQUEST_FOLLOW_SECONDS` and merges it
+once they pass; the chip turns green. `CI red` means a check failed and nothing
+was merged — start a run to fix it. `needs you` means the console stopped
+asking (gh signed out, someone else pushed, or a day went by). The number
+opens the pull request; the × clears the chip and stops following it.
 
 **A seat shows NO KEY** — it is pointed at Anthropic and `ANTHROPIC_API_KEY`
 is unset. The default seats are all local Ollama models; if

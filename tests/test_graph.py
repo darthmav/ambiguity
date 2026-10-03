@@ -732,6 +732,23 @@ def test_a_builder_pass_cut_off_before_finishing_blocks_approval(monkeypatch):
     assert "ran out of tool turns" in result["messages"][-1]
 
 
+def test_a_pull_request_whose_checks_fail_blocks_approval(monkeypatch):
+    """CI is the same evidence the proof is, run where the change will land."""
+    result = _gate_with(
+        monkeypatch, dwell={"status": "checks_failed", "checks_failed": ["CI / test (3.12)"]}
+    )
+
+    assert result["verdict"] == Verdict.REVISE.value
+    assert "checks fail (CI / test (3.12))" in result["messages"][-1]
+
+
+def test_a_pull_request_still_waiting_on_its_checks_does_not_block(monkeypatch):
+    """Pending is the console's to finish after the run, not another cycle's."""
+    result = _gate_with(monkeypatch, dwell={"status": "pending", "pending": "waiting on test"})
+
+    assert result["verdict"] == Verdict.APPROVED.value
+
+
 def test_an_unknown_cut_off_still_blocks(monkeypatch):
     """A reason nobody has wording for is still a pass that did not finish."""
     result = _gate_with(monkeypatch, builder_cut_off="something_new")
