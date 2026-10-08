@@ -51,7 +51,7 @@ _T = TypeVar("_T")
 # How long one node may spend on its answer. `LLM_TIMEOUT_SECONDS` bounds the
 # socket: it catches a connection gone quiet, not a model streaming slowly
 # without end, nor a node whose several calls each finish just inside it.
-NODE_DEADLINE_SECONDS = float(os.getenv("NODE_DEADLINE_SECONDS", "150"))
+NODE_DEADLINE_SECONDS = float(os.getenv("NODE_DEADLINE_SECONDS", "180"))
 
 # How many retrieved passages reach the Builder, and how much of each. One
 # number feeds the search and the slice, so the two cannot drift apart. A chunk

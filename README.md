@@ -357,7 +357,7 @@ same files work rootless with Podman:
 
 ```bash
 podman build --format docker -f dockerfile -t ambiguity-console .
-podman run --rm --network host --userns=keep-id --stop-timeout 900 -v "$PWD":/app ambiguity-console
+podman run --rm --network host --userns=keep-id --stop-timeout 1800 -v "$PWD":/app ambiguity-console
 ```
 
 `--stop-timeout` is the same allowance: without it `podman stop` kills the
