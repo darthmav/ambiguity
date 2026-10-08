@@ -1272,7 +1272,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Include the paid Anthropic candidates and configs")
     p.add_argument("--budget", type=float, default=900.0,
                    help="Wall-clock seconds per team run (default: 900)")
-    p.add_argument("--node-deadline", type=float, default=150.0)
+    p.add_argument("--node-deadline", type=float, default=180.0)
     p.add_argument("--builder-deadline", type=float, default=240.0)
     p.add_argument("--llm-timeout", type=float, default=None,
                    help="Seconds one seat call may wait at the socket "
@@ -1340,7 +1340,7 @@ def main(argv: list[str]) -> int:
     # the top of this file, so its socket timeout is set on the module instead
     # (`--llm-timeout`), which every seat call reads when it is built.
     #
-    # These started tighter than the shipped 150s/240s, on the theory that a
+    # These started tighter than the shipped 180s/240s, on the theory that a
     # sweep should be watchable and a wedged seat should not hold it for four
     # minutes. Measurement beat that theory. At a 60s node deadline the qwen
     # Planner was cut twice in one sweep while working normally -- it returned
@@ -1349,7 +1349,7 @@ def main(argv: list[str]) -> int:
     # slow; it reports a working seat as broken, which is the same class of
     # false verdict as scoring a silent Researcher `ok`.
     #
-    # So every deadline here now equals the shipped default -- node 150s,
+    # So every deadline here now equals the shipped default -- node 180s,
     # Builder 240s, and the 60s verification reserve that goes with it. That
     # is the point rather than a coincidence: a seat is being measured for a
     # console that will run it under those numbers, so measuring it under

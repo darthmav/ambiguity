@@ -104,7 +104,7 @@ services:
     restart: "no"
     # As ../docker-compose.yml: outlasts BUILDER_DEADLINE_SECONDS, so a stop
     # lets the run write its snapshot.
-    stop_grace_period: 900s
+    stop_grace_period: 1800s
 
 volumes:
   pgdata:

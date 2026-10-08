@@ -162,7 +162,7 @@ services:
     # teardown -- anything shorter kills the process, and the snapshot with it.
     # README.md's `podman run --stop-timeout` is the same figure, and
     # tests/test_claims.py holds both to it.
-    stop_grace_period: 900s
+    stop_grace_period: 1800s
 
 volumes:
   # The database's data: the container's corpus. `docker compose down -v`
