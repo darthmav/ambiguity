@@ -110,12 +110,14 @@ python example_usage.py
 │   ├── test_research_length.py # How much retrieved evidence reaches the Builder
 │   ├── test_rpc_params.py     # RPC parameters: typed, bounded, refused by name
 │   ├── test_projects.py       # Generated projects: the held-out walk, the write scope, embedding
-│   └── test_spectral_graph.py # The spectral_graph package, against closed-form spectra
+│   ├── test_spectral_graph.py # The spectral_graph package, against closed-form spectra
+│   └── test_dwell_tool.py     # The command-line dwell tool's confinement to this folder
 ├── scripts/
 │   ├── verify_and_test.py     # Manual verification: dependencies, seats, a search, the suite
 │   ├── cloud_smoke.py         # One run with every seat on Anthropic
 │   ├── spectral_benchmark.py  # Graph-architecture sweep behind the A-numbers
-│   └── diagnose_seats.py      # Role probes + team runs per seating
+│   ├── diagnose_seats.py      # Role probes + team runs per seating
+│   └── dwell.py               # The dwell pipeline from the command line, confined to this folder
 ├── frontend/
 │   ├── index.html             # Web console SPA
 │   └── README.md
