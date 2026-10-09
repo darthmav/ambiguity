@@ -8,6 +8,9 @@
 #   * the Ollama daemon and the models the seats and the embedder use -- it
 #     stays on the host, where the GPUs and the weights are;
 #   * a GitHub login (gh), which up.sh hands the container at every start;
+#   * Claude Code with the Playwright MCP server, and the Chromium and npx it
+#     needs, so a Claude session on the host can drive the console on :8081
+#     in a browser (scripts/claude_tools.sh);
 #   * docker/.env, the container's settings, naming your projects folder;
 #   * SearxNG for online research, unless one already answers;
 #   * the image, built once from this checkout; then it starts the console.
@@ -23,7 +26,11 @@
 #   ./docker/install.sh --no-searxng        no online research server
 #   ./docker/install.sh --no-docker-group   keep Docker behind sudo
 #   ./docker/install.sh --no-start          set up and build, do not start
-#   ./docker/install.sh --yes               never prompt (no sign-ins)
+#   ./docker/install.sh --no-claude         no Claude Code, Playwright MCP
+#                                           server or Claude in Chrome
+#   ./docker/install.sh --yes               never prompt (no sign-ins; a
+#                                           missing Claude Code is installed
+#                                           unasked)
 
 set -euo pipefail
 
@@ -31,12 +38,13 @@ cd "$(dirname "$0")/.."
 COMPOSE_FILE=docker/compose.yml
 DENV=docker/.env
 
-PROJECTS_DIR="" SEARXNG=1 DOCKER_GROUP=1 START=1 ASSUME_YES=0
+PROJECTS_DIR="" SEARXNG=1 DOCKER_GROUP=1 START=1 ASSUME_YES=0 CLAUDE=1
 while [ $# -gt 0 ]; do
     case "$1" in
         --projects)   PROJECTS_DIR="${2:?--projects needs a directory}"; shift ;;
         --projects=*) PROJECTS_DIR="${1#--projects=}" ;;
         --no-searxng) SEARXNG=0 ;;
+        --no-claude)  CLAUDE=0 ;;
         --no-docker-group) DOCKER_GROUP=0 ;;
         --no-start)   START=0 ;;
         --yes|-y)     ASSUME_YES=1 ;;
@@ -82,10 +90,12 @@ fi
 # the images, the models, GitHub -- and the image build's own downloads, which
 # go out over this machine's network too. The build forgives a hub it cannot
 # reach (the image fetches the tokenizer on first use), so that one is optional.
+# So are Claude Code's and npm's: the console runs without them.
 step "Network (the hosts this install downloads from)"
+net_groups=(arch dockerhub pypi ollama hf github --optional tokenizer research cloud)
+[ "$CLAUDE" -eq 1 ] && net_groups+=(npm claude)
 NETWORK_OK=1
-if ! scripts/network_check.sh arch dockerhub pypi ollama hf github \
-        --optional tokenizer research cloud; then
+if ! scripts/network_check.sh "${net_groups[@]}"; then
     NETWORK_OK=0
     problem "the network did not let through every host this install needs; allow the entries above"
 fi
@@ -98,14 +108,19 @@ step "System packages (pacman)"
 # No python, no compiler: the image carries its own. git and github-cli are
 # for the host's GitHub login, which the container borrows.
 REQUIRED=(docker docker-compose docker-buildx ollama git github-cli curl)
+# The Playwright MCP server runs on the host through npx, and drives a browser
+# there to reach the console on :8081: the container carries neither for it.
+CLAUDE_PACKAGES=(nodejs npm chromium)
+wanted=("${REQUIRED[@]}")
+[ "$CLAUDE" -eq 1 ] && wanted+=("${CLAUDE_PACKAGES[@]}")
 if ! command -v pacman >/dev/null; then
     echo "  pacman not found: this installer targets Arch / Omarchy." >&2
-    echo "  Install the equivalents of: ${REQUIRED[*]}, then re-run." >&2
+    echo "  Install the equivalents of: ${wanted[*]}, then re-run." >&2
     exit 1
 fi
-mapfile -t missing < <(pacman -T "${REQUIRED[@]}" || true)
+mapfile -t missing < <(pacman -T "${wanted[@]}" || true)
 if [ "${#missing[@]}" -eq 0 ]; then
-    ok "all ${#REQUIRED[@]} packages already installed"
+    ok "all ${#wanted[@]} packages already installed"
 else
     echo "  installing: ${missing[*]}"
     pacman_flags=(-S --needed)
@@ -396,6 +411,29 @@ if [ "$START" -eq 1 ] && [ "${#PROBLEMS[@]}" -eq 0 ]; then
     fi
 elif [ "$START" -eq 1 ]; then
     NOTES+=("not started, since something above needs fixing first; then ./docker/up.sh")
+fi
+
+# ---------------------------------------------------------------------------
+# 9. Claude Code, to drive the console in a browser
+# ---------------------------------------------------------------------------
+
+if [ "$CLAUDE" -eq 1 ]; then
+    step "Claude tools (Claude Code, the Playwright MCP server, Claude in Chrome)"
+    # ../install.sh's step, the same script: a Claude session on the host that
+    # can open the console on :8081 in a browser. After the start, not before
+    # it: none of this is the console's, so nothing here may keep it from
+    # starting. Without the host venv ../install.sh makes, the MCP server is
+    # registered but not test-started; the script's notes join this one's.
+    claude_tools=(scripts/claude_tools.sh install)
+    [ "$ASSUME_YES" -eq 1 ] && claude_tools+=(--yes)
+    claude_notes="$(mktemp)"
+    if ! CLAUDE_TOOLS_NOTES="$claude_notes" "${claude_tools[@]}"; then
+        problem "Claude Code is not fully set up to drive the console; scripts/claude_tools.sh check says what is missing"
+    fi
+    while IFS= read -r claude_note; do
+        if [ -n "$claude_note" ]; then NOTES+=("$claude_note"); fi
+    done <"$claude_notes"
+    rm -f "$claude_notes"
 fi
 
 echo

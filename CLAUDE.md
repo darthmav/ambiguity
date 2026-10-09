@@ -45,6 +45,14 @@ docker compose up --build
 python scripts/diagnose_seats.py --list
 python scripts/diagnose_seats.py --phase probe
 
+# The console as its user, in a real browser (needs the browser extra:
+# pip install -e ".[dev,browser]"); read-only unless --allow
+python scripts/browser_agent.py doctor
+python scripts/browser_agent.py check --spawn --stub-seats --no-rebuild
+
+# One shareable report on the whole machine: GPUs, daemon, models, database, console
+python scripts/diagnose_machine.py --quick
+
 # Run the example
 python example_usage.py
 ```
@@ -112,7 +120,10 @@ python example_usage.py
 │   ├── test_projects.py       # Generated projects: the held-out walk, the write scope, embedding
 │   ├── test_spectral_graph.py # The spectral_graph package, against closed-form spectra
 │   ├── test_dwell_tool.py     # The command-line dwell tool's confinement to this folder
-│   └── test_ollama_keepalive.py # The keep-alive drop-in, against stand-in sudo and systemctl
+│   ├── test_ollama_keepalive.py # The keep-alive drop-in, against stand-in sudo and systemctl
+│   ├── test_browser_agent.py  # The browser agent's guard, passes and tools; live ones under BROWSER_TESTS=1
+│   ├── test_diagnose_machine.py # The machine diagnostic: parsers, redaction, a degraded machine
+│   └── test_claude_tools.py   # Claude Code setup, against stand-in claude, npx and git
 ├── scripts/
 │   ├── verify_and_test.py     # Manual verification: dependencies, seats, a search, the suite
 │   ├── cloud_smoke.py         # One run with every seat on Anthropic
@@ -120,7 +131,10 @@ python example_usage.py
 │   ├── diagnose_seats.py      # Role probes + team runs per seating
 │   ├── dwell.py               # The dwell pipeline from the command line, confined to this folder
 │   ├── network_check.sh       # Which download hosts the network lets through; the installers' first step
-│   └── ollama_keepalive.sh    # systemd keeps the daemon running: enabled at boot, restarted on any exit
+│   ├── ollama_keepalive.sh    # systemd keeps the daemon running: enabled at boot, restarted on any exit
+│   ├── browser_agent.py       # The console in a real browser: scripted passes, one-shot tools, an RPC guard
+│   ├── diagnose_machine.py    # One redacted, shareable report on the machine the console runs on
+│   └── claude_tools.sh        # Claude Code, its claude.ai sign-in and the Playwright MCP server, per machine
 ├── frontend/
 │   ├── index.html             # Web console SPA
 │   └── README.md
@@ -430,6 +444,21 @@ a Builder that runs programs. No CORS header is sent; the page is same-origin.
   and the port is 8081, so a console on the host shares nothing with it), and `docker stop`
   asks for the same exit the console's X does.
 
+- **The browser agent is the console's user, and read-only unless told.**
+  `scripts/browser_agent.py` routes every `/rpc` call its pages make through a
+  guard: a mutating method needs its `--allow` key *and* a loopback console, and
+  `clear_corpus`, `set_seat`, `set_thinking`, `embed_project` and
+  `dismiss_pull_request` are never sent. `--spawn` runs a console of its own
+  from a temporary directory (own corpus schema, `RUNS_DIR`,
+  `FOLLOW_PULL_REQUESTS=0`); `--stub-seats` sets every key to an empty string,
+  which `load_dotenv` cannot refill, and refuses to go on unless all four seats
+  report a stub. Chromium's sandbox is off only as root, and Playwright is
+  imported lazily, so CI tests the agent with none. `diagnose_machine.py` is
+  read-only unless `--with-runs` and never starts a console; everything it
+  writes passes through its `redact`. No `.mcp.json` is committed: the
+  Playwright MCP server is registered per machine (`scripts/claude_tools.sh`),
+  and `.claude/settings.json` denies its `browser_run_code_unsafe`.
+
 ## Self-healing
 
 `self_healing` wraps calls rather than living inside them: `call_with_retry`
@@ -484,7 +513,10 @@ closes it. Where it is used:
   merges only that head. Never while a run is in flight, and a run is refused
   while one is being finished. A red check is journalled and shown, never
   fixed; repeated trouble or `PULL_REQUEST_FOLLOW_HOURS` stops it. The header
-  shows each as a chip.
+  shows each as a chip. `FOLLOW_PULL_REQUESTS=0` switches the follow off and
+  `RUNS_DIR` moves `runs/`, for a second console that only looks (the browser
+  agent's `--spawn`, the installer's console check): it must never merge the
+  real console's pull requests.
 - **The monitor** (`_self_healing_monitor` in `serve.py`) checks the daemon,
   SearxNG and the corpus every `HEALTH_CHECK_SECONDS`, logs each change of
   health, re-probes open circuits, and rebuilds a corpus whose last rebuild
