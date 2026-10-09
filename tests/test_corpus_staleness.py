@@ -252,3 +252,21 @@ def test_an_emptied_corpus_is_not_accused_of_drifting(monkeypatch, tmp_path):
     drifted = serve.rpc_rag_stats({})
     assert drifted["corpus"] == "indexed"
     assert drifted["staleness"]["stale"] is True
+
+
+def test_an_absent_corpus_says_whether_there_is_anything_to_build_it_from(monkeypatch, tmp_path):
+    """"A restart or the next run rebuilds it from the archive" is no help when
+    the archive is empty -- a fresh machine -- so the header is told which."""
+    import serve
+    from langgraph_agent.corpus_health import forget_cached_walk
+
+    monkeypatch.setattr(serve, "_open_kb", lambda: None)
+    monkeypatch.chdir(tmp_path)
+    forget_cached_walk()
+    assert serve.rpc_rag_stats({})["archive"] == 0
+
+    (tmp_path / "uploads").mkdir()
+    (tmp_path / "uploads" / "notes.md").write_text("The Planner breaks it down.\n")
+    forget_cached_walk()
+    assert serve.rpc_rag_stats({})["archive"] == 1
+    forget_cached_walk()

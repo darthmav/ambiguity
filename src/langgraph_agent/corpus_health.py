@@ -72,6 +72,16 @@ def _walk(root: str, use_cache: bool) -> tuple[frozenset[str], tuple[str, ...]]:
     return answer
 
 
+def archive_size(root: str = ".") -> int:
+    """How many files a rebuild would index -- the walk's indexable count, cached.
+
+    What tells "nothing indexed yet" from "nothing to index": on a fresh machine
+    a restart or a run rebuilds from an archive that holds nothing, and saying
+    either would help sent the operator round that loop.
+    """
+    return len(_walk(root, use_cache=True)[0])
+
+
 def forget_cached_walk() -> None:
     """Drop the cached walk, so the next answer is taken fresh.
 

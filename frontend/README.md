@@ -145,7 +145,7 @@ request, so both come back 200.
 | Method | Params | Returns |
 |---|---|---|
 | `status` | — | embedding model and device, corpus state, whether a rebuild or a run is in flight, and the pull requests the console is following |
-| `rag_stats` | — | documents, chunks, nodes, edges, graph health, staleness |
+| `rag_stats` | — | documents, chunks, nodes, edges, graph health, staleness; with no corpus, how many archive files a rebuild would index (`archive`) |
 | `list_documents` | — | every document node |
 | `query_graph` | `node_id`, `max_depth`, `min_degree`, `split` | `center_node`, `related_nodes`, `edges` |
 | `graph_overview` | `min_degree`, `include_isolated` | the whole corpus as one drawable graph |

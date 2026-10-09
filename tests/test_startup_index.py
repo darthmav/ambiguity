@@ -562,3 +562,21 @@ def test_the_stop_interrupts_a_wait(nowhere, monkeypatch, postgres):
 
     assert report["source"] == "busy_elsewhere"
     assert time.monotonic() - started < 5.0  # not the 30s it was told to wait
+
+
+def test_a_build_that_failed_does_not_blame_the_files():
+    """Every file failing to embed read as "too large or unreadable", which sent
+    the operator to the files when the tokenizer or the daemon was the cause."""
+    import serve
+
+    failed = serve._corpus_feed_line({
+        "source": "built", "corpus": "empty", "indexed": 0,
+        "errors": ["uploads/notes.md: The embedding tokenizer is not cached"],
+    })
+    assert "too large or unreadable" not in failed
+    assert "uploads/notes.md: The embedding tokenizer is not cached" in failed
+
+    oversized = serve._corpus_feed_line({
+        "source": "built", "corpus": "empty", "indexed": 0, "skipped": 1, "errors": [],
+    })
+    assert "too large or unreadable" in oversized

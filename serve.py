@@ -58,6 +58,7 @@ from langgraph_agent.config import (  # noqa: E402
 )
 from langgraph_agent.control import ACTIVITY, EMBEDDER_ACTIVITY, RUN_CONTROL  # noqa: E402
 from langgraph_agent.corpus_health import (  # noqa: E402
+    archive_size,
     corpus_staleness,
     forget_cached_walk,
 )
@@ -249,9 +250,16 @@ def rpc_rag_stats(_: dict[str, Any]) -> dict[str, Any]:
     kb_or_none = _open_kb()
     if kb_or_none is None:
         state, note = absent_corpus()
+        try:
+            archive: int | None = archive_size()
+        except Exception:  # pragma: no cover - a walk that cannot run
+            archive = None
         return {
             "corpus": state,
             "note": note,
+            # What a rebuild would index. Zero is the fresh machine, where only
+            # an upload or online research gives the corpus anything.
+            "archive": archive,
             "total_documents": 0,
             "total_chunks": 0,
             "total_nodes": 0,
@@ -1405,7 +1413,8 @@ def _corpus_feed_line(report: dict[str, Any], *, when: str = "before the run") -
     # Named, not only counted: a count says the corpus is short and nothing
     # about whether the fix is a rebuild, a freed card or a file.
     note = (
-        f" {len(errors)} file(s) failed to index: {'; '.join(errors[:3])}"
+        # Each error is a sentence of its own, whose full stop this one supplies.
+        f" {len(errors)} file(s) failed to index: {'; '.join(e.rstrip('.') for e in errors[:3])}"
         + (f"; and {len(errors) - 3} more." if len(errors) > 3 else ".")
         if errors
         else ""
@@ -1418,10 +1427,16 @@ def _corpus_feed_line(report: dict[str, Any], *, when: str = "before the run") -
             else "The corpus on this machine was empty"
         )
         if not report.get("indexed"):
+            # A failure names itself in `note`; blaming size or encoding for it
+            # sent the reader to the files when the embedder was the cause.
+            why = (
+                "no file the walk offered could be indexed."
+                if errors
+                else "every file the walk offered was too large or unreadable."
+            )
             return (
-                f"[Corpus] {was}, and indexing produced nothing: every file the "
-                f"walk offered was too large or unreadable.{note} The Researcher "
-                "has nothing to retrieve."
+                f"[Corpus] {was}, and indexing produced nothing: {why}{note} The "
+                "Researcher has nothing to retrieve."
             )
         return (
             f"[Corpus] {was}, so the archive was indexed {when}: "
@@ -1660,6 +1675,24 @@ def _run_payload(
     return payload
 
 
+def _drop_unused_project(output_dir: str, created: bool) -> bool:
+    """Remove the project folder this run made and never wrote to; True if it went.
+
+    A run on "New project…" names a folder after its goal before the Builder
+    starts. One that failed, was stopped or wrote nothing left it there empty:
+    offered in the dropdown, listed with an Embed button, and named in the
+    verdict as where the run's work was stored. A folder that existed before
+    the run is the operator's, and is never touched.
+    """
+    if not (created and output_dir):
+        return False
+    try:
+        Path(output_dir).rmdir()  # refused unless it is empty
+    except OSError:
+        return False
+    return True
+
+
 def rpc_run_goal(params: dict[str, Any]) -> dict[str, Any]:
     """Run a goal through the four-agent loop and return the final state.
 
@@ -1724,6 +1757,7 @@ def rpc_run_goal(params: dict[str, Any]) -> dict[str, Any]:
     over_budget = False
     stopped = False
     node_at_stop = ""
+    created_project = False
 
     try:
         HEALING.start_healing_session(run_id)
@@ -1740,6 +1774,7 @@ def rpc_run_goal(params: dict[str, Any]) -> dict[str, Any]:
         # limits, so their time is not charged to it.
         started = time.monotonic()
         if output_dir:
+            created_project = not Path(output_dir).exists()
             Path(output_dir).mkdir(parents=True, exist_ok=True)
         # Streamed rather than invoked, so the last state survives the
         # recursion ceiling: `graph.invoke` raises with no partial result.
@@ -1791,6 +1826,7 @@ def rpc_run_goal(params: dict[str, Any]) -> dict[str, Any]:
             elapsed_s=elapsed,
             web_research=research_report,
             project_embedded=bool(project) and project in embedded_projects(),
+            project_removed=_drop_unused_project(output_dir, created_project),
         )
         _save_snapshot(payload)
         return payload
@@ -1805,6 +1841,7 @@ def rpc_run_goal(params: dict[str, Any]) -> dict[str, Any]:
             elapsed_s=int(time.monotonic() - started),
             web_research=research_report,
             error=str(exc),
+            project_removed=_drop_unused_project(output_dir, created_project),
         ))
         raise
     finally:

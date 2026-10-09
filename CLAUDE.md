@@ -437,7 +437,9 @@ service that keeps failing until one trial call after its cooldown succeeds
 its lock and never holds it across a call, so it never serializes them),
 and every action lands in the healing journal (`get_healing_logger()`), which
 the console reads and a run's snapshot carries (each run is one healing
-session). Where it is used:
+session). An open spell is one story however long it lasts: its first refusal
+and first failed trial are journalled, the rest counted into the line that
+closes it. Where it is used:
 
 - **The database is one circuit, `POSTGRES`** (`corpus_store.py`), opened only
   by a server that cannot be reached (`database_unreachable`: no SQLSTATE, or a

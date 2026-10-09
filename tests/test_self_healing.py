@@ -344,6 +344,58 @@ def test_a_failed_trial_reopens_the_circuit_for_another_cooldown():
         circuit.call(lambda: "refused")
 
 
+def test_an_outage_is_journalled_once_however_long_it_lasts():
+    """A daemon left down with the console open wrote the same refusal seventy
+    times a minute, and a failed trial re-announced "OPENED after 3 failures"
+    every cooldown: the 500-event journal held six minutes of one line. Now a
+    spell says each thing once and counts the rest, and the close reports them."""
+    journal = get_healing_logger()
+    mark = journal.events()[-1]["seq"] if journal.events() else 0
+    circuit = Circuit("long_outage", failure_threshold=1, recovery_timeout=0.05)
+
+    def down() -> None:
+        raise ConnectionError("down")
+
+    with pytest.raises(ConnectionError):
+        circuit.call(down)
+    for _ in range(3):  # three cooldowns, three failed trials
+        for _ in range(20):
+            with pytest.raises(CircuitOpenError):
+                circuit.call(lambda: "refused")
+        time.sleep(0.06)
+        with pytest.raises(ConnectionError):
+            circuit.call(down)
+    time.sleep(0.06)
+    assert circuit.call(lambda: "up") == "up"
+
+    events = [e for e in journal.events(since=mark) if e.get("function") == "long_outage"]
+    actions = [e["action"] for e in events]
+    assert actions == ["circuit_opened", "circuit_prevented", "circuit_half_open",
+                       "circuit_trial_failed", "circuit_closed"]
+    closed = events[-1]
+    assert (closed["refused"], closed["failed_trials"]) == (60, 3)
+    assert "60 call(s) refused, 3 trial(s) failed" in closed["message"]
+
+
+def test_a_new_outage_is_journalled_afresh():
+    """The counts belong to one spell: after a close, the next outage's first
+    refusal and first failed trial are news again."""
+    journal = get_healing_logger()
+    mark = journal.events()[-1]["seq"] if journal.events() else 0
+    circuit = Circuit("second_outage", failure_threshold=1, recovery_timeout=0.05)
+    for _ in range(2):
+        with pytest.raises(ConnectionError):
+            circuit.call(lambda: (_ for _ in ()).throw(ConnectionError("down")))
+        with pytest.raises(CircuitOpenError):
+            circuit.call(lambda: "refused")
+        time.sleep(0.06)
+        assert circuit.call(lambda: "up") == "up"
+    actions = [e["action"] for e in journal.events(since=mark)
+               if e.get("function") == "second_outage"]
+    assert actions == ["circuit_opened", "circuit_prevented", "circuit_half_open",
+                       "circuit_closed"] * 2
+
+
 def test_a_success_clears_the_count_of_a_closed_circuit():
     circuit = Circuit("count_clears", failure_threshold=2, recovery_timeout=60)
     for _ in range(3):

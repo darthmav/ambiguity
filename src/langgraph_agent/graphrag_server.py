@@ -51,7 +51,7 @@ from langgraph_agent.projects import (
     set_project_embedded,
     skipped_dir,
 )
-from langgraph_agent.self_healing import Circuit, CircuitOpenError, call_with_retry
+from langgraph_agent.self_healing import Circuit, CircuitOpenError, call_with_retry, exception_chain
 
 # The embedding model that builds and searches the corpus, served by the local
 # daemon. There is exactly one: vectors from two models share no space, so a
@@ -143,6 +143,29 @@ class EmbedderLoadFailed(RuntimeError):
     """
 
 
+class TokenizerUnavailable(OSError):
+    """The embedding tokenizer is neither cached nor fetchable, so nothing can be chunked.
+
+    transformers words this as advice about a local directory of the same name,
+    which sent the reader looking for one; the cause it wraps -- a proxy's 403,
+    a name that does not resolve -- is the part worth reading, so it leads.
+    """
+
+    def __init__(self, exc: BaseException) -> None:
+        # The first error in the chain that is not transformers' own bare
+        # OSError: the HTTP client's, or the socket's.
+        chain = exception_chain(exc)
+        cause = next((e for e in chain if type(e) not in (OSError, ValueError)), chain[0])
+        reason = str(cause).strip().splitlines()[0] if str(cause).strip() else ""
+        super().__init__(
+            f"The embedding tokenizer ({EMBEDDING_TOKENIZER_NAME}) is not cached on this "
+            f"machine, and Hugging Face did not supply it ({type(cause).__name__}"
+            f"{': ' + reason if reason else ''}). Passages are cut with it, so nothing "
+            "can be embedded until it arrives: ./install.sh caches it, and "
+            "`scripts/network_check.sh tokenizer` says whether huggingface.co is reachable."
+        )
+
+
 class OllamaEmbedder:
     """An Ollama embedding model behind the two things the corpus asks of one.
 
@@ -187,7 +210,10 @@ class OllamaEmbedder:
                     EMBEDDING_TOKENIZER_NAME, local_files_only=True
                 )
             except (OSError, ValueError):
-                self._tokenizer = AutoTokenizer.from_pretrained(EMBEDDING_TOKENIZER_NAME)
+                try:
+                    self._tokenizer = AutoTokenizer.from_pretrained(EMBEDDING_TOKENIZER_NAME)
+                except (OSError, ValueError) as exc:
+                    raise TokenizerUnavailable(exc) from exc
         return self._tokenizer
 
     def encode(
@@ -1683,9 +1709,21 @@ def store_uploaded_document(
     # Read before the write, so "replaced" is a fact. Re-uploading a name is
     # how a document is corrected; `add_document` removes its previous chunks.
     replaced = path.exists()
+    previous = path.read_bytes() if replaced else None
     path.write_text(content, encoding="utf-8")
 
-    chunks = kb.add_document(str(path), content, _document_metadata(path))
+    try:
+        chunks = kb.add_document(str(path), content, _document_metadata(path))
+    except BaseException:
+        # The archive goes back to how it was. The file is what the next
+        # rebuild embeds, so leaving it stored the document the console was
+        # told was "not stored" -- and a failed re-upload left the corpus
+        # holding the chunks of a version no longer on disk.
+        if previous is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(previous)
+        raise
 
     report: dict[str, Any] = {
         "path": str(path),

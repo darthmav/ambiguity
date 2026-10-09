@@ -829,6 +829,43 @@ def test_embedding_goes_in_batches_of_the_cap(tmp_path):
     assert all(call.get("batch_size") == EMBEDDING_BATCH_SIZE for call in embedder.calls)
 
 
+def test_a_tokenizer_nobody_can_supply_says_why_in_one_sentence(monkeypatch):
+    """transformers' own wording blamed "a local directory with the same name";
+    the proxy's 403 underneath it was the cause, and the fix is the network."""
+    import sys
+    import types
+
+    from langgraph_agent.graphrag_server import (
+        EMBEDDING_TOKENIZER_NAME,
+        OllamaEmbedder,
+        TokenizerUnavailable,
+    )
+
+    class ProxyError(Exception):
+        pass
+
+    class _AutoTokenizer:
+        @staticmethod
+        def from_pretrained(name, local_files_only=False):
+            if local_files_only:
+                raise OSError("not in the local cache")
+            try:
+                raise ProxyError("403 Forbidden")
+            except ProxyError as cause:
+                raise OSError(f"Can't load the configuration of '{name}'. If you were "
+                              "trying to load it from 'https://huggingface.co/models', make "
+                              "sure you don't have a local directory with the same name.") from cause
+
+    monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(AutoTokenizer=_AutoTokenizer))
+
+    with pytest.raises(TokenizerUnavailable) as raised:
+        _ = OllamaEmbedder(EMBEDDING_TOKENIZER_NAME).tokenizer
+    message = str(raised.value)
+    assert "ProxyError: 403 Forbidden" in message
+    assert "local directory" not in message
+    assert isinstance(raised.value, OSError), "callers that catch OSError still do"
+
+
 def test_the_tokenizer_is_loaded_from_the_cache_before_the_network(monkeypatch):
     """Loading by name asked huggingface.co whenever the chunker first ran."""
     import sys

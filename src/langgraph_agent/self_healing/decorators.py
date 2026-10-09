@@ -63,9 +63,13 @@ def exception_chain(exc: BaseException) -> list[BaseException]:
 class CircuitOpenError(Exception):
     """A call refused without being attempted, because its circuit is open."""
 
-    def __init__(self, circuit: str, retry_in: float, *, testing: bool = False) -> None:
+    def __init__(
+        self, circuit: str, retry_in: float, *, testing: bool = False, first_refusal: bool = False
+    ) -> None:
         self.circuit = circuit
         self.retry_in = retry_in
+        # The first call this open spell refused: the one worth journalling.
+        self.first_refusal = first_refusal
         if testing:
             detail = "a trial call is testing it now"
         else:
@@ -85,6 +89,13 @@ class _Breaker:
     `reset_timeout` has passed; then one caller becomes the trial and the
     circuit is half-open, refusing the rest until the trial ends. The trial
     closes it by succeeding and reopens it by failing.
+
+    An outage is one story however long it lasts -- opened, refusing, still
+    down, back -- so a spell journals its first refusal and its first failed
+    trial and counts the rest, reporting them when it closes. Journalled call
+    by call, a daemon that stayed down wrote the same refusal seventy times a
+    minute while the console was open, and pushed everything else out of the
+    journal within minutes.
     """
 
     def __init__(
@@ -108,6 +119,9 @@ class _Breaker:
         # settle the state a later trial is testing.
         self._trial = 0
         self._trial_running = False
+        # This open spell's refused calls and failed trials, since it opened.
+        self._refused = 0
+        self._failed_trials = 0
 
     def retry_in(self) -> float:
         """Seconds until an open circuit lets a trial call through; 0 if it would now."""
@@ -124,15 +138,21 @@ class _Breaker:
             if self.state == STATE_CLOSED:
                 return 0
             if self.state == STATE_OPEN and self.retry_in() > 0:
-                raise CircuitOpenError(self.name, self.retry_in())
+                self._refused += 1
+                raise CircuitOpenError(
+                    self.name, self.retry_in(), first_refusal=self._refused == 1
+                )
             if self._trial_running:
-                raise CircuitOpenError(self.name, 0.0, testing=True)
-            became_half_open = self.state != STATE_HALF_OPEN
+                self._refused += 1
+                raise CircuitOpenError(
+                    self.name, 0.0, testing=True, first_refusal=self._refused == 1
+                )
+            first_trial = self.state != STATE_HALF_OPEN and not self._failed_trials
             self.state = STATE_HALF_OPEN
             self._trial += 1
             self._trial_running = True
             trial = self._trial
-        if became_half_open:
+        if first_trial:
             self._logger.log_circuit_half_open(self.name)
         return trial
 
@@ -140,7 +160,7 @@ class _Breaker:
         """Record how a call admitted by `admit` ended: `exc` None for success."""
         failed = exc is not None and self._counts(exc)
         interrupted = exc is not None and not isinstance(exc, Exception)
-        opened = closed = False
+        opened = closed = trial_failed = False
         with self._lock:
             ours = trial != 0 and trial == self._trial and self._trial_running
             if ours:
@@ -150,7 +170,9 @@ class _Breaker:
                 return
             if ours and self.state == STATE_HALF_OPEN:
                 if failed:
-                    self.state, self._opened_at, opened = STATE_OPEN, time.monotonic(), True
+                    self.state, self._opened_at = STATE_OPEN, time.monotonic()
+                    self._failed_trials += 1
+                    trial_failed = self._failed_trials == 1
                 else:
                     self.state, self.fail_counter, closed = STATE_CLOSED, 0, True
             elif self.state == STATE_CLOSED:
@@ -158,13 +180,19 @@ class _Breaker:
                     self.fail_counter += 1
                     if self.fail_counter >= self.fail_max:
                         self.state, self._opened_at, opened = STATE_OPEN, time.monotonic(), True
+                        self._refused = self._failed_trials = 0
                 else:
                     self.fail_counter = 0
             failures = self.fail_counter
+            refused, failed_trials = self._refused, self._failed_trials
+            if closed:
+                self._refused = self._failed_trials = 0
         if opened:
             self._logger.log_circuit_opened(self.name, failures)
+        if trial_failed:
+            self._logger.log_circuit_trial_failed(self.name, self.reset_timeout)
         if closed:
-            self._logger.log_circuit_closed(self.name)
+            self._logger.log_circuit_closed(self.name, refused, failed_trials)
 
     def open(self) -> bool:
         """Open the circuit now; False if it already was."""
@@ -173,6 +201,7 @@ class _Breaker:
                 return False
             self.state, self._opened_at = STATE_OPEN, time.monotonic()
             self._trial_running = False
+            self._refused = self._failed_trials = 0
         self._logger.log_circuit_opened(self.name, 0)
         return True
 
@@ -182,8 +211,10 @@ class _Breaker:
             was = self.state
             self.state, self.fail_counter, self._opened_at = STATE_CLOSED, 0, None
             self._trial_running = False
+            refused, failed_trials = self._refused, self._failed_trials
+            self._refused = self._failed_trials = 0
         if was != STATE_CLOSED:
-            self._logger.log_circuit_closed(self.name)
+            self._logger.log_circuit_closed(self.name, refused, failed_trials)
 
 
 # Every circuit this process has defined, by name.
@@ -256,11 +287,15 @@ class Circuit:
         try:
             trial = self._breaker.admit()
         except CircuitOpenError as refusal:
-            self._logger.error(
-                f"Circuit breaker preventing call to '{self.name}': {refusal}",
-                action="circuit_prevented",
-                function=self.name,
-            )
+            # The rest of the spell's refusals are counted, and reported when
+            # the circuit closes.
+            if refusal.first_refusal:
+                self._logger.warning(
+                    f"Circuit breaker preventing call to '{self.name}': {refusal}. "
+                    "Further refused calls are counted until it closes.",
+                    action="circuit_prevented",
+                    function=self.name,
+                )
             raise
         try:
             yield

@@ -887,11 +887,8 @@ function draw(ns, es, emptyNote){
   if(GRAPH_HOLD) return clearGraph(GRAPH_HOLD);
   const svg = $("#g"), W = svg.clientWidth || 900, H = svg.clientHeight || 520;
   $("#gempty").style.display = ns.length ? "none" : "grid";
-  if(!ns.length) $("#gempty").innerHTML = emptyNote || (CORPUS === "absent"
-    ? "No corpus &mdash; nothing is indexed until something asks for it."
-      + (BUILDS_ON_RUN ? "<br>Start a run: it rebuilds the corpus from the archive before the Architect opens."
-                       : "<br><code>REBUILD_CORPUS</code> is off, so nothing will.")
-    : "No graph yet &mdash; start a run and the corpus is rebuilt before it.");
+  if(!ns.length) $("#gempty").innerHTML = emptyNote
+    || `${CORPUS === "absent" ? "No corpus" : "No graph yet"} &mdash; ${esc(corpusHint())}.`;
 
   NODES = ns.map((n, i) => ({...n,
     x: W/2 + Math.cos(i/ns.length*6.283) * Math.min(W,H)*.3,
@@ -1278,6 +1275,26 @@ let CORPUS = "absent";
 // false, and the absent state is the one place someone looks to find out why
 // retrieval came back with nothing.
 let BUILDS_ON_RUN = true;
+// How many files a rebuild would index, from rag_stats; null until known. Zero
+// is a fresh machine, where neither a restart nor a run gives the corpus
+// anything -- only an upload or online research does.
+let ARCHIVE = null;
+// Archive files the corpus does not hold while it holds nothing at all: a
+// rebuild that failed on every one, which the header otherwise passed over.
+let UNINDEXED = 0;
+// What fills an empty corpus, said once for the header, the graph and the list.
+function corpusHint(){
+  // First, because an upload and a run's research embed what they bring
+  // whether or not anything rebuilds.
+  if(ARCHIVE === 0) return "nothing to index yet: upload a document, or tick research online on a run";
+  if(!BUILDS_ON_RUN) return "REBUILD_CORPUS is off, so nothing will build it";
+  if(UNINDEXED) return `${UNINDEXED} archive file(s) did not index; the [Corpus] line in the console log says why`;
+  return "a restart or the next run rebuilds it from the archive";
+}
+// The titles the markup gives the two buttons, read once: they are what the
+// buttons do. The Clear one says that uploads and fetched pages are deleted
+// from disk, and a copy of it kept here went stale without that warning.
+const CORPUS_BUTTON_TITLES = {ex: $("#exbtn").title, clr: $("#clrbtn").title};
 function setCorpusState(state){
   CORPUS = state;
   // `unavailable` is a database that cannot be asked: nothing to export or
@@ -1289,12 +1306,12 @@ function setCorpusState(state){
     ? "The corpus database cannot be reached — nothing to export until it answers."
     : absent
     ? "No corpus has been indexed — nothing to export."
-    : "Download the whole corpus as one JSON file — the graph plus every chunk and its metadata. Embeddings are left out; a reindex regenerates them locally.";
+    : CORPUS_BUTTON_TITLES.ex;
   $("#clrbtn").title = state === "unavailable"
     ? "The corpus database cannot be reached — nothing to clear until it answers."
     : absent
     ? "No corpus has been indexed — nothing to clear."
-    : "Empty the corpus: its chunks, graph and floor go in one database transaction, leaving an empty store — the same shape a reindex leaves. Refused while a run is in flight.";
+    : CORPUS_BUTTON_TITLES.clr;
 }
 
 /* ---------- generated projects ---------- */
@@ -1368,9 +1385,7 @@ async function loadDocs(){
   if(r.corpus) setCorpusState(r.corpus);
   $("#docs").innerHTML = docs.length ? docs.map(d =>
     `<div class="doc" data-id="${esc(d.id)}"><span>${esc(d.title)}</span><span>${esc(d.id)}</span></div>`).join("")
-    : (CORPUS === "absent"
-        ? `<div class="muted">no corpus — ${BUILDS_ON_RUN ? "a restart or the next run rebuilds it from the archive" : "REBUILD_CORPUS is off, so nothing will build one"}</div>`
-        : `<div class="muted">corpus is empty — ${BUILDS_ON_RUN ? "a restart or the next run rebuilds it from the archive" : "REBUILD_CORPUS is off, so nothing will rebuild it"}</div>`);
+    : `<div class="muted">${CORPUS === "absent" ? "no corpus" : "corpus is empty"} — ${esc(corpusHint())}</div>`;
   $$("#docs .doc").forEach(el => el.onclick = () => {
     $("#gnode").value = el.dataset.id;
     $$(".tab").find(t => t.dataset.p === "graph").click();
@@ -1855,6 +1870,9 @@ async function run(){
     ? ($("#eng-project").value.trim() || projectFromGoal(goal))
     : where;
   CURRENT.inflight = true; CURRENT.stopping = false; CURRENT.runId = "";
+  // The snapshot on screen before this run: a failure renders the server's
+  // snapshot only if this run wrote a newer one.
+  const priorSnapshot = SHOWN_SNAPSHOT;
   setRunButtons();
   $("#director").innerHTML += `<div class="msg user">${esc(goal)}`
     + (expectFail ? ` <span class="badge">expect failures</span>` : "")
@@ -1931,18 +1949,26 @@ async function run(){
   }catch(e){
     const live = $("#run-live");
     if(live) live.remove();
-    // The director pane is where the goal was typed and where a finished run
-    // answers. Reporting the failure anywhere else leaves that pane showing
-    // the goal and nothing after it, which reads as a request that was never
-    // sent rather than one that died on the first call.
-    $("#director").innerHTML +=
-      `<div class="msg sys"><b>Run failed</b> <span class="badge bad">FAIL</span>\n\n${esc(e.message)}</div>`;
-    $("#director").scrollTop = $("#director").scrollHeight;
+    // A failed run still produced whatever it produced, and the server kept it
+    // -- but only a run that started writes a snapshot. One refused before it
+    // began (a bad project name, a run already going) leaves the last run's,
+    // which used to be rendered under the refusal as if it had followed it.
+    let snapshot = null;
+    try{ snapshot = (await rpc("last_run", {}, true)).snapshot; }catch(err){ /* offline */ }
+    if(snapshot && snapshot.run_id && snapshot.run_id !== priorSnapshot){
+      renderRun(snapshot);
+    }else{
+      // The director pane is where the goal was typed and where a finished run
+      // answers. Reporting the failure anywhere else leaves that pane showing
+      // the goal and nothing after it, which reads as a request that was never
+      // sent rather than one that died on the first call.
+      $("#director").innerHTML +=
+        `<div class="msg sys"><b>Run failed</b> <span class="badge bad">FAIL</span>\n\n${esc(e.message)}</div>`;
+      $("#director").scrollTop = $("#director").scrollHeight;
+    }
     // A seat that just failed should lose its live chip now rather than at the
     // next 5s poll, so the cause is on screen next to the failure.
     poll(true);
-    // A failed run still produced whatever it produced, and the server kept it.
-    showLastRun("after the failure");
   }finally{
     finished = true;
     clearInterval(CURRENT.timer); CURRENT.timer = null;
@@ -2170,8 +2196,12 @@ function recoveryBlock(r){
   return parts.join("\n\n");
 }
 
+// The run whose result the transcript last showed (see run()).
+let SHOWN_SNAPSHOT = "";
+
 function renderRun(r, note){
   $("#state-dump").textContent = JSON.stringify(r, null, 2);
+  if(r.run_id) SHOWN_SNAPSHOT = r.run_id;
 
   // The run is over, so the line that was tracking it is replaced by the
   // answer rather than left behind reading "Running".
@@ -2187,8 +2217,9 @@ function renderRun(r, note){
     : "";
 
   // A run that built a separate project leaves it out of the corpus, and asks.
+  // One that wrote nothing there had its empty folder removed: nothing to ask.
   const name = (r.output_dir || "").replace(/^projects\//, "");
-  const project = !r.output_dir ? ""
+  const project = !r.output_dir || r.project_removed ? ""
     : r.project_embedded
       ? `<span class="project">Stored in ${esc(r.output_dir)}/ \u2014 this project is embedded, so the next rebuild indexes what the run wrote.</span>`
       : `<span class="project">Stored in ${esc(r.output_dir)}/ \u2014 not in the corpus.`
@@ -2196,7 +2227,17 @@ function renderRun(r, note){
         + `\nOr leave it out and Attach the files you want by hand.</span>`;
 
   const tag = note ? ` <span class="badge">${esc(note)}</span>` : "";
-  if(r.stopped){
+  if(r.error && !r.stopped){
+    // Nobody ruled on a run that raised, so it is titled by what happened --
+    // "Architect verdict: (none)" read as a ruling -- and answered with what
+    // survived, as a stopped run is.
+    $("#director").innerHTML +=
+      `<div class="msg sys"><b>Run failed</b> <span class="badge bad">FAIL</span>${tag}`+
+      `\n\n${esc(r.error)}\n\n${esc(recoveryBlock(r))}`+
+      (r.builder_report ? `\n\nBuilder: ${esc(r.builder_report)}` : "")+
+      touched+project+
+      `</div>`;
+  }else if(r.stopped){
     // A stopped run has no verdict to report -- nobody ruled -- so it is
     // titled by what happened instead, and answered with what survived.
     $("#director").innerHTML +=
@@ -2577,6 +2618,10 @@ async function pollOnce(quiet){
     BUILDS_ON_RUN = st.indexes_on_run !== false;
     applyIndexableSuffixes(st.indexable_suffixes);
     setCorpusState(stats.corpus || (stats.total_chunks ? "indexed" : "empty"));
+    ARCHIVE = typeof stats.archive === "number" ? stats.archive
+      : typeof stats.staleness?.expected === "number" ? stats.staleness.expected : null;
+    UNINDEXED = CORPUS === "empty" && !SERVER_BUSY.indexing && !SERVER_BUSY.run
+      ? (stats.staleness?.missing_count || 0) : 0;
     // Four zeros read as a knowledge base that happens to be empty. When none
     // has been built there is nothing to count, and saying so is the honest
     // reading -- it is also the only one that tells the operator what to do.
@@ -2585,11 +2630,11 @@ async function pollOnce(quiet){
     // what the operator has just this second asked for by pressing Clear.
     const indexing = indexingChip(st) + healingChip(healing) + pullRequestChips(st.pull_requests);
     $("#stats").innerHTML = CORPUS === "absent"
-      ? `<span class="nocorpus">no corpus &mdash; ${BUILDS_ON_RUN ? "a restart or the next run rebuilds it from the archive" : "nothing indexed"}</span>`+indexing
+      ? `<span class="nocorpus">no corpus &mdash; ${esc(corpusHint())}</span>`+indexing
       : CORPUS === "unavailable"
       ? `<span class="nocorpus" title="${esc(stats.note || "")}">corpus unavailable &mdash; the database is not answering; a run goes ahead without retrieval</span>`+indexing
       : CORPUS === "empty"
-      ? `<span class="nocorpus">corpus empty &mdash; ${BUILDS_ON_RUN ? "a restart or the next run rebuilds it from the archive" : "REBUILD_CORPUS is off, so nothing will rebuild it"}</span>`+indexing
+      ? `<span class="nocorpus">corpus empty &mdash; ${esc(corpusHint())}</span>`+indexing
       : `<span>docs <b>${stats.total_documents}</b></span>`+
         `<span>chunks <b>${stats.total_chunks}</b></span>`+
         `<span>nodes <b>${stats.total_nodes}</b></span>`+
