@@ -29,6 +29,14 @@ FROM archlinux:base AS base
 # postgresql-libs is here for the reason install.sh puts it on the host: psql
 # is how the database configuration is *proved* rather than assumed, and it is
 # the client a script the Builder writes will reach for.
+#
+# Every host the build downloads from is asked first, install.sh's first step:
+# behind an egress allowlist the build otherwise fails one host at a time, and
+# pacman's refusal reads as a stale database. The step's output shows only
+# when it fails, which is when it names them all. The tokenizer's hub is
+# optional because its bake, below, forgives a hub it cannot reach.
+RUN --mount=type=bind,source=scripts/network_check.sh,target=/tmp/network_check.sh \
+    bash /tmp/network_check.sh arch pypi --optional tokenizer
 RUN pacman -Syu --noconfirm --needed \
         python \
         git \

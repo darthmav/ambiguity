@@ -242,6 +242,16 @@ server with pgvector.
 ./install.sh            # --help lists --minimal, --no-system, --no-searxng, ...
 ```
 
+Its first step asks every host it will download from — the package mirrors,
+PyPI, the Ollama and Hugging Face registries, Docker Hub, GitHub — and names
+any that does not answer, with what needs it and why it failed (a proxy's
+refusal, a certificate the machine does not trust, a name that does not
+resolve). Behind an egress allowlist (a company proxy, or a Claude Code cloud
+environment, whose Network access is set per environment) it prints the
+entries to add, one per line. No script can add them: the allowlist belongs to
+the network. `docker/install.sh` and the image build ask the same way, and
+`scripts/network_check.sh --help` runs it on its own.
+
 Everything it installs is free to use. Elsewhere, or by hand:
 
 ```bash

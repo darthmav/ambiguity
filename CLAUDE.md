@@ -117,7 +117,8 @@ python example_usage.py
 │   ├── cloud_smoke.py         # One run with every seat on Anthropic
 │   ├── spectral_benchmark.py  # Graph-architecture sweep behind the A-numbers
 │   ├── diagnose_seats.py      # Role probes + team runs per seating
-│   └── dwell.py               # The dwell pipeline from the command line, confined to this folder
+│   ├── dwell.py               # The dwell pipeline from the command line, confined to this folder
+│   └── network_check.sh       # Which download hosts the network lets through; the installers' first step
 ├── frontend/
 │   ├── index.html             # Web console SPA
 │   └── README.md
