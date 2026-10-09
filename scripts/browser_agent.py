@@ -2071,11 +2071,12 @@ class SpawnedConsole:
 
 def encode_gif(frames: Sequence[tuple[Path, float]], target: Path, *, width: int = 720) -> str:
     """Frames to a GIF with the system ffmpeg; "" or why there is none."""
+    # Asked first: with nothing captured there is no GIF to make, ffmpeg or not.
+    if not frames:
+        return "no frames were captured"
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         return "ffmpeg is not installed, so there is no GIF"
-    if not frames:
-        return "no frames were captured"
     listing = frames[0][0].parent / "frames.txt"
     lines = ["ffconcat version 1.0"]
     for i, (path, stamp) in enumerate(frames):
