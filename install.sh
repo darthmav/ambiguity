@@ -288,6 +288,25 @@ else
     chmod 600 .env
     ok "created .env from .env.example (no key needed for the default seats)"
 fi
+# Which sign-in key variables the shell running this script exported, read
+# before .env is. One that only .env sets is for an Anthropic seat and is read
+# by the project alone; one the shell exports also reaches every claude started
+# from that shell and turns Claude in Chrome off, which the machine diagnosis
+# below is there to point out -- so it is shown the second kind, not the first.
+KEY_VARS=(ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN)
+shell_keys=" "
+for var in "${KEY_VARS[@]}"; do
+    if [ -n "${!var:-}" ]; then shell_keys+="$var "; fi
+done
+# Runs a command without the key variables that came from .env alone. What it
+# runs from the project reloads .env itself, so a seat's key is not lost.
+without_dotenv_keys() {
+    local drop=() var
+    for var in "${KEY_VARS[@]}"; do
+        case "$shell_keys" in *" $var "*) ;; *) drop+=(-u "$var") ;; esac
+    done
+    env "${drop[@]}" "$@"
+}
 set -a
 # shellcheck source=/dev/null
 . ./.env
@@ -1530,7 +1549,8 @@ if [ "${#PROBLEMS[@]}" -gt 0 ] && [ -f scripts/diagnose_machine.py ]; then
     for log in "${logs[@]}"; do
         if [ -f "$log" ]; then save_logs+=(--save-log "$log"); fi
     done
-    "$PY" scripts/diagnose_machine.py --quick --out "$INSTALL_REPORTS/machine" "${save_logs[@]}" || true
+    without_dotenv_keys "$PY" scripts/diagnose_machine.py --quick --out "$INSTALL_REPORTS/machine" \
+        "${save_logs[@]}" || true
     if [ -f "$INSTALL_REPORTS/machine/report.md" ]; then
         machine_report="$INSTALL_REPORTS/machine/report.md"
     fi

@@ -296,12 +296,77 @@ def test_redaction_takes_out_keys_tokens_passwords_addresses_and_paths(monkeypat
             "email", "home", "runtime-dir", "assigned-secret"} <= set(counts)
 
 
+@pytest.mark.parametrize("prose", [
+    "claude-opus-5 (no key: canned stub output)",
+    "The key: this matters",
+    "monkey: banana",
+    "prompt_tokens: 12",
+    "password: (none)",
+    "API key:\nnone",
+])
+def test_prose_after_a_colon_is_not_a_secret(prose):
+    counts: Counter[str] = Counter()
+    assert dm.redact(prose, counts) == prose
+    assert not counts, "a report would claim a secret that was never there"
+
+
+@pytest.mark.parametrize("setting, secret", [
+    ("ANTHROPIC_API_KEY=abc-def-123", "abc-def-123"),
+    ("OLLAMA_API_KEY=plainvalue", "plainvalue"),
+    ('"api_key": "plainvalue"', "plainvalue"),
+    ('"token": "plainvalue"', "plainvalue"),
+    ("PGPASSWORD: hunter2", "hunter2"),
+    ("password: hunter2", "hunter2"),
+    ("token=abc", "token=abc"),
+    ("x-api-key: plainvalue", "plainvalue"),
+    ("the key: a1b2c3d4e5f6", "a1b2c3d4e5f6"),
+    ("GET /rpc?token=abc123&page=2", "abc123"),
+    ('{\\"token\\": \\"plainvalue\\"}', "plainvalue"),
+])
+def test_a_setting_that_names_a_secret_is_redacted(setting, secret):
+    counts: Counter[str] = Counter()
+    cleaned = dm.redact(setting, counts)
+    assert secret not in cleaned
+    assert counts["assigned-secret"] == 1
+
+
 def test_redacted_data_stays_valid_json():
     value = {"note": 'KEY="abc\\"def"', f"{PLANTED_KEY}": [f"x {PLANTED_KEY}"]}
     cleaned = dm.redact_data(value)
     text = json.dumps(cleaned)
     assert PLANTED_KEY not in text
     assert json.loads(text) == cleaned
+
+
+def test_a_value_under_a_secret_key_is_redacted_as_data():
+    cleaned = dm.redact_data({"api_key": "plainvalue", "OLLAMA_API_KEY": "x",
+                              "token": "a1b2c3d4e5f6", "key": "./projects/demo#7",
+                              "seat": "claude-opus-5 (no key: canned stub output)"})
+    assert cleaned == {"api_key": "<redacted>", "OLLAMA_API_KEY": "<redacted>",
+                       "token": "<redacted>", "key": "./projects/demo#7",
+                       "seat": "claude-opus-5 (no key: canned stub output)"}
+
+
+@pytest.mark.parametrize("value", [
+    {"url": "http://localhost:8080/rpc?token=abc123"},
+    {"said": "the key: canned"},
+    {"console": "error: password=hunter2"},
+    {"page": 'token="abc"'},
+])
+def test_json_text_is_redacted_as_json(value):
+    """Text-mode redaction swallowed a string's closing quote; as data it cannot."""
+    for text, lines in ((json.dumps(value, indent=2), False), (json.dumps(value) + "\n", True)):
+        cleaned = dm.redact_json_text(text, lines=lines)
+        assert json.loads(cleaned) == dm.redact_data(value)
+        assert "abc123" not in cleaned and "hunter2" not in cleaned
+
+
+def test_log_json_writes_json_that_parses(tmp_path):
+    ctx = make_ctx(tmp_path, FakeMachine())
+    path = ctx.log_json("planted.json", {"said": 'token="abc"', "where": Path("/x"),
+                                         "api_key": PLANTED_KEY})
+    written = json.loads((ctx.out / path).read_text())
+    assert written == {"said": 'token="<redacted>"', "where": "/x", "api_key": "<redacted>"}
 
 
 # --------------------------------------------------------------------------
@@ -414,6 +479,102 @@ def test_with_runs_sends_one_run_only_to_an_idle_console(tmp_path, running):
     assert f"{out.name}/browser/shots/tour.png" in names
     assert not [n for n in names if n.endswith("trace.zip")]
     assert code == 0
+
+
+@pytest.mark.parametrize("status, progress, quick", [
+    ({"run_in_flight": False}, {"running": False}, False),
+    ({"run_in_flight": True}, {"running": True, "goal": "write a poem"}, True),
+    ({"indexing": {"running": True}}, {}, True),
+])
+def test_a_busy_console_gets_only_the_quick_browser_passes(tmp_path, status, progress, quick):
+    """The default set searches through the embedder, which would wait on the
+    run's seat and then evict it."""
+    calls: list[list[str]] = []
+    python = make_ctx(tmp_path, FakeMachine()).python
+    agent = (python, str(ROOT / "scripts" / "browser_agent.py"), "check")
+    machine = FakeMachine(commands={agent: _browser_agent(calls)},
+                          urls=console(status, {"run_progress": progress}))
+    section = dm.section_browser(make_ctx(tmp_path, machine))
+    [call] = calls
+    assert ("--quick" in call) is quick
+    assert ("heavy_passes" in section.data) is quick
+    if quick:
+        assert section.data["heavy_passes"].startswith("skipped because a ")
+
+
+def test_a_browser_report_with_secret_shaped_text_is_still_read(tmp_path):
+    """Page text the browser agent left alone must not cost the report its passes."""
+    def agent_run(cmd: list[str], kwargs: dict[str, Any]) -> Any:
+        out = Path(cmd[cmd.index("--out") + 1])
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "results.json").write_text(json.dumps({
+            "schema": "ambiguity-browser/1",
+            "passes": [{"name": "tour", "status": "pass"}, {"name": "graph", "status": "fail",
+                                                            "reason": 'the page said token="abc"'}],
+            "page_errors": [{"text": "API key:\nnone"}, {"text": "auth: password=hunter2"}],
+            "rpc": {"error_envelopes": [{"method": "search_documents"}]}}, indent=2))
+        (out / "rpc.jsonl").write_text(json.dumps({"url": "/rpc?token=abc123"}) + "\n")
+        return dm.Ran(1, out="1 pass failed")
+
+    python = make_ctx(tmp_path, FakeMachine()).python
+    agent = (python, str(ROOT / "scripts" / "browser_agent.py"), "check")
+    machine = FakeMachine(commands={agent: agent_run},
+                          urls=console({"run_in_flight": False}, {"run_progress": {}}))
+    ctx = make_ctx(tmp_path, machine)
+    section = dm.section_browser(ctx)
+
+    assert [p["name"] for p in section.data["passes"]] == ["tour", "graph"]
+    assert section.data["page_errors"] == 2 and section.data["rpc_error_envelopes"] == 1
+    assert [p.kind for p in section.problems] == ["browser-pass"]
+    results = json.loads((ctx.out / "browser" / "results.json").read_text())
+    assert results["passes"][1]["reason"] == 'the page said token="<redacted>"'
+    assert "hunter2" not in json.dumps(results)
+    [row] = [json.loads(line) for line in (ctx.out / "browser" / "rpc.jsonl").read_text().splitlines()]
+    assert row == {"url": "/rpc?token=<redacted>"}
+
+
+def test_the_status_fields_the_busy_check_reads_are_ones_the_console_sends():
+    """Both sides of one contract: a rename in serve.py, or here, fails."""
+    import serve
+
+    status = serve.rpc_status({})
+    assert {"run_in_flight", "indexing", "pull_request_follow"} <= set(status), sorted(status)
+    # An idle console, in the shape `busy_reasons` reads.
+    assert status["pull_request_follow"] == {"running": False, "number": None}
+
+
+# --------------------------------------------------------------------------
+# The Playwright MCP registration, asked as scripts/claude_tools.sh asks it
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("answer, state, kinds", [
+    (dm.Ran(None, err="\ntimed out after 120s", timed_out=True), "no answer within 120s",
+     ["mcp-failed"]),
+    (dm.Ran(1, err='No MCP server named "playwright". Run `claude mcp add` to add one.'),
+     "not registered", ["mcp-unregistered"]),
+    (dm.Ran(1, err="Error: config file is not valid JSON"),
+     "could not be read: Error: config file is not valid JSON", ["mcp-failed"]),
+    (ok("playwright:\n  Scope: Local config (private to you in this project)\n"
+        "  Status: ✓ Connected\n  Type: stdio\n  Command: npx\n"),
+     {"status": "✓ Connected", "scope": "Local config (private to you in this project)"}, []),
+])
+def test_the_mcp_registration_is_read_from_the_checkout(tmp_path, answer, state, kinds):
+    seen: dict[str, Any] = {}
+    machine = FakeMachine({("claude", "--version"): ok("2.1.295 (Claude Code)")})
+
+    def run(cmd: list[str], timeout: float = 10.0, **kwargs: Any) -> Any:
+        if cmd[:4] == ["claude", "mcp", "get", "playwright"]:
+            seen.update(timeout=timeout, cwd=kwargs.get("cwd"))
+            return answer
+        return machine.run(cmd, timeout, **kwargs)
+
+    section = dm.section_tools(make_ctx(tmp_path, machine, run=run, facts_cache={}))
+    # A local-scope server is keyed by the project's path, and `mcp get`
+    # starts npx to health-check it.
+    assert seen == {"timeout": 120.0, "cwd": str(dm.ROOT)}
+    assert section.data["playwright_mcp"] == state
+    assert [p.kind for p in section.problems if p.kind.startswith("mcp-")] == kinds
 
 
 def test_an_idle_console_lets_the_embedder_run(tmp_path):

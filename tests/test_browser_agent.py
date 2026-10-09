@@ -21,6 +21,7 @@ import threading
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -195,6 +196,111 @@ def test_the_agents_own_rpc_calls_are_under_the_same_guard():
         ba.rpc_call(LOOPBACK, "clear_corpus", allow=list(ba.ALLOW_KEYS))
     with pytest.raises(ba.RpcRefused, match="--allow run"):
         ba.rpc_call(LOOPBACK, "run_goal", {"goal": "x"})
+
+
+# Request targets a page can send, and whether the guard covers each. The
+# server's own verdict on them is the test after this one's.
+GUARDED = {
+    "/rpc": True, "/rpc?x=1": True, "/rpc?": True, "/rpc;x": True, "/rpc;x?y=1": True,
+    "///rpc": True, "//x/rpc": True, "//[x/rpc": True,
+    "/rpcx": False, "/rpc/": False, "/a/rpc": False, "/api/status": False, "/": False,
+}
+
+
+@pytest.mark.parametrize("target, guarded", GUARDED.items())
+def test_the_guard_reads_a_url_the_way_the_server_does(target, guarded):
+    """A `**/rpc` glob matched the whole URL, so `/rpc?x` and `/rpc;x` were
+    never guarded, while the server drops the query and `;params` and
+    dispatched them: clear_corpus went through."""
+    assert ba.is_rpc_url(f"http://127.0.0.1:8080{target}") is guarded
+
+
+def test_every_target_serve_dispatches_as_an_rpc_is_guarded():
+    """Grounded in the server itself rather than a reading of it: each target
+    sent raw through http.server and serve.py's own `do_POST`."""
+    import http.client
+
+    import serve
+
+    dispatched: list[str] = []
+
+    class Recording(serve.Handler):
+        def handle_rpc(self, data):
+            dispatched.append(self.path)
+            self.send_json({"result": {}, "elapsed_ms": 0})
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Recording)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
+    try:
+        reached = []
+        for target in GUARDED:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            before = len(dispatched)
+            conn.request("POST", target, body=b'{"method": "status"}',
+                         headers={"Content-Type": "application/json"})
+            conn.getresponse().read()
+            conn.close()
+            if len(dispatched) > before:
+                reached.append(target)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert {"/rpc", "/rpc?x=1", "/rpc;x", "///rpc"} <= set(reached), reached
+    missed = [t for t in reached if not ba.is_rpc_url(f"http://127.0.0.1:{port}{t}")]
+    assert not missed, f"the server ran these as RPCs and the guard would not see them: {missed}"
+
+
+class _Route:
+    def __init__(self, calls: list) -> None:
+        self.calls = calls
+
+    def continue_(self):
+        self.calls.append(("continue", None))
+
+    def fulfill(self, **reply):
+        self.calls.append(("fulfill", json.loads(reply["body"])))
+
+
+class _Request:
+    method = "POST"
+    url = "http://127.0.0.1:8080/rpc"
+
+    def __init__(self, body: bytes | None) -> None:
+        self.post_data_buffer = body
+
+    @property
+    def post_data(self):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+
+def test_the_guard_reads_the_body_the_way_the_server_does():
+    """`post_data` decodes as UTF-8 and raised on a UTF-16 body the server's
+    `json.loads(bytes)` reads: the handler died and the fetch hung. The bytes
+    are read instead, and whatever cannot be read is refused."""
+    calls: list = []
+    owner = SimpleNamespace(allow=frozenset(), recorder=ba.Recorder())
+    wipe = json.dumps({"method": "clear_corpus"})
+    for body in (wipe.encode("utf-16"), wipe.encode("utf-32"), wipe.encode("utf-8-sig"),
+                 b"\xff\xfe\xff", b"[" * 100_000, b"", None):
+        ba.Session._guard(owner, _Route(calls), _Request(body))
+    assert [kind for kind, _ in calls] == ["fulfill"] * 7
+    assert all(reply["error"]["message"].startswith(ba.BLOCKED_PREFIX) for _, reply in calls)
+    assert [b["method"] for b in owner.recorder.blocked] == ["clear_corpus"] * 3 + [""] * 4
+    calls.clear()
+    ba.Session._guard(owner, _Route(calls), _Request(json.dumps({"method": "status"}).encode("utf-16")))
+    assert calls == [("continue", None)]
+
+
+def test_the_recorder_logs_an_rpc_on_any_url_the_server_dispatches():
+    rec = ba.Recorder()
+    for target in ("/rpc;x", "/rpc?x=1", "///rpc"):
+        rec.on_response("POST", f"http://127.0.0.1:8080{target}", 200,
+                        json.dumps({"method": "status"}).encode("utf-16"), {"result": {}, "elapsed_ms": 3})
+    assert [e["method"] for e in rec.rpc] == ["status"] * 3
 
 
 def test_unknown_allow_keys_are_refused_by_name():
@@ -655,18 +761,21 @@ def test_without_stub_seats_the_keys_are_left_alone(tmp_path, monkeypatch):
 
 def test_the_stub_environment_really_stubs_every_seat(tmp_path, monkeypatch):
     """The config's own verdict, in a child that loads `.env` the way serve.py
-    does: a planted key in the environment and per-seat keys stay unread."""
+    does: a planted key in the environment and per-seat keys stay unread.
+    A file, not `-c`: under `-c` config's `load_dotenv()` searches the working
+    directory, here a scratch one, and the checkout's `.env` was never read."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-planted")
     monkeypatch.setenv("PLANNER_API_KEY", "sk-ant-api03-planted")
     env = ba.spawn_environment(os.environ, port=1, runs_dir=tmp_path, stub_seats=True, no_rebuild=True,
                                dotenv_keys=ba.dotenv_names(ROOT / ".env"))
     env["PYTHONPATH"] = str(ROOT / "src")
-    code = (
+    probe = tmp_path / "probe.py"
+    probe.write_text(
         "from langgraph_agent.config import AGENTS, _resolve_seat, get_agent_status\n"
         "print(all(get_agent_status(a)['stubbed'] for a in AGENTS),"
         " any(_resolve_seat(a)['api_key'] for a in AGENTS))\n"
     )
-    done = subprocess.run([sys.executable, "-c", code], env=env, cwd=tmp_path, capture_output=True,
+    done = subprocess.run([sys.executable, str(probe)], env=env, cwd=tmp_path, capture_output=True,
                           text=True, timeout=120)
     assert done.returncode == 0, done.stderr[-2000:]
     assert done.stdout.split() == ["True", "False"]
@@ -684,6 +793,40 @@ def test_a_serve_without_the_isolation_switches_is_not_spawned():
     assert "RUNS_DIR or FOLLOW_PULL_REQUESTS" in ba.serve_isolation_problem("RUNS_DIR = Path('runs')")
     assert "FOLLOW_PULL_REQUESTS" in ba.serve_isolation_problem('os.getenv("RUNS_DIR")')
     assert ba.serve_isolation_problem('os.getenv("RUNS_DIR") or x; os.getenv("FOLLOW_PULL_REQUESTS")') == ""
+
+
+def _drop_schema(tmp_path: Path, env: dict[str, str], dotenv: Path) -> dict[str, Any]:
+    """The spawned console's schema drop, run the way `drop_schema` runs it."""
+    done = subprocess.run(
+        [sys.executable, "-c", ba._DROP_SCHEMA, str(tmp_path / "knowledge"), str(dotenv)],
+        cwd=tmp_path, env={**env, "PYTHONPATH": str(ROOT / "src")}, capture_output=True, text=True,
+        timeout=120, stdin=subprocess.DEVNULL,
+    )
+    return dict(json.loads(done.stdout.strip().splitlines()[-1]))
+
+
+def test_the_schema_drop_finds_the_database_the_console_found(tmp_path):
+    """The console reads `.env`; a `-c` child's own `load_dotenv()` searched
+    its scratch directory, so a DATABASE_URL set only in `.env` sent the drop
+    to the default server and left the schema behind. Here `.env` names a
+    port nothing listens on, which the drop must try, and say it could not
+    reach -- not that the schema is gone."""
+    dotenv = tmp_path / "dotenv"
+    dotenv.write_text("DATABASE_URL=postgresql://postgres@127.0.0.1:1/nowhere\n")
+    env = {k: v for k, v in os.environ.items() if k != "DATABASE_URL"}
+    out = _drop_schema(tmp_path, env, dotenv)
+    assert out["schema"].startswith("kb_") and out["dropped"] is False, out
+    assert out.get("unreachable") is True and re.search(r"port 1\b", out["error"]), out
+    assert "absent" not in out
+
+
+def test_the_schema_drop_never_lets_dotenv_override_the_environment(tmp_path, postgres):
+    """Loaded the way the console loads it, never over a variable already set:
+    the spawned console's emptied keys stay empty, and its DATABASE_URL wins."""
+    dotenv = tmp_path / "dotenv"
+    dotenv.write_text("DATABASE_URL=postgresql://postgres@127.0.0.1:1/nowhere\n")
+    out = _drop_schema(tmp_path, {**os.environ, "DATABASE_URL": postgres}, dotenv)
+    assert out.get("absent") is True and "error" not in out and "unreachable" not in out, out
 
 
 def test_expected_errors_are_narrow():
@@ -716,7 +859,6 @@ def test_a_tour_of_a_spawned_stub_console(tmp_path, capsys):
     spawned = results["spawned"]
     assert all(seat["stubbed"] for seat in spawned["seats"]) and len(spawned["seats"]) == 4
     assert spawned["workdir_removed"] is True
-    assert spawned["schema"].get("dropped") or spawned["schema"].get("absent"), spawned["schema"]
     tour = results["passes"][0]["observations"]
     assert len(tour["seats"]) == 4 and all("NO KEY" in s["chips"] for s in tour["seats"])
     assert (tmp_path / "console.log").exists()
@@ -724,6 +866,17 @@ def test_a_tour_of_a_spawned_stub_console(tmp_path, capsys):
     assert (pending.read_bytes() if pending.exists() else None) == before
     now = sorted(p.name for p in (ROOT / "projects").iterdir()) if (ROOT / "projects").is_dir() else []
     assert now == projects
+    # Last, so a machine without a database still checks everything above. A
+    # server that never answered could hold no schema, and could not say so
+    # either: skipped, as the suite's other database tests are, unless
+    # REQUIRE_POSTGRES=1 makes that a failure.
+    schema = spawned["schema"]
+    if schema.get("unreachable"):
+        message = f"PostgreSQL did not answer, so the schema drop went unchecked: {schema.get('error')}"
+        if os.getenv("REQUIRE_POSTGRES") == "1":
+            pytest.fail(message)
+        pytest.skip(message)
+    assert schema.get("dropped") or schema.get("absent"), schema
 
 
 FIXTURE = """<!doctype html><html><head><title>fixture page</title></head><body>
@@ -837,6 +990,48 @@ def test_the_tools_round_trip_in_one_batch(tmp_path, fixture_site, capsys):
     downloads = list((tmp_path / "images").glob("*download-hello.txt"))
     assert downloads and downloads[0].read_text() == "hello download"
     assert "tab 1/1" in out.splitlines()[-1] or "tab 1/1" in out.splitlines()[-2]
+
+
+# Every way past a `**/rpc` glob, and a body only a bytes-reading JSON parser
+# reads. Each fetch gives up after five seconds, so a guard that dies on a
+# body fails this rather than hanging it.
+EVADE_JS = """(async () => {
+  const wipe = JSON.stringify({method: 'clear_corpus'});
+  const utf16 = new Uint8Array([0xff, 0xfe, ...[...wipe].flatMap(c => [c.charCodeAt(0), 0])]);
+  const tries = [['/rpc', wipe], ['/rpc?x=1', wipe], ['/rpc;x', wipe], ['/rpc?', wipe],
+                 ['///rpc', wipe], ['/rpc', utf16]];
+  const out = [];
+  for (const [target, body] of tries) {
+    const stop = new AbortController();
+    const timer = setTimeout(() => stop.abort(), 5000);
+    try {
+      const r = await fetch(location.origin + target, {method: 'POST', body, signal: stop.signal});
+      out.push(target + ' -> ' + (await r.text()).slice(0, 60));
+    } catch (e) {
+      out.push(target + ' -> ' + e.name);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return out.join('\\n');
+})()"""
+
+
+@LIVE
+def test_a_page_cannot_route_a_refused_call_around_the_guard(tmp_path, fixture_site, capsys):
+    """The fixture records a POST to any path, which is stricter than serve.py:
+    nothing at all may reach it."""
+    pytest.importorskip("playwright")
+    url, received = fixture_site
+    file = tmp_path / "steps.json"
+    file.write_text(json.dumps([{"tool": "eval", "js": EVADE_JS}]))
+    code = ba.main(["batch", str(file), "--open", url])
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert received == [], f"refused calls reached the server: {received}\n{out}"
+    answers = [line for line in out.splitlines() if re.match(r"/+rpc\S* -> ", line)]
+    assert len(answers) == 6 and all(ba.BLOCKED_PREFIX in line for line in answers), out
+    assert "blocked calls: 6" in out, out
 
 
 # ---------------------------------------------------------------------------

@@ -800,6 +800,10 @@ def rpc_status(_: dict[str, Any]) -> dict[str, Any]:
         # Pull requests a run left waiting on their checks, which the monitor
         # merges once they pass, and the last word on each.
         "pull_requests": pull_requests_snapshot(),
+        # Whether the monitor is finishing one right now, and which: a stored
+        # entry reads `pending` throughout, so only this says a run would be
+        # refused, and a diagnostic waits rather than load the cards beside it.
+        "pull_request_follow": _pull_request_follow_status(),
     }
 
 
@@ -2119,6 +2123,17 @@ def pull_requests_snapshot() -> list[dict[str, Any]]:
     with _pull_requests_lock:
         entries = _read_pull_requests()
     return [{field: entry.get(field) for field in _PULL_REQUEST_FIELDS} for entry in entries]
+
+
+def _pull_request_follow_status() -> dict[str, Any]:
+    """Whether the monitor is finishing a pull request now: `{running, number}`.
+
+    A copy, read under `_run_lock` where it is written, so a reader never sees
+    `running` from one finish and `number` from the next.
+    """
+    with _run_lock:
+        return {"running": bool(_pull_request_follow["running"]),
+                "number": _pull_request_follow["number"]}
 
 
 def _finish_one(entry: Mapping[str, Any]) -> dict[str, Any]:

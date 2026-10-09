@@ -61,7 +61,7 @@ from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlparse, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -579,10 +579,37 @@ def _percentile(values: Sequence[float], pct: float) -> float | None:
     return ordered[min(index, len(ordered) - 1)]
 
 
-def _rpc_request(post_data: str | None) -> tuple[str, Any]:
+def is_rpc_url(url: str) -> bool:
+    """Whether serve.py could dispatch a POST to `url` as an RPC.
+
+    The server's own test, applied to the request target rather than the
+    whole URL: `urlparse(...).path == "/rpc"`, which drops the query and the
+    `;params` both. A glob such as `**/rpc` matches the whole URL, so `/rpc?x`
+    and `/rpc;x` slipped past the guard and still reached the server as RPCs.
+    http.server first folds a leading run of slashes into one, so `///rpc`
+    is `/rpc` too; a Python without that fold reads `//x/rpc` as host `x` and
+    path `/rpc`. Both readings are guarded, and so is a URL that cannot be
+    parsed here at all (`//[x` is an unclosed IPv6 host to urlparse): a call
+    guarded needlessly is only read, a call missed is sent.
+    """
     try:
-        body = json.loads(post_data or "{}")
+        target = urlsplit(url).path
+        folded = "/" + target.lstrip("/")
+        return "/rpc" in (urlparse(target).path, urlparse(folded).path)
     except ValueError:
+        return True
+
+
+def _rpc_request(post_data: str | bytes | None) -> tuple[str, Any]:
+    """The method and params of a request body, read the way the server reads it.
+
+    Bytes go to `json.loads` as they are, so a UTF-16 or UTF-32 body the
+    server accepts is read here too; anything unreadable is method "", which
+    the guard refuses.
+    """
+    try:
+        body = json.loads(post_data or b"{}")
+    except (ValueError, RecursionError):
         return "", None
     if not isinstance(body, dict):
         return "", None
@@ -627,11 +654,11 @@ class Recorder:
     def on_requestfailed(self, method: str, url: str, failure: str) -> None:
         self.failed_requests.append({**self._stamp(), "method": method, "url": url, "failure": failure})
 
-    def on_response(self, method: str, url: str, status: int, post_data: str | None,
+    def on_response(self, method: str, url: str, status: int, post_data: str | bytes | None,
                     body: Any) -> None:
         if status >= 400:
             self.http_errors.append({**self._stamp(), "method": method, "url": url, "status": status})
-        if urlsplit(url).path != "/rpc" or method != "POST":
+        if not is_rpc_url(url) or method != "POST":
             return
         rpc_method, params = _rpc_request(post_data)
         error = body.get("error") if isinstance(body, dict) else None
@@ -871,7 +898,7 @@ class Session:
         self.context = handle.browser.new_context(
             viewport={"width": viewport[0], "height": viewport[1]}, accept_downloads=True,
         )
-        self.context.route("**/rpc", self._guard)
+        self.context.route(is_rpc_url, self._guard)
         self.pages: list[Any] = []
         self.context.on("page", self._watch)
         self.page = self.context.new_page()
@@ -894,7 +921,13 @@ class Session:
         if request.method != "POST":
             route.continue_()
             return
-        method, params = _rpc_request(request.post_data)
+        # The raw bytes, not `post_data`: that decodes as UTF-8 and raised on a
+        # body the server reads, killing this handler with the fetch left
+        # hanging. Whatever cannot be read is method "", and refused.
+        try:
+            method, params = _rpc_request(request.post_data_buffer)
+        except Exception:
+            method, params = "", None
         refusal = rpc_refusal(method, self.allow, request.url)
         if not refusal:
             route.continue_()
@@ -926,13 +959,13 @@ class Session:
     def _on_response(self, response: Any) -> None:
         request = response.request
         body = None
-        if urlsplit(response.url).path == "/rpc" and request.method == "POST":
+        if is_rpc_url(response.url) and request.method == "POST":
             try:
                 body = response.json()
             except Exception:
                 body = None
         try:
-            post_data = request.post_data
+            post_data = request.post_data_buffer
         except Exception:
             post_data = None
         self.recorder.on_response(request.method, response.url, response.status, post_data, body)
@@ -1046,10 +1079,10 @@ class Session:
                   timeout_s: float = RPC_TIMEOUT_S) -> dict[str, Any] | None:
         """Run `action` and wait for the page's `method` call to be answered."""
         def is_it(response: Any) -> bool:
-            if urlsplit(response.url).path != "/rpc":
+            if not is_rpc_url(response.url):
                 return False
             try:
-                return _rpc_request(response.request.post_data)[0] == method
+                return _rpc_request(response.request.post_data_buffer)[0] == method
             except Exception:
                 return False
 
@@ -1879,17 +1912,33 @@ def free_port() -> int:
 # Run in a child with the spawned console's own environment, so the schema's
 # name and the database are found exactly the way the console found them,
 # through the project's own helpers, and nothing it imports loads `.env` into
-# this process.
+# this process. The console runs serve.py as a file, so config's
+# `load_dotenv()` walks up from config.py to the checkout's `.env`; under `-c`
+# it searches the working directory instead, the throwaway one, and finds
+# nothing. So the child loads the checkout's `.env` itself, first -- never over
+# a variable already set, so the emptied keys stay empty -- or a
+# `DATABASE_URL` set only there sent the drop to the default server while the
+# schema sat on another. An unreachable server is said apart from an error:
+# the schema could not be checked, which is not the same as never created.
 _DROP_SCHEMA = """
 import json, sys
 out = {"schema": "", "dropped": False}
 try:
+    from dotenv import load_dotenv
+    load_dotenv(sys.argv[2])
     import psycopg
     from psycopg import sql
-    from langgraph_agent.corpus_store import SCHEMA_PREFIX, corpus_schema, database_url
+    from langgraph_agent.corpus_store import (
+        SCHEMA_PREFIX, corpus_schema, database_unreachable, database_url,
+    )
     out["schema"] = schema = corpus_schema(sys.argv[1])
     if schema.startswith(SCHEMA_PREFIX):
-        with psycopg.connect(database_url(), connect_timeout=5, autocommit=True) as conn:
+        try:
+            conn = psycopg.connect(database_url(), connect_timeout=5, autocommit=True)
+        except Exception as exc:
+            out["unreachable"] = database_unreachable(exc)
+            raise
+        with conn:
             found = conn.execute(
                 "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s", (schema,)
             ).fetchone()
@@ -1993,7 +2042,8 @@ class SpawnedConsole:
         env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(ROOT / "src"), env.get("PYTHONPATH"))))
         try:
             done = subprocess.run(
-                [sys.executable, "-c", _DROP_SCHEMA, str(self.workdir / "knowledge")],
+                [sys.executable, "-c", _DROP_SCHEMA, str(self.workdir / "knowledge"),
+                 str(ROOT / ".env")],
                 cwd=self.workdir, env=env, capture_output=True, text=True, timeout=60,
                 stdin=subprocess.DEVNULL,
             )
@@ -2079,6 +2129,7 @@ def render_markdown(results: Mapping[str, Any]) -> str:
         schema = spawned.get("schema") or {}
         if schema:
             fate = ("dropped" if schema.get("dropped") else "never created" if schema.get("absent")
+                    else "not checked: the database did not answer" if schema.get("unreachable")
                     else f"left behind ({schema.get('error', 'unknown')})")
             out.append(f"- its corpus schema {schema.get('schema') or '?'}: {fate}")
     out.append(f"- verdict: {tally['pass']} passed, {tally['fail']} failed, {tally['skip']} skipped, "

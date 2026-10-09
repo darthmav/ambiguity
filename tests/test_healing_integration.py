@@ -1047,6 +1047,25 @@ def test_a_run_waits_while_a_pull_request_is_being_finished(monkeypatch):
         serve.rpc_run_goal({"goal": "ship it"})
 
 
+def test_the_status_says_while_a_pull_request_is_being_finished(monkeypatch):
+    """The stored entry reads `pending` throughout a finish, so only this tells a
+    client -- the machine diagnostic among them -- that a run would be refused."""
+    seen: list[dict[str, Any]] = []
+
+    def finish(run: Any, **kwargs: Any) -> dict[str, Any]:
+        seen.append(serve.rpc_status({})["pull_request_follow"])
+        return {"success": True, "pending": "waiting on test"}
+
+    monkeypatch.setattr(serve, "finish_pull_request", finish)
+    serve._track_pull_request(_PENDING, "run", "ship it")
+    assert serve.rpc_status({})["pull_request_follow"] == {"running": False, "number": None}
+
+    serve._follow_pull_requests()
+
+    assert seen == [{"running": True, "number": 12}]
+    assert serve.rpc_status({})["pull_request_follow"] == {"running": False, "number": None}
+
+
 _HEALTHY = {
     component: {"status": "healthy", "details": "fine"}
     for component in ("ollama-daemon", "postgres", "corpus")

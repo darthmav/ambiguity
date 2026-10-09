@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from shlex import quote as shlex_quote
 
 import pytest
 
@@ -480,6 +481,47 @@ def test_both_installers_set_up_the_claude_tools():
         assert "scripts/claude_tools.sh install" in text, installer
         assert "CLAUDE_TOOLS_NOTES" in text, f"{installer} drops the notes"
         assert "--no-claude" in text, installer
+
+
+def _install_key_lines() -> str:
+    """install.sh's own lines that decide which key variables its diagnosis sees:
+    from `KEY_VARS=(` to the end of `without_dotenv_keys`."""
+    lines = (ROOT / "install.sh").read_text(encoding="utf-8").splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("KEY_VARS=("))
+    end = next(i for i in range(start, len(lines)) if lines[i] == "}")
+    return "\n".join(lines[start:end + 1])
+
+
+@pytest.mark.parametrize("from_shell, shown", [
+    ({}, []),
+    ({"ANTHROPIC_API_KEY": "sk-from-the-shell"}, ["ANTHROPIC_API_KEY"]),
+    ({"ANTHROPIC_AUTH_TOKEN": "from-the-shell"}, ["ANTHROPIC_AUTH_TOKEN"]),
+])
+def test_the_install_diagnosis_sees_only_the_keys_the_shell_exported(tmp_path, from_shell, shown):
+    # A key kept in .env for an Anthropic seat is the project's own, and the
+    # diagnosis would call it an override of Claude Code's sign-in and say to
+    # remove it. One the shell exports really is one, so it is still shown.
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-from-dotenv\n", encoding="utf-8")
+    probe = f"import json, os; print(json.dumps([k for k in {KEYS!r} if k in os.environ]))"
+    script = "\n".join([
+        "set -euo pipefail",
+        _install_key_lines(),
+        "set -a", ". ./.env", "set +a",
+        f'without_dotenv_keys "$PY" -c {shlex_quote(probe)}',
+    ])
+    env = {k: v for k, v in os.environ.items() if k not in KEYS}
+    done = subprocess.run(["bash", "-c", script], cwd=tmp_path, capture_output=True, text=True,
+                          timeout=30, env={**env, **from_shell, "PY": sys.executable})
+
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout) == shown
+
+
+def test_install_runs_its_diagnosis_without_the_dotenv_keys():
+    text = (ROOT / "install.sh").read_text(encoding="utf-8")
+    assert 'without_dotenv_keys "$PY" scripts/diagnose_machine.py' in text
+    # Read before .env is sourced, or every key would look exported by the shell.
+    assert text.index("KEY_VARS=(") < text.index(". ./.env")
 
 
 @pytest.mark.parametrize("installer, flags", [

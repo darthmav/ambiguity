@@ -82,12 +82,42 @@ _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
      r"\1 <redacted>"),
 )
 
-# `ANTHROPIC_API_KEY=...`, `"api_key": "..."`, `PGPASSWORD: ...`. Horizontal
-# whitespace only, so an empty value never reaches into the next line.
+# `ANTHROPIC_API_KEY=...`, `"api_key": "..."`, `PGPASSWORD: ...` and
+# `x-api-key: ...`. Horizontal whitespace only, so an empty value never reaches
+# into the next line. A bare value stops at a quote, a backslash or an `&`: in
+# JSON-escaped text or a query string, what follows is not part of it, and
+# eating a closing quote leaves a string that no longer parses.
+_SECRET_NAME = r"[A-Za-z0-9_\-]*(?:key|token|secret|password|passwd)"
 _ASSIGNED_SECRET = re.compile(
-    r"(?i)\b([A-Za-z0-9_]*(?:key|token|secret|password|passwd))([\"']?[ \t]*[=:][ \t]*)"
-    r"(\"[^\"\n]*\"|'[^'\n]*'|[^\s,;}]+)"
+    rf"(?i)(?<![A-Za-z0-9_\-])({_SECRET_NAME})(\\?[\"']?[ \t]*[=:][ \t]*)"
+    r"(\\\"[^\"\n]*?\\\"|\"[^\"\n]*\"|'[^'\n]*'|[^\s,;&}\"'\\]+)"
 )
+_SECRET_KEY = re.compile(rf"(?i){_SECRET_NAME}")
+# Values that say there is no secret, which a report is better off keeping.
+_NO_SECRET = frozenset({"none", "null", "nil", "unset", "n/a", "true", "false"})
+_CREDENTIAL = re.compile(r"[A-Za-z0-9._~+/=\-]{8,}")
+
+
+def _names_a_setting(name: str, quoted: bool) -> bool:
+    """Whether `name: value` reads as a setting rather than a sentence.
+
+    `ANTHROPIC_API_KEY:`, `x-api-key:`, `"token":`, `PGPASSWORD:` and
+    `password:` are settings; `no key: canned stub output` and `monkey: banana`
+    are prose, and a seat label garbled into `no key: <redacted>` would both
+    hide what the report is for and claim a secret that was never there.
+    """
+    return (quoted or "_" in name or "-" in name or name.isupper()
+            or name.lower() in ("password", "passwd", "secret"))
+
+
+def _credential_shaped(value: str) -> bool:
+    """A word that could be a key: long, token characters only, letters and digits."""
+    return (_CREDENTIAL.fullmatch(value) is not None and any(c.isdigit() for c in value)
+            and any(c.isalpha() for c in value))
+
+
+def _says_no_secret(value: str) -> bool:
+    return not value or value.startswith("<") or value.strip("()").lower() in _NO_SECRET
 _URL_PASSWORD = re.compile(r"\b([a-z][a-z0-9+.\-]*://[^/\s:@]+):([^/\s@]+)@", re.I)
 _EMAIL = re.compile(r"\b([A-Za-z0-9._%+\-]+)@([A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,})\b")
 _RUN_USER = re.compile(r"/run/user/\d+")
@@ -109,12 +139,18 @@ def redact(text: str, counts: Counter[str] | None = None) -> str:
         tally[kind] += n
 
     def _assigned(m: re.Match[str]) -> str:
-        value = m.group(3).strip("\"'")
-        if not value or value.startswith("<"):
+        name, sep, raw = m.group(1), m.group(2), m.group(3)
+        quote = '\\"' if raw.startswith('\\"') else raw[:1] if raw[:1] in "\"'" else ""
+        value = raw[len(quote):len(raw) - len(quote)]
+        if _says_no_secret(value):
+            return m.group(0)
+        # `NAME=value` is always a setting; after a colon, a bare lowercase
+        # name is a setting only when what follows looks like a credential.
+        if "=" not in sep and not (_names_a_setting(name, quoted=sep[:1] in "\"'\\")
+                                   or _credential_shaped(value)):
             return m.group(0)
         tally["assigned-secret"] += 1
-        quote = m.group(3)[0] if m.group(3)[:1] in "\"'" else ""
-        return f"{m.group(1)}{m.group(2)}{quote}<redacted>{quote}"
+        return f"{name}{sep}{quote}<redacted>{quote}"
 
     text = _ASSIGNED_SECRET.sub(_assigned, text)
 
@@ -150,15 +186,49 @@ def redact_data(value: Any, counts: Counter[str] | None = None) -> Any:
     """`value` with every string in it -- keys too -- passed through `redact`.
 
     Done on the structure rather than on its JSON, so a replacement can never
-    land inside an escape and leave a results.json that does not parse.
+    land inside an escape and leave a results.json that does not parse. A
+    string under a key that names a secret (`{"api_key": "..."}`) is the secret
+    itself, by the same rule `redact` reads `name: value` with.
     """
     if isinstance(value, str):
         return redact(value, counts)
     if isinstance(value, dict):
-        return {redact(str(k), counts): redact_data(v, counts) for k, v in value.items()}
+        return {redact(str(k), counts): _redact_entry(str(k), v, counts)
+                for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [redact_data(v, counts) for v in value]
     return value
+
+
+def _redact_entry(key: str, value: Any, counts: Counter[str] | None) -> Any:
+    if (isinstance(value, str) and _SECRET_KEY.fullmatch(key) and not _says_no_secret(value)
+            and (_names_a_setting(key, quoted=False) or _credential_shaped(value))):
+        if counts is not None:
+            counts["assigned-secret"] += 1
+        return "<redacted>"
+    return redact_data(value, counts)
+
+
+def redact_json_text(text: str, counts: Counter[str] | None = None, *,
+                     lines: bool = False) -> str:
+    """JSON (or JSON lines) text redacted as data and written back as JSON.
+
+    Text that does not parse is redacted as text: it was never valid JSON for
+    a reader to lose.
+    """
+    if lines:
+        return "".join(redact_json_text(line, counts) if line.strip() else line
+                        for line in text.splitlines(keepends=True))
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return redact(text, counts)
+    cleaned = redact_data(value, counts)
+    if cleaned == value:
+        return text
+    # Laid out as it came: a JSON line stays one line.
+    ending = "\n" if text.endswith("\n") else ""
+    return json.dumps(cleaned, indent=2 if "\n" in text.strip() else None) + ending
 
 
 # --------------------------------------------------------------------------
@@ -726,6 +796,9 @@ SEARXNG_CONTAINER = "ambiguity-searxng"
 POSTGRES_CONTAINER = "postgres18"
 CONSOLE_READS = ("status", "rag_stats", "healing", "list_seats", "run_progress",
                  "embedding_activity", "last_run")
+# What scripts/claude_tools.sh allows `claude mcp get`, which starts the
+# server to health-check it: a first npx start downloads the package.
+MCP_GET_SECONDS = 120.0
 
 
 def _stdin_is_tty() -> bool:
@@ -851,7 +924,13 @@ class Context:
         return f"logs/{name}"
 
     def log_json(self, name: str, value: Any) -> str:
-        return self.log(name, json.dumps(value, indent=2, default=str))
+        """Write `value` to logs/<name> as JSON, redacted as data so the file still parses."""
+        self.logs.mkdir(parents=True, exist_ok=True)
+        # A round trip first, so what `default=str` turns into text is redacted too.
+        plain = json.loads(json.dumps(value, default=str))
+        (self.logs / name).write_text(json.dumps(redact_data(plain, self.counts), indent=2),
+                                      encoding="utf-8")
+        return f"logs/{name}"
 
     def rpc(self, method: str, params: dict[str, Any] | None = None,
             timeout: float = 30.0) -> tuple[Any, str]:
@@ -954,15 +1033,13 @@ class Context:
         if isinstance(indexing, dict) and indexing.get("running"):
             reasons.append("a corpus rebuild is in flight"
                            + (f" ({indexing.get('message')})" if indexing.get("message") else ""))
-        # The console marks a pull request it is finishing; a console too old to
-        # say leaves this list empty, and its follower holds no cards anyway.
-        follow = status.get("pull_request_follow") or {}
-        finishing = [f"#{follow.get('number')}"] if isinstance(follow, dict) and follow.get(
-            "running") else []
-        finishing += [f"#{pr.get('number')}" for pr in status.get("pull_requests") or []
-                      if isinstance(pr, dict) and pr.get("status") == "finishing"]
-        if finishing:
-            reasons.append(f"pull request {', '.join(sorted(set(finishing)))} is being finished")
+        # The console says when its monitor is finishing a pull request; one
+        # too old to say reads as not finishing, and its follower holds no
+        # cards anyway.
+        follow = status.get("pull_request_follow")
+        if isinstance(follow, dict) and follow.get("running"):
+            number = follow.get("number")
+            reasons.append(f"pull request {f'#{number} ' if number else ''}is being finished")
         return reasons
 
 
@@ -1315,13 +1392,26 @@ def section_tools(ctx: Context) -> Section:
         data["claude_on_path"] = found
         if len(found) > 1 and "mise" in found[0]:
             data["claude_note"] = "a mise shim comes first on PATH and may shadow the installed claude"
-        registered = ctx.cmd(["claude", "mcp", "get", "playwright"], 45,
-                             env=ctx.env_without_keys())
+        # From the checkout, as scripts/claude_tools.sh registers it: a local-scope
+        # server is keyed by the project's path. And as long as that script
+        # allows, since `mcp get` health-checks the server by starting npx.
+        registered = ctx.cmd(["claude", "mcp", "get", "playwright"], MCP_GET_SECONDS,
+                             env=ctx.env_without_keys(), cwd=str(ctx.root))
         text = registered.text
-        if not registered.ok:
+        if registered.timed_out:
+            data["playwright_mcp"] = f"no answer within {MCP_GET_SECONDS:g}s"
+            problems.append(finding("mcp-failed", "Claude Code did not say whether the "
+                                    "Playwright MCP server is registered here",
+                                    data["playwright_mcp"]))
+        elif not registered.ok and re.search(r"no mcp server|not found", text, re.I):
             data["playwright_mcp"] = "not registered"
             problems.append(finding("mcp-unregistered", "the Playwright MCP server is not "
                                     "registered with Claude Code here", first_line(registered)))
+        elif not registered.ok:
+            data["playwright_mcp"] = f"could not be read: {first_line(registered)}"
+            problems.append(finding("mcp-failed", "Claude Code could not say whether the "
+                                    "Playwright MCP server is registered here",
+                                    first_line(registered)))
         else:
             state = re.search(r"^\s*Status:\s*(.+)$", text, re.M)
             scope = re.search(r"^\s*Scope:\s*(.+)$", text, re.M)
@@ -2014,14 +2104,22 @@ def section_console_before(ctx: Context) -> Section:
 
 
 def _redact_tree(ctx: Context, directory: Path) -> None:
-    """Pass every text file a helper wrote under `directory` through `redact`, in place."""
+    """Pass every text file a helper wrote under `directory` through `redact`, in place.
+
+    JSON is redacted as data and written back as JSON: a replacement made in
+    its text can land inside an escape, and a results.json that no longer
+    parses loses every pass it carried.
+    """
     if not directory.is_dir():
         return
     for path in directory.rglob("*"):
         if path.is_file() and path.suffix in (".md", ".json", ".jsonl", ".txt", ".log", ".csv"):
             text = read_text(path, limit=50_000_000)
             if text is not None:
-                cleaned = redact(text, ctx.counts)
+                if path.suffix in (".json", ".jsonl"):
+                    cleaned = redact_json_text(text, ctx.counts, lines=path.suffix == ".jsonl")
+                else:
+                    cleaned = redact(text, ctx.counts)
                 if cleaned != text:
                     path.write_text(cleaned, encoding="utf-8")
 
@@ -2066,8 +2164,15 @@ def section_browser(ctx: Context) -> Section:
         return skipped(f"skipped: the console is not answering at {ctx.base}")
 
     data: dict[str, Any] = {}
-    ran, results = _browser_check(ctx, ["--quick"] if ctx.args.quick else [], "browser",
-                                  300 if ctx.args.quick else 900)
+    # The default set searches through the embedder, which the console's
+    # arbiter puts behind a run's seat or a rebuild and which then evicts the
+    # model they hold: while either is in flight the passes are the quick set.
+    busy = ctx.busy_reasons()
+    quick = bool(ctx.args.quick or busy)
+    if busy and not ctx.args.quick:
+        data["heavy_passes"] = f"skipped because {' and '.join(busy)}"
+    ran, results = _browser_check(ctx, ["--quick"] if quick else [], "browser",
+                                  300 if quick else 900)
     passes = [p for p in results.get("passes") or [] if isinstance(p, dict)]
     data["exit"] = ran.code
     data["browser"] = results.get("browser")
@@ -2446,7 +2551,7 @@ def diagnose(ctx: Context, names: list[str]) -> int:
                      for s in sections},
         "saved_logs": saved,
     }
-    # Whatever a helper wrote under the report directory is redacted before
+    # The files helpers wrote under the report directory are redacted before
     # anything is read back into the report, or bundled.
     _redact_tree(ctx, ctx.out)
     results = redact_data(results, ctx.counts)
