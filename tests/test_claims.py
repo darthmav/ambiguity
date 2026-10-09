@@ -191,6 +191,53 @@ def test_the_structure_tree_lists_every_module_test_and_script():
 
 
 # ---------------------------------------------------------------------------
+# the network check
+# ---------------------------------------------------------------------------
+
+
+def _network_groups() -> dict[str, set[str]]:
+    """`scripts/network_check.sh`'s table: each group and the hosts it asks."""
+    text = (ROOT / "scripts" / "network_check.sh").read_text(encoding="utf-8")
+    table = re.search(r"^TABLE='\n(.*?)^'", text, re.S | re.M)
+    assert table, "scripts/network_check.sh has no TABLE"
+    rows = [row.split("|") for row in table.group(1).splitlines() if row.strip()]
+    return {row[0]: set(row[1].split()) for row in rows}
+
+
+def test_the_network_check_asks_every_host_the_code_downloads_from():
+    """A host the code reaches and the check never asks is the one an
+    allowlist built from its output leaves off."""
+    from urllib.parse import urlparse
+
+    from langgraph_agent.graphrag_server import EMBEDDING_MODEL_NAME
+    from langgraph_agent.web_research import DUCKDUCKGO_ENDPOINT
+
+    groups = _network_groups()
+    pulled = {seat["model"] for seat in DEFAULT_SEATS.values() if seat["provider"] == "ollama"}
+    for tag in pulled | {EMBEDDING_MODEL_NAME}:
+        group, host = ("hf", "hf.co") if tag.startswith("hf.co/") else ("ollama", "registry.ollama.ai")
+        assert host in groups[group], f"{tag} is pulled from {host}, which {group!r} never asks"
+    assert "huggingface.co" in groups["tokenizer"], "the tokenizer comes from the hub"
+    assert urlparse(DUCKDUCKGO_ENDPOINT).hostname in groups["research"]
+
+
+def test_every_network_group_an_installer_names_exists():
+    """A group the check does not know exits 2, which an installer reports as
+    a network that blocked it -- on every machine, open networks included."""
+    known = set(_network_groups())
+    named: set[str] = set()
+    for path in ("install.sh", "docker/install.sh", "dockerfile"):
+        text = (ROOT / path).read_text(encoding="utf-8").replace("\\\n", " ")
+        calls = re.findall(r"network_check\.sh ([^;\n]*)", text)
+        assert calls, f"{path} no longer runs the network check"
+        arrays = re.findall(r"net_groups\+?=\(([^)]*)\)", text)
+        for words in [*calls, *arrays]:
+            named |= {w for w in words.split() if re.fullmatch(r"[a-z]+", w)}
+    named -= {"then", "bash"}  # the shell around a call, not its groups
+    assert named and named <= known, f"groups the check does not know: {sorted(named - known)}"
+
+
+# ---------------------------------------------------------------------------
 # figures quoted in prose
 # ---------------------------------------------------------------------------
 

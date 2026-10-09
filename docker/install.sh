@@ -75,6 +75,22 @@ if [ "$(id -u)" -eq 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 0. Network
+# ---------------------------------------------------------------------------
+
+# ../install.sh's first step, for this install's hosts: the host's packages,
+# the images, the models, GitHub -- and the image build's own downloads, which
+# go out over this machine's network too. The build forgives a hub it cannot
+# reach (the image fetches the tokenizer on first use), so that one is optional.
+step "Network (the hosts this install downloads from)"
+NETWORK_OK=1
+if ! scripts/network_check.sh arch dockerhub pypi ollama hf github \
+        --optional tokenizer research cloud; then
+    NETWORK_OK=0
+    problem "the network did not let through every host this install needs; allow the entries above"
+fi
+
+# ---------------------------------------------------------------------------
 # 1. System packages
 # ---------------------------------------------------------------------------
 
@@ -96,6 +112,11 @@ else
     [ "$ASSUME_YES" -eq 1 ] && pacman_flags+=(--noconfirm)
     # No -y, for ../install.sh's reason: a partial upgrade is not supported.
     if ! sudo pacman "${pacman_flags[@]}" "${missing[@]}"; then
+        if [ "$NETWORK_OK" -eq 0 ]; then
+            echo "  pacman failed, and the Network step above found hosts that" >&2
+            echo "  did not answer: start there, then re-run." >&2
+            exit 1
+        fi
         echo "  pacman failed; if a package was not found, run omarchy-update" >&2
         echo "  (or sudo pacman -Syu) and re-run." >&2
         exit 1
@@ -225,6 +246,18 @@ if systemctl cat ollama.service >/dev/null 2>&1; then
         ok "limited the daemon to one model at a time ($one_model)"
     else
         problem "could not limit the daemon to one model; see $one_model"
+    fi
+fi
+
+# Kept running, as ../install.sh keeps it: enabled at boot and restarted
+# whenever it exits. The container reaches every seat and the embedder
+# through this one daemon.
+if systemctl cat ollama.service >/dev/null 2>&1; then
+    if scripts/ollama_keepalive.sh check >/dev/null 2>&1; then
+        ok "the daemon starts at boot and is restarted whenever it exits"
+    else
+        scripts/ollama_keepalive.sh install \
+            || problem "the daemon is not kept running; scripts/ollama_keepalive.sh check says what is missing"
     fi
 fi
 

@@ -251,6 +251,34 @@ def test_a_daemon_with_nothing_pulled_is_not_called_unreachable(monkeypatch):
     assert config.get_agent_status("planner")["badge"] == "OFFLINE"
 
 
+def test_a_seat_that_met_the_down_daemon_reads_like_every_other_seat(monkeypatch):
+    """The seat whose call met the open circuit read "ollama-daemon unreachable;
+    next try in 5s", FAILING, beside three reading "Ollama daemon unreachable",
+    OFFLINE -- one outage, two stories. And it stayed FAILING after the daemon
+    came back, until that seat happened to make a call."""
+    from langgraph_agent.self_healing import CircuitOpenError
+
+    monkeypatch.setattr(config, "_seat_failures", {})
+    monkeypatch.setattr(config, "_ollama_tags_cache", (0.0, None))
+    config.set_agent_llm("planner", "ollama", config.DOLPHIN_9B)
+    config._seat_failures["planner"] = config._seat_failure_reason(
+        "ollama", CircuitOpenError(config.OLLAMA_DAEMON.name, 5.0)
+    )
+
+    def refused(path: str, payload: Any = None, *, timeout: float) -> Any:
+        raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+    monkeypatch.setattr(config, "daemon_request", refused)
+    down = config.get_agent_status("planner")
+    assert (down["badge"], down["reason"]) == ("OFFLINE", config.DAEMON_UNREACHABLE)
+
+    monkeypatch.setattr(config, "_ollama_tags_cache", (0.0, None))
+    monkeypatch.setattr(config, "daemon_request",
+                        lambda path, payload=None, *, timeout: {"models": [{"name": config.DOLPHIN_9B}]})
+    assert config.get_agent_status("planner")["live"] is True
+    config._agent_llm_overrides.pop("planner", None)
+
+
 def test_a_daemon_answering_with_an_error_is_up(monkeypatch):
     def urlopen(request: Any, timeout: float | None = None) -> Any:
         raise urllib.error.HTTPError(request.full_url, 404, "Not Found", None, io.BytesIO())

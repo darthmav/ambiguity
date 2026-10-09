@@ -188,7 +188,9 @@ Later cycles route as the Planner asks.
 
 Every seat is reassignable live from its dropdown in the console, which lists
 exactly what `ollama ls` reports (embedders excluded), so a tag you pull appears
-on the next poll; selections last for the life of the process. `qwen3-embedding:latest`
+on the next poll, plus the Anthropic models a seat takes from `.env` (marked
+when `ANTHROPIC_API_KEY` is unset, since the seat then runs canned stub output);
+selections last for the life of the process. `qwen3-embedding:latest`
 is the embedder's, not a seat's: it cannot chat. Only `qwen3.8:latest`
 reports `tools`, which is why it -- not either dolphin -- holds the Builder.
 
@@ -241,6 +243,21 @@ server with pgvector.
 ```bash
 ./install.sh            # --help lists --minimal, --no-system, --no-searxng, ...
 ```
+
+The Ollama daemon serves every default seat and the embedder, so the installer
+keeps it running: `ollama.service` is enabled at boot and a systemd drop-in
+restarts it whenever it exits, with no start limit to give up at
+(`scripts/ollama_keepalive.sh check` reports both).
+
+Its first step asks every host it will download from — the package mirrors,
+PyPI, the Ollama and Hugging Face registries, Docker Hub, GitHub — and names
+any that does not answer, with what needs it and why it failed (a proxy's
+refusal, a certificate the machine does not trust, a name that does not
+resolve). Behind an egress allowlist (a company proxy, or a Claude Code cloud
+environment, whose Network access is set per environment) it prints the
+entries to add, one per line. No script can add them: the allowlist belongs to
+the network. `docker/install.sh` and the image build ask the same way, and
+`scripts/network_check.sh --help` runs it on its own.
 
 Everything it installs is free to use. Elsewhere, or by hand:
 

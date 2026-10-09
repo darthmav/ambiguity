@@ -119,12 +119,15 @@ def test_seat_names_must_be_strings():
 @pytest.mark.parametrize("provider,model", [
     ("ollama", "gemma4:cloud"),              # a model the console used to offer
     ("ollama", "qwen3-embedding:latest"),    # pulled, but it cannot chat
-    ("anthropic", "claude-opus-5"),
+    ("anthropic", "claude-3-opus-20240229"), # an Anthropic model it does not offer
     ("anthropic", "kimi-k3:cloud"),          # an offered model under the wrong provider
 ])
-def test_a_seat_takes_only_a_model_the_console_offers(provider, model):
+def test_a_seat_takes_only_a_model_the_console_offers(provider, model, monkeypatch):
     """The dropdown is the whole list, so a stale tab cannot seat anything else."""
     from langgraph_agent.config import get_agent_model_info
+
+    monkeypatch.setattr(serve, "ollama_daemon_tags", lambda: None)
+    monkeypatch.setattr(serve, "_last_ollama_options", [])
 
     before = get_agent_model_info("planner")
     with pytest.raises(ValueError, match="not a seat model the console offers"):
@@ -133,8 +136,8 @@ def test_a_seat_takes_only_a_model_the_console_offers(provider, model):
 
 
 def test_the_seat_dropdowns_are_exactly_ollama_ls(monkeypatch):
-    """The dropdowns hold every tag the daemon lists that can complete, and
-    nothing kept in code: no tag is offered because a list here names it.
+    """The Ollama options are every tag the daemon lists that can complete, and
+    nothing kept in code: no Ollama tag is offered because a list here names it.
 
     Cloud tags appear when the daemon lists them (pulled or used), grouped apart
     from local weights. An embedder (no `completion`) is left out; a tag the
@@ -155,15 +158,15 @@ def test_the_seat_dropdowns_are_exactly_ollama_ls(monkeypatch):
             return None
         return ["completion", "tools", "thinking"]
 
-    monkeypatch.setattr(serve, "list_ollama_models", lambda: tags)
+    monkeypatch.setattr(serve, "ollama_daemon_tags", lambda: tags)
+    monkeypatch.setattr(serve, "_last_ollama_options", [])
     monkeypatch.setattr(serve, "ollama_model_capabilities", caps)
 
-    options = serve.rpc_llm_options({})["options"]
+    options = [o for o in serve.rpc_llm_options({})["options"] if o["provider"] == "ollama"]
     models = [o["model"] for o in options]
     assert sorted(models) == sorted(
         ["kimi-k3:cloud", "nemotron-3-nano:30b-cloud", "qwen3.8:latest", "mystery:latest"]
     )
-    assert all(o["provider"] == "ollama" for o in options)
     groups = {o["model"]: o["group"] for o in options}
     assert groups["kimi-k3:cloud"] == groups["nemotron-3-nano:30b-cloud"] == "Ollama Cloud"
     assert groups["qwen3.8:latest"] == groups["mystery:latest"] == "Ollama (local)"
@@ -175,12 +178,53 @@ def test_the_seat_dropdowns_are_exactly_ollama_ls(monkeypatch):
 
 def test_a_tag_the_daemon_does_not_list_is_not_offered_and_not_seatable(monkeypatch):
     """A cloud tag that was hardcoded once is gone the moment `ollama ls` is."""
-    monkeypatch.setattr(serve, "list_ollama_models", lambda: ["qwen3.8:latest"])
+    monkeypatch.setattr(serve, "ollama_daemon_tags", lambda: ["qwen3.8:latest"])
+    monkeypatch.setattr(serve, "_last_ollama_options", [])
     monkeypatch.setattr(serve, "ollama_model_capabilities", lambda m: ["completion"])
 
-    assert [o["model"] for o in serve.rpc_llm_options({})["options"]] == ["qwen3.8:latest"]
+    offered = serve.rpc_llm_options({})["options"]
+    assert [o["model"] for o in offered if o["provider"] == "ollama"] == ["qwen3.8:latest"]
     with pytest.raises(ValueError, match="not a seat model the console offers"):
         serve.rpc_set_seat({"agent": "planner", "provider": "ollama", "model": "kimi-k3:cloud"})
+
+
+def test_anthropic_is_offered_and_says_when_it_has_no_key(monkeypatch):
+    """Moving a seat to Anthropic took a `.env` edit and a restart. The
+    dropdown now offers the models `.env` would give a seat, and a model that
+    would run the stub for want of a key says so before it is picked."""
+    from langgraph_agent import config
+    from langgraph_agent.config import ANTHROPIC_SEAT_MODELS
+
+    monkeypatch.setattr(config, "_agent_llm_overrides", {})
+    monkeypatch.setattr(serve, "ollama_daemon_tags", lambda: [])
+    monkeypatch.setattr(serve, "_last_ollama_options", [])
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    offered = [o for o in serve.rpc_llm_options({})["options"] if o["provider"] == "anthropic"]
+    assert [o["model"] for o in offered] == list(ANTHROPIC_SEAT_MODELS)
+    assert all("no key" in o["label"] and "ANTHROPIC_API_KEY" in o["group"] for o in offered)
+
+    seat = serve.rpc_set_seat({"agent": "planner", "provider": "anthropic", "model": offered[0]["model"]})
+    assert (seat["provider"], seat["badge"]) == ("anthropic", "NO KEY")
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    keyed = [o for o in serve.rpc_llm_options({})["options"] if o["provider"] == "anthropic"]
+    assert all(o["label"] == o["model"] and o["group"] == "Anthropic" for o in keyed)
+
+
+def test_a_daemon_that_cannot_be_asked_leaves_its_last_list_offered(monkeypatch):
+    """The dropdown emptied whenever the daemon was down, so no seat could be
+    moved -- not even onto a provider that needs no daemon."""
+    monkeypatch.setattr(serve, "_last_ollama_options", [])
+    monkeypatch.setattr(serve, "ollama_model_capabilities", lambda m: ["completion"])
+    monkeypatch.setattr(serve, "ollama_daemon_tags", lambda: ["qwen3.8:latest"])
+    serve.rpc_llm_options({})
+
+    monkeypatch.setattr(serve, "ollama_daemon_tags", lambda: None)
+    ollama = [o for o in serve.rpc_llm_options({})["options"] if o["provider"] == "ollama"]
+
+    assert [o["model"] for o in ollama] == ["qwen3.8:latest"]
+    assert "daemon down" in ollama[0]["group"]
 
 
 # ---------------------------------------------------------------------------

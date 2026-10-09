@@ -24,7 +24,9 @@ in `_DEFAULT_AGENT_MODELS` for its provider; `DEFAULT_SEATS` is derived from
 that. Then update the seat table in CLAUDE.md and the override templates in
 `.env.example` (`tests/test_claims.py` checks both), and list the tag in
 `AGENT_LLM_OPTIONS` so `install.sh` pulls it. That list is not the offer: the
-dropdowns and `set_seat` read `ollama ls` (`_seat_model_options`). Check the
+dropdowns and `set_seat` read `ollama ls` (`_seat_model_options`), plus the
+Anthropic defaults (`ANTHROPIC_SEAT_MODELS`, derived from
+`_DEFAULT_AGENT_MODELS`). Check the
 tag reports `tools` before seating it as the Builder: that seat's work *is*
 tool calls, and `get_agent_status` puts a **NO TOOLS** chip on its card alone.
 

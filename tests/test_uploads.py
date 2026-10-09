@@ -112,6 +112,35 @@ def test_the_id_and_metadata_match_what_a_reindex_would_write(kb, tmp_path, monk
     assert metadata == _document_metadata(walked)
 
 
+class _FailingKB(_RecordingKB):
+    """An embedder that cannot embed: the daemon down, the tokenizer missing."""
+
+    def add_document(self, doc_id: str, content: str, metadata: dict[str, Any]) -> int:
+        raise OSError("the embedding tokenizer is not cached here")
+
+
+def test_an_upload_that_fails_to_embed_leaves_nothing_behind(root):
+    """The console says "not stored" when the call fails, so nothing may be.
+
+    The file used to stay under uploads/ after the embed failed, and the next
+    rebuild embedded the document the operator had been told was refused.
+    """
+    with pytest.raises(OSError, match="tokenizer"):
+        store_uploaded_document(_FailingKB(), "notes.md", "The Architect rules.", root)
+
+    assert not (Path(root) / UPLOADS_DIR / "notes.md").exists()
+
+
+def test_a_re_upload_that_fails_to_embed_keeps_the_version_the_corpus_holds(kb, root):
+    """A failed correction must not swap the file under the chunks of the old one."""
+    store_uploaded_document(kb, "spec.md", "First draft.", root)
+
+    with pytest.raises(OSError):
+        store_uploaded_document(_FailingKB(), "spec.md", "Second draft.", root)
+
+    assert (Path(root) / UPLOADS_DIR / "spec.md").read_text() == "First draft."
+
+
 def test_re_uploading_a_name_replaces_rather_than_accumulates(kb, root):
     """The ordinary way to correct a document, and it must not leave two.
 

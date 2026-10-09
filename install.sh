@@ -96,6 +96,23 @@ if [ "$(id -u)" -eq 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 0. Network
+# ---------------------------------------------------------------------------
+
+# Before anything downloads. Behind an egress allowlist each blocked host
+# otherwise fails its own step, worded by whichever tool met it; asked up
+# front, every host this install needs is named at once, with what needs it.
+step "Network (the hosts this install downloads from)"
+net_groups=(pypi ollama hf tokenizer github)
+[ "$SYSTEM" -eq 1 ] && net_groups+=(arch)
+{ [ "$POSTGRES" -eq 1 ] || [ "$SEARXNG" -eq 1 ]; } && net_groups+=(dockerhub)
+NETWORK_OK=1
+if ! scripts/network_check.sh "${net_groups[@]}" --optional research cloud; then
+    NETWORK_OK=0
+    problem "the network did not let through every host this install needs; allow the entries above"
+fi
+
+# ---------------------------------------------------------------------------
 # 1. System packages
 # ---------------------------------------------------------------------------
 
@@ -180,6 +197,11 @@ if [ "$SYSTEM" -eq 1 ]; then
         # support. If the mirrors have moved on, upgrade the system properly
         # (omarchy-update, or sudo pacman -Syu) and re-run.
         if ! sudo pacman "${pacman_flags[@]}" "${missing[@]}"; then
+            if [ "$NETWORK_OK" -eq 0 ]; then
+                echo "  pacman failed, and the Network step above found hosts that" >&2
+                echo "  did not answer: start there, then re-run ./install.sh." >&2
+                exit 1
+            fi
             echo "  pacman failed. If it could not find a package or file, the" >&2
             echo "  package database is stale: run omarchy-update (or" >&2
             echo "  sudo pacman -Syu) and then re-run ./install.sh." >&2
@@ -359,6 +381,20 @@ else
             fi
         else
             echo "  --no-system does not configure the daemon; for one model at a time write $one_model with OLLAMA_MAX_LOADED_MODELS=1 and OLLAMA_NUM_PARALLEL=1"
+        fi
+    fi
+
+    # Every seat and the embedder are this one daemon, so it is kept running:
+    # enabled at boot and restarted whenever it exits (scripts/ollama_keepalive.sh).
+    if [ -z "${OLLAMA_BASE_URL:-}" ] && systemctl cat ollama.service >/dev/null 2>&1; then
+        if scripts/ollama_keepalive.sh check >/dev/null 2>&1; then
+            ok "the daemon starts at boot and is restarted whenever it exits"
+        elif [ "$SYSTEM" -eq 1 ]; then
+            echo "  starting the daemon at boot and restarting it whenever it exits"
+            scripts/ollama_keepalive.sh install \
+                || problem "the daemon is not kept running; scripts/ollama_keepalive.sh check says what is missing"
+        else
+            echo "  --no-system does not configure the daemon; to keep it running: scripts/ollama_keepalive.sh install"
         fi
     fi
 

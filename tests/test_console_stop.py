@@ -484,3 +484,57 @@ def test_a_termination_signal_with_no_run_exits_at_once():
     serve._exit_the_way_the_console_would(signal.SIGTERM, None)
 
     assert serve._shutdown_requested.is_set()
+
+
+# ---------------------------------------------------------------------------
+# The project folder a run is given
+# ---------------------------------------------------------------------------
+
+
+def test_a_run_that_wrote_nothing_leaves_no_empty_project_behind(tmp_path, monkeypatch):
+    """A failed, stopped or empty run left projects/<goal> behind, to be offered
+    in the dropdown and announced in the verdict as where the work was stored."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(serve, "graph", _FakeGraph(["architect", "builder"]))
+
+    result = serve.rpc_run_goal({"goal": "Do a thing", "project": "nothing-written"})
+
+    assert result["project_removed"] is True
+    assert not (tmp_path / "projects" / "nothing-written").exists()
+
+
+def test_a_failed_run_takes_its_empty_project_with_it(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(serve, "graph", _FakeGraph(["architect"], raises=RuntimeError("seat died")))
+
+    with pytest.raises(RuntimeError):
+        serve.rpc_run_goal({"goal": "Do a thing", "project": "died-early"})
+
+    assert not (tmp_path / "projects" / "died-early").exists()
+    assert serve.rpc_last_run({})["snapshot"]["project_removed"] is True
+
+
+def test_a_project_with_work_in_it_is_kept(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    def write():
+        (tmp_path / "projects" / "built" / "hello.py").write_text("print('hi')\n")
+
+    monkeypatch.setattr(serve, "graph", _FakeGraph(["builder"], during_step=write))
+
+    result = serve.rpc_run_goal({"goal": "Do a thing", "project": "built"})
+
+    assert result["project_removed"] is False
+    assert (tmp_path / "projects" / "built" / "hello.py").exists()
+
+
+def test_a_project_that_was_there_before_the_run_is_never_removed(tmp_path, monkeypatch):
+    """Even empty: the operator chose it from the dropdown."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "projects" / "mine").mkdir(parents=True)
+    monkeypatch.setattr(serve, "graph", _FakeGraph(["architect"]))
+
+    result = serve.rpc_run_goal({"goal": "Do a thing", "project": "mine"})
+
+    assert result["project_removed"] is False
+    assert (tmp_path / "projects" / "mine").is_dir()

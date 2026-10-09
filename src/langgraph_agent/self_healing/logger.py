@@ -163,11 +163,29 @@ class SelfHealingLogger:
             failure_count=failure_count,
         )
 
-    def log_circuit_closed(self, func_name: str) -> None:
-        """Log when circuit breaker closes (recovery)."""
+    def log_circuit_closed(self, func_name: str, refused: int = 0,
+                           failed_trials: int = 0) -> None:
+        """Log when circuit breaker closes (recovery), with what the open spell cost."""
+        spell = []
+        if refused:
+            spell.append(f"{refused} call(s) refused")
+        if failed_trials:
+            spell.append(f"{failed_trials} trial(s) failed")
         self.info(
-            f"Circuit breaker CLOSED for '{func_name}' - service recovered",
+            f"Circuit breaker CLOSED for '{func_name}' - service recovered"
+            + (f" ({', '.join(spell)} while it was open)" if spell else ""),
             action="circuit_closed",
+            function=func_name,
+            refused=refused,
+            failed_trials=failed_trials,
+        )
+
+    def log_circuit_trial_failed(self, func_name: str, cooldown: float) -> None:
+        """Log the first failed trial of an open spell; later ones are only counted."""
+        self.warning(
+            f"Circuit breaker for '{func_name}' stays OPEN: its trial call failed. "
+            f"It is tested again every {cooldown:g}s until it answers.",
+            action="circuit_trial_failed",
             function=func_name,
         )
 
