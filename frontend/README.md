@@ -100,8 +100,10 @@ that document rather than adding a second copy of it.
 ## Crew rail
 
 One card per seat: role-coloured dot and border, a dropdown of the seat models
-the console offers (every tag `ollama ls` reports, embedders excluded;
-`set_seat` refuses anything the daemon does not list),
+the console offers (every tag `ollama ls` reports, embedders excluded -- the
+tags it last listed, so marked, while the daemon cannot be asked -- and the
+Anthropic models `.env` would seat, labelled when `ANTHROPIC_API_KEY` is unset;
+`set_seat` refuses anything else),
 the provider with a
 *thinking* checkbox beside it, and chips for placement (`REMOTE` / `LOCAL`)
 and `NO KEY`.
@@ -161,7 +163,7 @@ request, so both come back 200.
 | `list_seats` | — | the four seats and whether each can run |
 | `set_seat` | `agent`, `provider`, `model` | the updated seat |
 | `set_thinking` | `agent`, `thinking` (a JSON boolean) | the updated seat; refused for a model with no switch |
-| `llm_options` | — | the seat models the console offers (`ollama ls` minus embedders) |
+| `llm_options` | — | the seat models the console offers (`ollama ls` minus embedders, and Anthropic's) |
 | `embedding_options` | — | the embedding model, its corpus and its relevance floor |
 | `run_goal` | `goal`, `project`, `research_web`, `expect_failures`, `discuss_only` | the final `AgentState`, plus how the run ended |
 | `run_progress` | — | the run in flight: active seat, turns, messages |
@@ -206,7 +208,8 @@ ticked. Check `rag_stats` reports non-zero nodes afterwards.
 
 **The header shows `ollama-daemon down`** — the daemon stopped answering and its
 circuit opened. It closes on its own once a trial call succeeds; click the chip
-to send one now.
+to send one now. The installers have systemd restart the daemon whenever it
+exits; `scripts/ollama_keepalive.sh check` says whether that is in place.
 
 **The header shows `PR #N waiting on CI`** — a run's `git_dwell` pushed and
 opened a pull request whose checks outlasted the Builder's deadline. The

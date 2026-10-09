@@ -111,14 +111,16 @@ python example_usage.py
 │   ├── test_rpc_params.py     # RPC parameters: typed, bounded, refused by name
 │   ├── test_projects.py       # Generated projects: the held-out walk, the write scope, embedding
 │   ├── test_spectral_graph.py # The spectral_graph package, against closed-form spectra
-│   └── test_dwell_tool.py     # The command-line dwell tool's confinement to this folder
+│   ├── test_dwell_tool.py     # The command-line dwell tool's confinement to this folder
+│   └── test_ollama_keepalive.py # The keep-alive drop-in, against stand-in sudo and systemctl
 ├── scripts/
 │   ├── verify_and_test.py     # Manual verification: dependencies, seats, a search, the suite
 │   ├── cloud_smoke.py         # One run with every seat on Anthropic
 │   ├── spectral_benchmark.py  # Graph-architecture sweep behind the A-numbers
 │   ├── diagnose_seats.py      # Role probes + team runs per seating
 │   ├── dwell.py               # The dwell pipeline from the command line, confined to this folder
-│   └── network_check.sh       # Which download hosts the network lets through; the installers' first step
+│   ├── network_check.sh       # Which download hosts the network lets through; the installers' first step
+│   └── ollama_keepalive.sh    # systemd keeps the daemon running: enabled at boot, restarted on any exit
 ├── frontend/
 │   ├── index.html             # Web console SPA
 │   └── README.md
@@ -454,7 +456,11 @@ closes it. Where it is used:
   the embedder and every status read go through it (`daemon_request`), and only
   an unreachable daemon trips it (`daemon_unreachable`) -- an HTTP error is the
   daemon answering. `retry_unreachable` retries a daemon call briefly, since an
-  unreachable daemon ran nothing; the emergency stop ends the wait.
+  unreachable daemon ran nothing; the emergency stop ends the wait. Underneath
+  it systemd keeps the daemon running: both installers write a keep-alive
+  drop-in (`scripts/ollama_keepalive.sh`) -- enabled at boot, `Restart=always`,
+  no start limit. Every Ollama seat words an unreachable daemon the same way
+  (`DAEMON_UNREACHABLE`), as OFFLINE, until it answers.
 - **The embedder** retries a failed model load (5xx) on its own longer
   schedule, and a schedule that still ends in a 5xx opens `EMBEDDER_LOAD`
   (`embedder-load`): every embed is refused at once until a single-attempt
@@ -536,7 +542,8 @@ every checkout has, so `uploads/`, `projects/` and fetched pages are out.
   its circuit opened, so calls fail at once instead of each waiting it out.
   It closes by itself once the daemon answers a trial call; clicking the chip
   lets the next call through now. A rebuild it interrupted is redone by the
-  monitor once the daemon is back.
+  monitor once the daemon is back. systemd restarts a daemon that exited;
+  `scripts/ollama_keepalive.sh check` says whether the installer set that up.
 - **The header shows `embedder-load down`** -- the embedding model's forced
   load failed a whole retry schedule. `journalctl -u ollama` names the card and
   the allocation that failed, and `nvidia-smi` what else holds that card -- on

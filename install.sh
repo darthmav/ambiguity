@@ -384,6 +384,20 @@ else
         fi
     fi
 
+    # Every seat and the embedder are this one daemon, so it is kept running:
+    # enabled at boot and restarted whenever it exits (scripts/ollama_keepalive.sh).
+    if [ -z "${OLLAMA_BASE_URL:-}" ] && systemctl cat ollama.service >/dev/null 2>&1; then
+        if scripts/ollama_keepalive.sh check >/dev/null 2>&1; then
+            ok "the daemon starts at boot and is restarted whenever it exits"
+        elif [ "$SYSTEM" -eq 1 ]; then
+            echo "  starting the daemon at boot and restarting it whenever it exits"
+            scripts/ollama_keepalive.sh install \
+                || problem "the daemon is not kept running; scripts/ollama_keepalive.sh check says what is missing"
+        else
+            echo "  --no-system does not configure the daemon; to keep it running: scripts/ollama_keepalive.sh install"
+        fi
+    fi
+
     if ! daemon_up; then
         problem "Ollama daemon unreachable at $OLLAMA_URL"
     else

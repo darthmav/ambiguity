@@ -249,6 +249,18 @@ if systemctl cat ollama.service >/dev/null 2>&1; then
     fi
 fi
 
+# Kept running, as ../install.sh keeps it: enabled at boot and restarted
+# whenever it exits. The container reaches every seat and the embedder
+# through this one daemon.
+if systemctl cat ollama.service >/dev/null 2>&1; then
+    if scripts/ollama_keepalive.sh check >/dev/null 2>&1; then
+        ok "the daemon starts at boot and is restarted whenever it exits"
+    else
+        scripts/ollama_keepalive.sh install \
+            || problem "the daemon is not kept running; scripts/ollama_keepalive.sh check says what is missing"
+    fi
+fi
+
 if ! daemon_up; then
     problem "the Ollama daemon does not answer at $OLLAMA_URL"
 else

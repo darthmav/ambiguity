@@ -208,21 +208,17 @@ def test_the_stale_verdict_is_withheld_while_a_run_is_in_flight(monkeypatch, tmp
     assert during["missing_count"] == 1
 
 
-def test_an_emptied_corpus_is_not_accused_of_drifting(monkeypatch, tmp_path):
-    """Clear leaves `empty`, and `empty` is not a verdict about the project.
+def test_an_empty_corpus_missing_archive_files_is_stale(monkeypatch, tmp_path):
+    """An empty corpus is held to the walk like any other.
 
-    Pressing Clear on this project left the header reading "stale: 112 not
-    indexed" -- the store held nothing, the walk offered 112, and the
-    comparison is arithmetically right and useless: it restates the state the
-    operator just asked for as an accusation, and the only thing that acts on
-    it is the run that would rebuild the corpus anyway. Staleness is worth
-    reporting precisely because a drifting corpus looks like a healthy one;
-    an empty corpus says so on its own chip. The counts stay, as they do under
-    `settling`.
+    It used to be excused: pressing Clear left the header reading "stale: 112
+    not indexed", because the store was emptied and the files a rebuild walks
+    were left where they were. Clear deletes those files now
+    (`remove_corpus_sources`), so after one the walk offers nothing and there is
+    nothing to report -- while the excuse went on hiding the one case left, a
+    rebuild where every file failed, behind a header that read "corpus empty".
     """
     import serve
-
-    root = _project(tmp_path, **{"a.md": "alpha", "b.md": "beta"})
 
     class _KB:
         graph = __import__("networkx").DiGraph()
@@ -234,24 +230,27 @@ def test_an_emptied_corpus_is_not_accused_of_drifting(monkeypatch, tmp_path):
             return {"total_documents": 0, "total_chunks": self._chunks,
                     "total_nodes": 0, "total_edges": 0}
 
-    monkeypatch.setattr(serve, "corpus_staleness", lambda docs: corpus_staleness(docs, root, use_cache=False))
     monkeypatch.setitem(serve._run_progress, "running", False)
     monkeypatch.setitem(serve._background_rebuild, "running", False)
-
     monkeypatch.setattr(serve, "_open_kb", lambda: _KB(0))
-    emptied = serve.rpc_rag_stats({})
-    assert emptied["corpus"] == "empty"
-    assert not emptied["staleness"]["stale"]
-    assert emptied["staleness"]["emptied"] is True
-    # Still the truth about this instant, as under `settling`.
-    assert emptied["staleness"]["missing_count"] == 2
 
-    # And an indexed corpus that has drifted is still accused: the suppression
-    # is about the empty state, not about the comparison.
-    monkeypatch.setattr(serve, "_open_kb", lambda: _KB(1))
-    drifted = serve.rpc_rag_stats({})
-    assert drifted["corpus"] == "indexed"
-    assert drifted["staleness"]["stale"] is True
+    # As Clear leaves it: an empty store and nothing for a rebuild to walk.
+    cleared_root = str(tmp_path / "cleared")
+    (tmp_path / "cleared").mkdir()
+    monkeypatch.setattr(serve, "corpus_staleness",
+                        lambda docs: corpus_staleness(docs, cleared_root, use_cache=False))
+    cleared = serve.rpc_rag_stats({})
+    assert cleared["corpus"] == "empty"
+    assert not cleared["staleness"]["stale"]
+
+    # An empty store beside files that did not index.
+    root = _project(tmp_path / "failed", **{"a.md": "alpha", "b.md": "beta"})
+    monkeypatch.setattr(serve, "corpus_staleness",
+                        lambda docs: corpus_staleness(docs, root, use_cache=False))
+    failed = serve.rpc_rag_stats({})
+    assert failed["corpus"] == "empty"
+    assert failed["staleness"]["stale"] is True
+    assert failed["staleness"]["missing_count"] == 2
 
 
 def test_an_absent_corpus_says_whether_there_is_anything_to_build_it_from(monkeypatch, tmp_path):

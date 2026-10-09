@@ -188,7 +188,9 @@ Later cycles route as the Planner asks.
 
 Every seat is reassignable live from its dropdown in the console, which lists
 exactly what `ollama ls` reports (embedders excluded), so a tag you pull appears
-on the next poll; selections last for the life of the process. `qwen3-embedding:latest`
+on the next poll, plus the Anthropic models a seat takes from `.env` (marked
+when `ANTHROPIC_API_KEY` is unset, since the seat then runs canned stub output);
+selections last for the life of the process. `qwen3-embedding:latest`
 is the embedder's, not a seat's: it cannot chat. Only `qwen3.8:latest`
 reports `tools`, which is why it -- not either dolphin -- holds the Builder.
 
@@ -241,6 +243,11 @@ server with pgvector.
 ```bash
 ./install.sh            # --help lists --minimal, --no-system, --no-searxng, ...
 ```
+
+The Ollama daemon serves every default seat and the embedder, so the installer
+keeps it running: `ollama.service` is enabled at boot and a systemd drop-in
+restarts it whenever it exits, with no start limit to give up at
+(`scripts/ollama_keepalive.sh check` reports both).
 
 Its first step asks every host it will download from — the package mirrors,
 PyPI, the Ollama and Hugging Face registries, Docker Hub, GitHub — and names

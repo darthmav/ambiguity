@@ -65,6 +65,11 @@ _DEFAULT_AGENT_MODELS: dict[Provider, dict[AgentName, str]] = {
     },
 }
 
+# The Anthropic models the console's seat dropdowns offer: the ones a seat takes
+# when `{ROLE}_PROVIDER=anthropic` names no model, so the dropdown and `.env`
+# reach the same models. Ollama's offer is whatever the daemon lists.
+ANTHROPIC_SEAT_MODELS: tuple[str, ...] = tuple(dict.fromkeys(_DEFAULT_AGENT_MODELS["anthropic"].values()))
+
 # The model a provider runs when neither the seat nor the environment
 # (`OLLAMA_MODEL`, `ANTHROPIC_MODEL`) names one.
 _PROVIDER_DEFAULT_MODELS: dict[Provider, str] = {
@@ -435,6 +440,23 @@ def _failure_reason(exc: Exception) -> str:
     return message[:90].strip()
 
 
+# How every Ollama seat says the daemon could not be reached, whether the
+# status poll found it gone or the seat's own last call did. Worded apart, the
+# banner read "architect -- ollama-daemon unreachable; next try in 5s" beside
+# three seats reading "Ollama daemon unreachable", over one outage.
+DAEMON_UNREACHABLE = "Ollama daemon unreachable"
+
+
+def _seat_failure_reason(provider: str, exc: Exception) -> str:
+    """`_failure_reason`, with an unreachable daemon worded one way for every Ollama seat."""
+    if provider == "ollama" and (
+        (isinstance(exc, CircuitOpenError) and exc.circuit == OLLAMA_DAEMON.name)
+        or daemon_unreachable(exc)
+    ):
+        return DAEMON_UNREACHABLE
+    return _failure_reason(exc)
+
+
 class SeatCallAbandoned(RuntimeError):
     """A seat call ended part-way because the node waiting for it had given up."""
 
@@ -576,14 +598,14 @@ class _SeatLLM:
                             "unforced reload", f"seat:{self._agent}", False,
                             f"{tag}: {_failure_reason(retried)}",
                         )
-                        _seat_failures[self._agent] = _failure_reason(retried)
+                        _seat_failures[self._agent] = _seat_failure_reason(self._provider, retried)
                         raise
                     healing.log_recovery_action(
                         "unforced reload", f"seat:{self._agent}", True,
                         f"{tag} did not fit the cards whole, so the daemon chose the split",
                     )
                 else:
-                    _seat_failures[self._agent] = _failure_reason(exc)
+                    _seat_failures[self._agent] = _seat_failure_reason(self._provider, exc)
                     raise
         # A call that works clears an older failure: the seat recovers on its
         # own.
@@ -992,7 +1014,10 @@ def get_agent_status(agent: AgentName) -> dict[str, Any]:
         live, reason, badge = False, (
             f"{agent.upper()}_PROVIDER={provider!r} is not one of {', '.join(PROVIDERS)}"
         ), "BAD PROVIDER"
-    elif failure:
+    # A daemon that could not be reached is the daemon's state, not the seat's,
+    # so the check below says it -- OFFLINE while it lasts, nothing once the
+    # daemon answers again -- rather than this seat's last call.
+    elif failure and not (provider == "ollama" and failure == DAEMON_UNREACHABLE):
         live, reason, badge = False, failure, "FAILING"
     elif provider == "anthropic" and not os.getenv("ANTHROPIC_API_KEY"):
         live, reason, badge, stubbed = False, "ANTHROPIC_API_KEY not set", "NO KEY", True
@@ -1001,7 +1026,7 @@ def get_agent_status(agent: AgentName) -> dict[str, Any]:
         # an empty list, and only the first is OFFLINE.
         tags = ollama_daemon_tags()
         if tags is None:
-            live, reason, badge = False, "Ollama daemon unreachable", "OFFLINE"
+            live, reason, badge = False, DAEMON_UNREACHABLE, "OFFLINE"
         # Compared as tags: `qwen3.8` is `qwen3.8:latest`.
         elif not any(_same_ollama_tag(model, tag) for tag in tags):
             live, reason, badge = False, f"{model} not pulled", "NOT PULLED"

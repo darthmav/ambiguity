@@ -298,6 +298,7 @@ label.go:hover{filter:brightness(1.4)}
    warning. */
 #eng-where{font:11px var(--mono);padding:4px 6px;max-width:210px}
 #eng-project{font:11px var(--mono);padding:4px 8px;width:150px}
+#eng-project.bad{border-color:var(--err);box-shadow:0 0 0 3px #f8717122}
 .project{display:block;margin-top:8px;padding:7px 10px;border-radius:6px;
   background:#4ea3ff0d;border:1px solid #4ea3ff44;font:11px/1.6 var(--mono);color:var(--ink-2)}
 .project button{margin-left:6px}
@@ -315,6 +316,35 @@ table.bridges th{text-align:left;color:var(--ink-3);font-weight:400;
   border-bottom:1px solid #ffffff12;padding:4px 10px 4px 0}
 table.bridges td{padding:3px 10px 3px 0;color:var(--ink-2)}
 pre#state-dump{font:11px/1.7 var(--mono);color:var(--ink-2);white-space:pre-wrap;word-break:break-word}
+/* A narrow window -- a phone, a half-screen tile -- stacks the console. The top
+   bar wraps under the brand with the counters on a line of their own, the crew
+   becomes a row of cards that scrolls sideways, and the page scrolls rather
+   than each pane. The fixed two-column grid put 804px of console in a 390px
+   window, most of it off screen. */
+@media (max-width: 860px){
+  html,body{height:auto}
+  body{grid-template-columns:minmax(0,1fr);grid-template-rows:auto auto auto auto minmax(0,1fr);
+    grid-template-areas:"brand" "top" "warn" "crew" "main";min-height:100vh;overflow-x:hidden;overflow-y:auto}
+  #brand{border-right:0;min-height:44px}
+  #top{flex-wrap:wrap;padding:6px 10px;row-gap:4px;min-width:0}
+  #stats{order:5;flex-basis:100%;margin-left:0;flex-wrap:wrap;gap:4px 12px;padding:2px 2px 4px;min-width:0}
+  #stats > span{overflow-wrap:anywhere}
+  #exit,#exit-confirm{margin-left:auto}
+  #crew{border-right:0;border-bottom:1px solid var(--line);display:flex;align-items:stretch;
+    overflow-x:auto;overflow-y:hidden;padding:8px 6px;min-width:0}
+  #crew .hd{display:none}
+  #seats{display:flex}
+  .seat,#embed{margin:0 4px;flex:0 0 220px}
+  .seat:hover{transform:none}
+  #main{overflow:visible;min-width:0}
+  .panel{height:auto;padding:12px}
+  .panel[data-p="graph"].on{height:72vh}
+  .split{grid-template-columns:minmax(0,1fr)}
+  .scroll{max-height:62vh}
+  #eng-prompt{flex-basis:100%}
+  #eng-where{max-width:100%}
+  #warn{overflow-wrap:anywhere}
+}
 ::-webkit-scrollbar{width:9px;height:9px}
 ::-webkit-scrollbar-thumb{background:#ffffff12;border-radius:5px}
 ::-webkit-scrollbar-track{background:transparent}
@@ -1279,8 +1309,9 @@ let BUILDS_ON_RUN = true;
 // is a fresh machine, where neither a restart nor a run gives the corpus
 // anything -- only an upload or online research does.
 let ARCHIVE = null;
-// Archive files the corpus does not hold while it holds nothing at all: a
-// rebuild that failed on every one, which the header otherwise passed over.
+// Archive files an empty corpus does not hold -- a rebuild that failed on every
+// one -- by the server's stale verdict, which it withholds mid-run and
+// mid-rebuild, when the corpus is meant to be moving.
 let UNINDEXED = 0;
 // What fills an empty corpus, said once for the header, the graph and the list.
 function corpusHint(){
@@ -1345,6 +1376,20 @@ async function loadProjects(){
         + (p.embedded ? "Remove from corpus" : "Embed") + `</button></span></div>`).join("")
     : `<div class="muted">no generated projects yet</div>`;
 }
+
+// The server's rule for a project name (`project_name_error`), checked here so
+// a bad name is refused at the field instead of after the goal has gone into
+// the transcript. The server still decides; its reserved names are its own.
+const PROJECT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+function projectNameProblem(name){
+  if(!name) return "";
+  return PROJECT_NAME.test(name) && !name.includes("..") ? ""
+    : "Letters, digits, '.', '_' or '-', starting with a letter or digit, at most 64 characters.";
+}
+$("#eng-project").addEventListener("input", e => {
+  e.target.setCustomValidity(projectNameProblem(e.target.value.trim()));
+  e.target.classList.toggle("bad", !!projectNameProblem(e.target.value.trim()));
+});
 
 // A slug from the goal, for a new project left unnamed.
 function projectFromGoal(goal){
@@ -1869,6 +1914,13 @@ async function run(){
   const project = where === NEW_PROJECT
     ? ($("#eng-project").value.trim() || projectFromGoal(goal))
     : where;
+  if(where === NEW_PROJECT && projectNameProblem(project)){
+    const field = $("#eng-project");
+    field.setCustomValidity(projectNameProblem(project));
+    field.classList.add("bad");
+    field.reportValidity();
+    return;
+  }
   CURRENT.inflight = true; CURRENT.stopping = false; CURRENT.runId = "";
   // The snapshot on screen before this run: a failure renders the server's
   // snapshot only if this run wrote a newer one.
@@ -2620,8 +2672,8 @@ async function pollOnce(quiet){
     setCorpusState(stats.corpus || (stats.total_chunks ? "indexed" : "empty"));
     ARCHIVE = typeof stats.archive === "number" ? stats.archive
       : typeof stats.staleness?.expected === "number" ? stats.staleness.expected : null;
-    UNINDEXED = CORPUS === "empty" && !SERVER_BUSY.indexing && !SERVER_BUSY.run
-      ? (stats.staleness?.missing_count || 0) : 0;
+    UNINDEXED = CORPUS === "empty" && stats.staleness?.stale
+      ? (stats.staleness.missing_count || 0) : 0;
     // Four zeros read as a knowledge base that happens to be empty. When none
     // has been built there is nothing to count, and saying so is the honest
     // reading -- it is also the only one that tells the operator what to do.

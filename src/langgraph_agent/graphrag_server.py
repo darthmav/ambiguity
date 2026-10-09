@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import threading
+import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -143,6 +144,12 @@ class EmbedderLoadFailed(RuntimeError):
     """
 
 
+# How long a tokenizer the hub would not supply is taken as still unavailable:
+# long enough for one rebuild to ask the hub once, short enough that a network
+# put right is noticed at the next file.
+TOKENIZER_RETRY_SECONDS = 60.0
+
+
 class TokenizerUnavailable(OSError):
     """The embedding tokenizer is neither cached nor fetchable, so nothing can be chunked.
 
@@ -178,6 +185,11 @@ class OllamaEmbedder:
     def __init__(self, model: str) -> None:
         self.model = model
         self._tokenizer: Any = None
+        # When the tokenizer last could not be had, and what stopped it. A
+        # rebuild asks once per file, and each ask went back to the hub -- a
+        # timeout apiece on a network that drops a connection rather than
+        # refusing it.
+        self._tokenizer_failed: tuple[float, BaseException] | None = None
         # How much of the model the daemon left on the CPU when it last
         # embedded. The reply is identical either way, so this is the only
         # place a split that quarters the speed shows. None until a call has
@@ -210,9 +222,13 @@ class OllamaEmbedder:
                     EMBEDDING_TOKENIZER_NAME, local_files_only=True
                 )
             except (OSError, ValueError):
+                failed = self._tokenizer_failed
+                if failed is not None and time.monotonic() - failed[0] < TOKENIZER_RETRY_SECONDS:
+                    raise TokenizerUnavailable(failed[1]) from failed[1]
                 try:
                     self._tokenizer = AutoTokenizer.from_pretrained(EMBEDDING_TOKENIZER_NAME)
                 except (OSError, ValueError) as exc:
+                    self._tokenizer_failed = (time.monotonic(), exc)
                     raise TokenizerUnavailable(exc) from exc
         return self._tokenizer
 

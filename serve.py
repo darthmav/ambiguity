@@ -46,12 +46,13 @@ from langgraph.errors import GraphRecursionError  # noqa: E402
 from langgraph_agent import create_agent_graph, initial_state  # noqa: E402
 from langgraph_agent.config import (  # noqa: E402
     AGENTS,
+    ANTHROPIC_SEAT_MODELS,
     daemon_request,
     get_agent_model_info,
     get_agent_status,
     is_local_ollama_model,
-    list_ollama_models,
     ollama_base_url,
+    ollama_daemon_tags,
     ollama_model_capabilities,
     set_agent_llm,
     set_agent_thinking,
@@ -304,10 +305,9 @@ def rpc_rag_stats(_: dict[str, Any]) -> dict[str, Any]:
             _run_progress.get("running") or _background_rebuild.get("running")
         ):
             report = {**report, "stale": False, "settling": True}
-        # An emptied corpus is not a drifting one: `empty` already says so, and
-        # "not indexed" would accuse the operator of the Clear they just did.
-        if report.get("stale") and stats["corpus"] == "empty":
-            report = {**report, "stale": False, "emptied": True}
+        # An empty corpus is held to the walk too. Clear deletes what a
+        # rebuild walks, so after one nothing is missing; what an empty corpus
+        # lacks is files that did not index, which "corpus empty" alone hid.
         stats["staleness"] = report
     except Exception as exc:  # pragma: no cover - a walk that cannot run
         stats["staleness"] = {"stale": False, "unavailable": str(exc)}
@@ -674,32 +674,63 @@ def rpc_set_thinking(params: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "role": agent, **get_agent_status(agent)}
 
 
+# The Ollama options as the daemon last listed them, offered while it cannot be
+# asked: a dropdown that emptied whenever the daemon was down could not move a
+# seat at all -- not even onto Anthropic, which needs no daemon.
+_last_ollama_options: list[dict[str, str]] = []
+
+
 def _seat_model_options() -> list[dict[str, str]]:
-    """Every tag `ollama ls` reports that a seat can run, and nothing else.
+    """Every tag `ollama ls` reports that a seat can run, then Anthropic's models.
 
     A tag whose capabilities lack `completion` (the embedder) is left out; one
     the daemon would not describe stays in -- "could not ask" is not "cannot
-    run". Cloud tags are grouped apart from weights on this machine.
+    run". Cloud tags are grouped apart from weights on this machine. While the
+    daemon cannot be asked, the tags it last listed are offered under a group
+    that says so, and the card reads OFFLINE until it answers. Anthropic's are
+    the models `.env` would give a seat (`ANTHROPIC_SEAT_MODELS`); without a key
+    a seat moved there runs the stub, and the option says so before it is
+    chosen.
     """
-    options = []
-    for tag in list_ollama_models():
-        caps = ollama_model_capabilities(tag)
-        if caps is not None and "completion" not in caps:
-            continue
-        cloud = not is_local_ollama_model(tag)
-        options.append({
-            "label": tag,
-            "provider": "ollama",
-            "model": tag,
-            "group": "Ollama Cloud" if cloud else "Ollama (local)",
-        })
-    # Local weights first, then cloud, each alphabetical (the daemon's list is).
-    options.sort(key=lambda o: o["group"] != "Ollama (local)")
-    return options
+    global _last_ollama_options
+    tags = ollama_daemon_tags()
+    if tags is None:
+        ollama = [
+            {**option, "group": f"{option['group']} - daemon down, as last listed"}
+            for option in _last_ollama_options
+        ]
+    else:
+        ollama = []
+        for tag in tags:
+            caps = ollama_model_capabilities(tag)
+            if caps is not None and "completion" not in caps:
+                continue
+            cloud = not is_local_ollama_model(tag)
+            ollama.append({
+                "label": tag,
+                "provider": "ollama",
+                "model": tag,
+                "group": "Ollama Cloud" if cloud else "Ollama (local)",
+            })
+        # Local weights first, then cloud, each alphabetical (the daemon's list is).
+        ollama.sort(key=lambda o: o["group"] != "Ollama (local)")
+        _last_ollama_options = ollama
+
+    keyed = bool(os.getenv("ANTHROPIC_API_KEY"))
+    anthropic = [
+        {
+            "label": model if keyed else f"{model} (no key: canned stub output)",
+            "provider": "anthropic",
+            "model": model,
+            "group": "Anthropic" if keyed else "Anthropic - ANTHROPIC_API_KEY not set",
+        }
+        for model in ANTHROPIC_SEAT_MODELS
+    ]
+    return ollama + anthropic
 
 
 def rpc_llm_options(_: dict[str, Any]) -> dict[str, Any]:
-    """Model choices for the seat dropdowns: `ollama ls`, minus embedders."""
+    """Model choices for the seat dropdowns: `ollama ls` minus embedders, and Anthropic's."""
     return {"options": _seat_model_options()}
 
 
