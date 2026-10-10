@@ -580,9 +580,9 @@ console on this machine. Every `/rpc` call the page makes, and every one the
 agent makes itself, is checked before it leaves: a method you did not allow is
 answered with an error and never sent, a Stop is sent only for a run the agent
 started, and clearing the corpus is never allowed. The guard sits on the
-page's requests, so code you hand the page through the `eval` tool acts with
-the page's own powers -- a beacon sent as the page unloads goes around it --
-and is for reading the page, never for calling the console.
+page's requests, and code run inside the page has the page's own powers (a
+beacon sent as it unloads goes around a route), so the `eval` tool and
+`wait --fn` run only with `--allow eval`.
 `--spawn` starts a console of its own from a temporary directory instead -- its
 own corpus, runs and uploads, and pull-request following off -- and
 `--stub-seats` makes every seat a keyless stub, verified before anything runs.

@@ -653,3 +653,57 @@ def test_the_installers_document_their_new_flags(installer, flags):
     assert shown.returncode == 0, shown.stderr
     for flag in flags:
         assert flag in shown.stdout, f"{installer} --help does not list {flag}"
+
+
+def test_check_names_a_key_the_shell_sets(host):
+    # check runs in the user's own shell, so a key set there is one every
+    # claude started from it inherits, in place of the claude.ai sign-in.
+    _all_present(host)
+    host.env["ANTHROPIC_API_KEY"] = "sk-ant-from-the-shell"
+
+    done = _run(host, "check")
+
+    assert done.returncode == 1, done.stdout
+    assert "ANTHROPIC_API_KEY set in this shell" in done.stdout
+    assert "sk-ant-from-the-shell" not in done.stdout + done.stderr
+
+
+def _install_exported_key_note() -> str:
+    """install.sh's lines that turn a key the shell exported into a note."""
+    lines = (ROOT / "install.sh").read_text(encoding="utf-8").splitlines()
+    start = next(i for i, line in enumerate(lines) if "read -ra exported_keys" in line)
+    end = next(i for i in range(start, len(lines)) if lines[i].strip() == "fi")
+    return "\n".join(lines[start:end + 1])
+
+
+@pytest.mark.parametrize("from_shell, noted", [
+    ({}, False),
+    ({"ANTHROPIC_API_KEY": "sk-from-the-shell"}, True),
+])
+def test_install_notes_a_key_the_shell_exported_not_one_from_dotenv(tmp_path, from_shell, noted):
+    (tmp_path / ".env").write_text("ANTHROPIC_AUTH_TOKEN=from-dotenv\n", encoding="utf-8")
+    script = "\n".join([
+        "set -euo pipefail", "NOTES=()",
+        _install_key_lines(),
+        "set -a", ". ./.env", "set +a",
+        _install_exported_key_note(),
+        'printf "%s\\n" "${NOTES[@]+"${NOTES[@]}"}"',
+    ])
+    env = {k: v for k, v in os.environ.items() if k not in KEYS}
+    done = subprocess.run(["bash", "-c", script], cwd=tmp_path, capture_output=True, text=True,
+                          timeout=30, env={**env, **from_shell})
+
+    assert done.returncode == 0, done.stderr
+    assert ("ANTHROPIC_API_KEY exported by your shell" in done.stdout) is noted
+    assert "ANTHROPIC_AUTH_TOKEN" not in done.stdout
+
+
+def test_a_named_browser_never_fetches_another():
+    # BROWSER_AGENT_CHROMIUM decides the browser; a download would change nothing.
+    text = (ROOT / "install.sh").read_text(encoding="utf-8").replace("\\\n", " ")
+    decisions = [line for line in text.splitlines()
+                 if line.lstrip().startswith("if") and ('-z "$(system_chromium)"' in line
+                                                        or '"$doctor_status" -eq 2' in line)]
+    assert len(decisions) == 3, decisions
+    for line in decisions:
+        assert "BROWSER_AGENT_CHROMIUM:-" in line, line

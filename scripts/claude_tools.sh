@@ -381,7 +381,17 @@ install_tools() {
 }
 
 check() {
-    local bad=0 method browser manifest
+    local bad=0 method browser manifest var exported=()
+    # This runs in the user's own shell, so what is set here is what a claude
+    # started from it inherits: any of these replaces the claude.ai sign-in,
+    # and Claude in Chrome is off under it.
+    for var in "${KEY_VARS[@]}"; do
+        if [ -n "${!var:-}" ]; then exported+=("$var"); fi
+    done
+    if [ "${#exported[@]}" -gt 0 ]; then
+        cross "${exported[*]} set in this shell overrides the claude.ai sign-in (Claude in Chrome is off under it): remove it from your shell's config"
+        bad=1
+    fi
     if have_claude; then
         ok "Claude Code $(claude_version) ($(command -v claude))"
         method="$(auth_method)"

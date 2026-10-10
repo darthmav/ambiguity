@@ -148,7 +148,8 @@ net_groups+=(--optional research cloud)
 [ "$CLAUDE" -eq 1 ] && net_groups+=(npm claude)
 # Playwright's own browser builds, fetched (steps 6b and 12) only on a machine
 # that will have no chromium: --no-system installs none.
-if [ "$BROWSER_AGENT" -eq 1 ] && [ "$SYSTEM" -eq 0 ] && [ -z "$(system_chromium)" ]; then
+if [ "$BROWSER_AGENT" -eq 1 ] && [ "$SYSTEM" -eq 0 ] && [ -z "$(system_chromium)" ] \
+        && [ -z "${BROWSER_AGENT_CHROMIUM:-}" ]; then
     net_groups+=(playwright)
 fi
 NETWORK_OK=1
@@ -737,7 +738,8 @@ if [ "$CLAUDE" -eq 1 ]; then
     # Playwright's own build only after this one has looked for a browser, so
     # the MCP server went unregistered until the next run. Fetched here first;
     # the browser agent's step then finds it.
-    if [ "$BROWSER_AGENT" -eq 1 ] && [ "$SYSTEM" -eq 0 ] && [ -z "$(system_chromium)" ]; then
+    if [ "$BROWSER_AGENT" -eq 1 ] && [ "$SYSTEM" -eq 0 ] && [ -z "$(system_chromium)" ] \
+            && [ -z "${BROWSER_AGENT_CHROMIUM:-}" ]; then
         echo "  no system Chromium, and --no-system installs none: fetching Playwright's own, for the MCP server and the browser agent"
         if ! "$PY" -m playwright install chromium; then
             echo "  Playwright's Chromium was not fetched; the browser agent's step tries again"
@@ -753,6 +755,13 @@ if [ "$CLAUDE" -eq 1 ]; then
         if [ -n "$claude_note" ]; then NOTES+=("$claude_note"); fi
     done <"$claude_notes"
     rm -f "$claude_notes"
+    # claude_tools.sh reads the sign-in with these removed, so it cannot see
+    # them; a claude started from this shell would. Said here, where the shell
+    # that exported them is known.
+    read -ra exported_keys <<<"$shell_keys"
+    if [ "${#exported_keys[@]}" -gt 0 ]; then
+        NOTES+=("${exported_keys[*]} exported by your shell overrides Claude Code's claude.ai sign-in, so Claude in Chrome stays off in a claude started from it: remove it from your shell's own config")
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -1358,7 +1367,10 @@ if [ "$BROWSER_AGENT" -eq 1 ]; then
     # tab is the first of clear's two, which arms the button and nothing more.
     doctor_status=0
     doctor_json="$("$PY" scripts/browser_agent.py doctor --json 2>/dev/null)" || doctor_status=$?
-    if [ "$doctor_status" -eq 2 ] && [ "$SYSTEM" -eq 0 ]; then
+    # Not when BROWSER_AGENT_CHROMIUM names the browser: the agent uses that
+    # one or none, so a download would change nothing, and doctor has
+    # already said what is wrong with the path it names.
+    if [ "$doctor_status" -eq 2 ] && [ "$SYSTEM" -eq 0 ] && [ -z "${BROWSER_AGENT_CHROMIUM:-}" ]; then
         # --no-system installs no chromium, so Playwright's own build is
         # fetched into its cache instead (the playwright group in step 0):
         # by step 6b already, unless --no-claude or that fetch failed.

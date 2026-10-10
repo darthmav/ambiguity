@@ -192,10 +192,11 @@ never sent. `clear_corpus`, `set_seat`, `set_thinking`, `embed_project` and
 `dismiss_pull_request` are never sent, whatever is allowed, and a `stop_run`
 goes only with a run id -- the passes press Stop only on a run they started,
 and `exit` is refused while any run is in flight. Shared and service workers
-are switched off, since their requests never meet the page's route. What the
-guard cannot see is code you hand the page with `eval`: it has the page's own
-powers (a beacon sent as the page unloads goes around the route), so use
-`eval` to read the page, never to call the console.
+are switched off, since their requests never meet the page's route. Code run
+inside the page has the page's own powers (a beacon sent as the page unloads
+goes around the route), so `eval` and `wait --fn` run only with
+`--allow eval` -- and then are for reading the page, never for calling the
+console.
 
 **One-shot tools and `batch`.** The same vocabulary Claude in Chrome uses, built
 on Playwright (`browser_agent.py tools` prints the table with each tool's

@@ -187,6 +187,11 @@ ALLOW_KEYS: dict[str, tuple[str, ...]] = {
     "upload": ("upload_document",),
     "circuit": ("reset_circuit",),
     "exit": ("shutdown",),
+    # No RPC of its own: it lets the `eval` tool and `wait --fn` run code in
+    # the page. That code has the page's own powers -- a beacon as the page
+    # unloads, a popup's fetch -- which reach the server where the guard's
+    # route never looks, so it runs only when asked for by name.
+    "eval": (),
 }
 ALLOW_FOR = {method: key for key, methods in ALLOW_KEYS.items() for method in methods}
 
@@ -3158,6 +3163,10 @@ class ToolRunner:
 
     def run(self, tool: Tool, args: Mapping[str, Any]) -> str:
         self.recorder.context = tool.name
+        if (tool.name == "eval" or (tool.name == "wait" and args.get("fn"))) \
+                and "eval" not in self.session.allow:
+            raise ToolError(f"{tool.name} runs JavaScript with the page's own powers, which the RPC "
+                            "guard cannot follow; it runs only with --allow eval")
         handler = getattr(self, "t_" + tool.name.replace("-", "_"))
         try:
             return str(handler(args))
