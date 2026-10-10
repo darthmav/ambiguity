@@ -308,10 +308,8 @@ def rpc_rag_stats(_: dict[str, Any]) -> dict[str, Any]:
             _run_progress.get("running") or _background_rebuild.get("running")
         ):
             report = {**report, "stale": False, "settling": True}
-        # What a rebuild would index, as for an absent corpus: the walk less
-        # what the indexer cannot read. An empty corpus lacks every file, so
-        # every one of them was read for `unreadable_count`.
-        stats["archive"] = report["expected"] - report["unreadable_count"]
+        # What a rebuild would index, the same figure an absent corpus reports.
+        stats["archive"] = report["archive"]
         # An empty corpus is held to the walk too. Clear deletes what a
         # rebuild walks, so after one nothing is missing; what an empty corpus
         # lacks is files that did not index, which "corpus empty" alone hid.
@@ -1940,6 +1938,18 @@ _health_lock = threading.Lock()
 _last_rebuild: dict[str, Any] = {}
 
 
+def _rebuild_stop(circuit: str | None) -> tuple[str, str]:
+    """Why a rebuild stopped on `circuit`, and when the monitor redoes it."""
+    return {
+        EMBEDDER_LOAD.name: ("the embedding model would not load", "after the embedder came back"),
+        TOKENIZER_UNAVAILABLE: (
+            "the embedding tokenizer could not be fetched",
+            "on asking for the tokenizer again",
+        ),
+        POSTGRES.name: ("the database could not be reached", "after the database came back"),
+    }.get(circuit or "", ("the embedder could not be reached", "after the embedder came back"))
+
+
 def _check_health() -> dict[str, dict[str, str]]:
     """Ask each service the console depends on whether it is answering."""
     results: dict[str, dict[str, str]] = {}
@@ -1969,18 +1979,10 @@ def _check_health() -> dict[str, dict[str, str]]:
     with _run_lock:
         last = dict(_last_rebuild)
     if last.get("source") == "unavailable":
-        circuit = last.get("unavailable_circuit")
+        why, _ = _rebuild_stop(last.get("unavailable_circuit"))
         results["corpus"] = {
             "status": "unhealthy",
-            "details": (
-                "the last rebuild stopped because the embedding model would not load"
-                if circuit == EMBEDDER_LOAD.name
-                else "the last rebuild stopped because the embedding tokenizer could not be fetched"
-                if circuit == TOKENIZER_UNAVAILABLE
-                else "the last rebuild stopped because the database could not be reached"
-                if circuit == POSTGRES.name
-                else "the last rebuild stopped because the embedder could not be reached"
-            ),
+            "details": f"the last rebuild stopped because {why}",
         }
     else:
         results["corpus"] = {"status": "healthy", "details": f"corpus {corpus_state()[0]}"}
@@ -2019,11 +2021,7 @@ def _heal() -> None:
         and not tokenizer_retry_in()
         and not _run_in_flight()
     ):
-        when = (
-            "after the database came back" if stopped_by == POSTGRES.name
-            else "on asking for the tokenizer again" if stopped_by == TOKENIZER_UNAVAILABLE
-            else "after the embedder came back"
-        )
+        _, when = _rebuild_stop(stopped_by)
         report = _rebuild_the_corpus_in_background(when)
         if report is not None:  # None: another rebuild was already under way
             recovered = report.get("source") not in ("unavailable", "error", "busy_elsewhere")

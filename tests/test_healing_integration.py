@@ -240,6 +240,19 @@ def test_a_dead_daemon_opens_its_circuit_and_is_then_not_asked(monkeypatch):
     assert len(calls) == config.OLLAMA_CIRCUIT_THRESHOLD, "an open circuit still asked"
 
 
+def _tags(*models: str) -> Any:
+    return lambda path, payload=None, *, timeout: {"models": [{"name": m} for m in models]}
+
+
+def _refused_request(path: str, payload: Any = None, *, timeout: float) -> Any:
+    raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+
+@pytest.fixture
+def planner_on_ollama(monkeypatch):
+    """The planner seated on the local dolphin, with no failure and no tag list remembered."""
+
+
 def test_a_daemon_with_nothing_pulled_is_not_called_unreachable(monkeypatch):
     """Both used to be an empty list, so every seat on a fresh daemon read
     OFFLINE "daemon unreachable" and sent the operator after the wrong thing."""
@@ -251,60 +264,39 @@ def test_a_daemon_with_nothing_pulled_is_not_called_unreachable(monkeypatch):
 
     monkeypatch.setattr(config, "_ollama_tags_cache", (0.0, None))
 
-    def refused(path: str, payload: Any = None, *, timeout: float) -> Any:
-        raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
-
-    monkeypatch.setattr(config, "daemon_request", refused)
+    monkeypatch.setattr(config, "daemon_request", _refused_request)
     assert config.get_agent_status("planner")["badge"] == "OFFLINE"
 
 
-def test_a_seat_that_met_the_down_daemon_reads_like_every_other_seat(monkeypatch):
+def test_a_seat_that_met_the_down_daemon_reads_like_every_other_seat(
+    planner_on_ollama, monkeypatch
+):
     """The seat whose call met the open circuit read "ollama-daemon unreachable;
     next try in 5s", FAILING, beside three reading "Ollama daemon unreachable",
     OFFLINE -- one outage, two stories. And it stayed FAILING after the daemon
     came back, until that seat happened to make a call."""
     from langgraph_agent.self_healing import CircuitOpenError
 
-    monkeypatch.setattr(config, "_seat_failures", {})
-    monkeypatch.setattr(config, "_ollama_tags_cache", (0.0, None))
-    config.set_agent_llm("planner", "ollama", config.DOLPHIN_9B)
     config._seat_failures["planner"] = config._seat_failure_reason(
         "ollama", CircuitOpenError(config.OLLAMA_DAEMON.name, 5.0)
     )
 
-    def refused(path: str, payload: Any = None, *, timeout: float) -> Any:
-        raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
-
-    monkeypatch.setattr(config, "daemon_request", refused)
+    monkeypatch.setattr(config, "daemon_request", _refused_request)
     down = config.get_agent_status("planner")
     assert (down["badge"], down["reason"]) == ("OFFLINE", config.DAEMON_UNREACHABLE)
 
     monkeypatch.setattr(config, "_ollama_tags_cache", (0.0, None))
-    monkeypatch.setattr(config, "daemon_request",
-                        lambda path, payload=None, *, timeout: {"models": [{"name": config.DOLPHIN_9B}]})
+    monkeypatch.setattr(config, "daemon_request", _tags(config.DOLPHIN_9B))
     assert config.get_agent_status("planner")["live"] is True
-    config._agent_llm_overrides.pop("planner", None)
-
-
-def _tags(*models: str) -> Any:
-    return lambda path, payload=None, *, timeout: {"models": [{"name": m} for m in models]}
-
-
-def _refused_request(path: str, payload: Any = None, *, timeout: float) -> Any:
-    raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
 
 
 def test_a_seat_that_just_lost_the_daemon_does_not_read_live_off_the_cached_tags(
-    no_waits, monkeypatch
+    no_waits, planner_on_ollama, monkeypatch
 ):
     """The tag list is cached for 30s, and a seat whose call had just failed on
     a down daemon was passed to it: the daemon had answered moments before, so
     the seat read live -- and the console's poll after a failed run, meant to
     drop the chip at once, showed it green."""
-    monkeypatch.setattr(config, "_seat_failures", {})
-    monkeypatch.setattr(config, "_ollama_tags_cache", (0.0, None))
-    monkeypatch.setattr(config, "_agent_llm_overrides", {})
-    config.set_agent_llm("planner", "ollama", config.DOLPHIN_9B)
     monkeypatch.setattr(config, "daemon_request", _tags(config.DOLPHIN_9B))
     assert config.get_agent_status("planner")["live"] is True
 
@@ -321,15 +313,11 @@ def test_a_seat_that_just_lost_the_daemon_does_not_read_live_off_the_cached_tags
 
 
 def test_a_seat_whose_call_the_daemon_dropped_stays_failing_once_it_is_back(
-    no_waits, monkeypatch
+    no_waits, planner_on_ollama, monkeypatch
 ):
     """A daemon that dies under a seat's call, and is restarted by systemd,
     answers the next poll: worded as an outage, the seat then read live on
     every poll, hiding a seat whose every call takes the daemon down."""
-    monkeypatch.setattr(config, "_seat_failures", {})
-    monkeypatch.setattr(config, "_ollama_tags_cache", (0.0, None))
-    monkeypatch.setattr(config, "_agent_llm_overrides", {})
-    config.set_agent_llm("planner", "ollama", config.DOLPHIN_9B)
     inner = _Model(1, _raised_from(httpx.ReadError("reset"), ConnectionResetError(104, "reset")))
     seat = config._SeatLLM("planner", inner, provider="ollama")
 
@@ -504,11 +492,15 @@ class _IndexingKB:
         return {}
 
 
-def test_a_rebuild_stops_when_the_embedder_cannot_be_reached(tmp_path):
+def _three_uploads(tmp_path: Path) -> None:
     uploads = tmp_path / gs.UPLOADS_DIR
     uploads.mkdir()
     for name in ("a.md", "b.md", "c.md"):
         (uploads / name).write_text(f"{name} text", encoding="utf-8")
+
+
+def test_a_rebuild_stops_when_the_embedder_cannot_be_reached(tmp_path):
+    _three_uploads(tmp_path)
     kb = _IndexingKB()
 
     report = gs.index_corpus_files(kb, str(tmp_path))  # type: ignore[arg-type]
@@ -645,10 +637,7 @@ class _UnloadableKB(_IndexingKB):
 
 def test_a_rebuild_stops_when_the_model_will_not_load(tmp_path):
     """One schedule per rebuild, not one per document: the rest would be refused."""
-    uploads = tmp_path / gs.UPLOADS_DIR
-    uploads.mkdir()
-    for name in ("a.md", "b.md", "c.md"):
-        (uploads / name).write_text(f"{name} text", encoding="utf-8")
+    _three_uploads(tmp_path)
     kb = _UnloadableKB()
 
     report = gs.index_corpus_files(kb, str(tmp_path))  # type: ignore[arg-type]
@@ -672,10 +661,7 @@ class _NoTokenizerKB(_IndexingKB):
 def test_a_rebuild_stops_when_there_is_no_tokenizer(tmp_path):
     """Recorded once per file, as N identical errors, the rebuild was not
     `unavailable`, so the monitor never redid it once the hub was reachable."""
-    uploads = tmp_path / gs.UPLOADS_DIR
-    uploads.mkdir()
-    for name in ("a.md", "b.md", "c.md"):
-        (uploads / name).write_text(f"{name} text", encoding="utf-8")
+    _three_uploads(tmp_path)
     kb = _NoTokenizerKB()
 
     report = gs.index_corpus_files(kb, str(tmp_path))  # type: ignore[arg-type]

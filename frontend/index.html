@@ -2024,7 +2024,7 @@ async function run(){
     if(e.runId){
       try{ snapshot = (await rpc("last_run", {}, true)).snapshot; }catch(err){ /* offline */ }
     }
-    if(snapshot && e.runId && snapshot.run_id === e.runId){
+    if(snapshot && snapshot.run_id === e.runId){
       renderRun(snapshot);
     }else{
       // The director pane is where the goal was typed and where a finished run

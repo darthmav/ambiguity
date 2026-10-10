@@ -125,9 +125,13 @@ def ollama_base_url() -> str:
 _DROPPED_MID_ANSWER = ("ReadError", "RemoteProtocolError")
 
 
+def _dropped(cause: BaseException) -> bool:
+    return type(cause).__name__ in _DROPPED_MID_ANSWER
+
+
 def dropped_mid_answer(exc: BaseException) -> bool:
     """Whether a call reached the daemon and lost it before the reply was complete."""
-    return any(type(cause).__name__ in _DROPPED_MID_ANSWER for cause in exception_chain(exc))
+    return any(_dropped(cause) for cause in exception_chain(exc))
 
 
 def daemon_unreachable(exc: BaseException) -> bool:
@@ -147,7 +151,7 @@ def daemon_unreachable(exc: BaseException) -> bool:
         # part of the call, so this is neither an outage to retry around nor
         # one to count; its reset is the context of the error, so it is read
         # first.
-        if type(cause).__name__ in _DROPPED_MID_ANSWER:
+        if _dropped(cause):
             return False
         # urllib raises URLError only while connecting and sending, before any
         # response: refused, unresolvable, or a connect that timed out.
@@ -486,6 +490,8 @@ DAEMON_UNREACHABLE = "Ollama daemon unreachable"
 # whose every call takes the daemon down must not read live just because
 # systemd brought the daemon back.
 DAEMON_DROPPED_CALL = "Ollama daemon went down during this seat's last call"
+# The daemon is gone in both, for every reader rather than for one seat.
+_DAEMON_LOST_REASONS = (DAEMON_UNREACHABLE, DAEMON_DROPPED_CALL)
 
 
 def _seat_failure_reason(provider: str, exc: Exception) -> str:
@@ -503,7 +509,7 @@ def _seat_failure_reason(provider: str, exc: Exception) -> str:
 def _record_seat_failure(agent: str, provider: str, exc: Exception) -> None:
     """Remember why `agent`'s call failed; a daemon it lost is lost for every reader."""
     reason = _seat_failure_reason(provider, exc)
-    if reason in (DAEMON_UNREACHABLE, DAEMON_DROPPED_CALL):
+    if reason in _DAEMON_LOST_REASONS:
         _daemon_lost()
     _seat_failures[agent] = reason
 
@@ -1071,7 +1077,7 @@ def get_agent_status(agent: AgentName) -> dict[str, Any]:
     # down during the call is OFFLINE the same way while it is down, and the
     # seat's failure once it is back.
     elif failure and not (
-        provider == "ollama" and failure in (DAEMON_UNREACHABLE, DAEMON_DROPPED_CALL)
+        provider == "ollama" and failure in _DAEMON_LOST_REASONS
     ):
         live, reason, badge = False, failure, "FAILING"
     elif provider == "anthropic" and not os.getenv("ANTHROPIC_API_KEY"):

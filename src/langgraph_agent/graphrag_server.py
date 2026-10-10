@@ -8,6 +8,7 @@ only by indexing (`get_knowledge_base`); every read goes through
 `open_knowledge_base`, which never creates one.
 """
 
+import contextlib
 import functools
 import hashlib
 import json
@@ -239,14 +240,13 @@ class OllamaEmbedder:
             os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
             from transformers import AutoTokenizer
 
-            try:
+            # Not cached raises; the hub is then asked below, outside this
+            # handler, so its failure's chain ends at its own cause, not at
+            # this miss.
+            with contextlib.suppress(OSError, ValueError):
                 self._tokenizer = AutoTokenizer.from_pretrained(
                     EMBEDDING_TOKENIZER_NAME, local_files_only=True
                 )
-            except (OSError, ValueError):
-                # Not cached. The hub is asked below, outside this handler, so
-                # its failure's chain ends at its own cause, not at this miss.
-                pass
             if self._tokenizer is None:
                 # Asked for once a window, not once a file: each ask went back
                 # to the hub, a timeout apiece on a network that drops a

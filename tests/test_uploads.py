@@ -122,8 +122,7 @@ class _FailingKB(_RecordingKB):
     """An embedder that cannot embed: the daemon down, the tokenizer missing."""
 
     def add_document(
-        self, doc_id: str, content: str, metadata: dict[str, Any],
-        *, on_commit: Callable[[], None] | None = None,
+        self, doc_id: str, content: str, metadata: dict[str, Any], **kwargs: Any
     ) -> int:
         raise OSError("the embedding tokenizer is not cached here")
 

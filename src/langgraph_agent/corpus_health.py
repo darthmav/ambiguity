@@ -15,6 +15,7 @@ from what the archive used to hold. This compares the two:
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Iterable
 from pathlib import Path
@@ -31,8 +32,9 @@ WALK_CACHE_SECONDS = 30.0
 STALENESS_SAMPLE = 12
 
 _walk_cache: dict[str, tuple[float, frozenset[str], tuple[str, ...]]] = {}
-# `archive_size`'s answer, kept as long as a walk is: it reads every file.
-_archive_cache: dict[str, tuple[float, int]] = {}
+# `_indexer_can_read`'s verdicts, keyed by path and good while the file's
+# (mtime, size) holds: a poll over an unchanged archive stats and never reads.
+_read_verdicts: dict[str, tuple[int, int, bool]] = {}
 
 
 def _walk(root: str, use_cache: bool) -> tuple[frozenset[str], tuple[str, ...]]:
@@ -75,8 +77,9 @@ def _walk(root: str, use_cache: bool) -> tuple[frozenset[str], tuple[str, ...]]:
 
 
 def archive_size(root: str = ".") -> int:
-    """How many files a rebuild would index: the walk's indexable count, cached,
-    less the files that are not UTF-8 text, which the indexer skips.
+    """How many files a rebuild would index: the walk less the files that are
+    not UTF-8 text, which the indexer skips -- `corpus_staleness`'s `archive`
+    for a corpus that holds nothing.
 
     What tells "nothing indexed yet" from "nothing to index": on a fresh machine
     a restart or a run rebuilds from an archive that holds nothing, and saying
@@ -84,12 +87,7 @@ def archive_size(root: str = ".") -> int:
     unreadable files, an archive of Latin-1 notes promised a rebuild that then
     indexed nothing.
     """
-    cached = _archive_cache.get(root)
-    if cached is not None and time.monotonic() - cached[0] < WALK_CACHE_SECONDS:
-        return cached[1]
-    count = sum(1 for path in _walk(root, use_cache=True)[0] if _indexer_can_read(path))
-    _archive_cache[root] = (time.monotonic(), count)
-    return count
+    return int(corpus_staleness((), root)["archive"])
 
 
 def forget_cached_walk() -> None:
@@ -99,7 +97,7 @@ def forget_cached_walk() -> None:
     changes the moment someone acts on it.
     """
     _walk_cache.clear()
-    _archive_cache.clear()
+    _read_verdicts.clear()
 
 
 def _indexer_can_read(path: str) -> bool:
@@ -109,12 +107,24 @@ def _indexer_can_read(path: str) -> bool:
     and the next one will.
     """
     try:
+        stat = os.stat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    cached = _read_verdicts.get(path)
+    if cached is not None and cached[:2] == (stat.st_mtime_ns, stat.st_size):
+        return cached[2]
+    try:
         Path(path).read_text(encoding="utf-8")
     except FileNotFoundError:
         return True
     except (OSError, UnicodeDecodeError):
-        return False
-    return True
+        readable = False
+    else:
+        readable = True
+    _read_verdicts[path] = (stat.st_mtime_ns, stat.st_size, readable)
+    return readable
 
 
 def corpus_staleness(
@@ -145,5 +155,7 @@ def corpus_staleness(
         "oversized_count": len(oversized),
         "oversized": list(oversized[:STALENESS_SAMPLE]),
         "unreadable_count": len(unreadable),
+        # What a rebuild would index: the walk less what the indexer skips.
+        "archive": len(want) - len(unreadable),
         "unreadable": unreadable[:STALENESS_SAMPLE],
     }

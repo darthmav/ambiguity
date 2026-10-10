@@ -84,19 +84,23 @@ index_url="${PIP_INDEX_URL:-${UV_DEFAULT_INDEX:-${UV_INDEX_URL:-}}}"
 index_origin="$(origin_of "$index_url")"
 
 origins_of() {
-    case "$1" in
-        arch) arch_origins ;;
-        pypi) if [ -n "$index_origin" ]; then echo "$index_origin"; else field pypi 2 | tr ' ' '\n' | sed 's#^#https://#'; fi ;;
-        *) field "$1" 2 | tr ' ' '\n' | sed '/^$/d; s#^#https://#' ;;
-    esac
+    if [ "$1" = arch ]; then
+        arch_origins
+    elif [ "$1" = pypi ] && [ -n "$index_origin" ]; then
+        echo "$index_origin"
+    else
+        field "$1" 2 | tr ' ' '\n' | sed '/^$/d; s#^#https://#'
+    fi
 }
 
 entries_of() {
-    case "$1" in
-        arch) host_of "$(arch_origins | head -n 1)" ;;
-        pypi) if [ -n "$index_origin" ]; then host_of "$index_origin"; else field pypi 3 | tr ' ' '\n'; fi ;;
-        *) field "$1" 3 | tr ' ' '\n' ;;
-    esac
+    if [ "$1" = arch ]; then
+        host_of "$(arch_origins | head -n 1)"
+    elif [ "$1" = pypi ] && [ -n "$index_origin" ]; then
+        host_of "$index_origin"
+    else
+        field "$1" 3 | tr ' ' '\n'
+    fi
 }
 
 required=() optional=() after_optional=0
