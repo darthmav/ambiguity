@@ -56,29 +56,45 @@ MIRRORLIST="${MIRRORLIST:-/etc/pacman.d/mirrorlist}"
 field() { awk -F'|' -v g="$1" -v n="$2" '$1 == g {print $n}' <<<"$TABLE"; }
 known() { [ -n "$(field "$1" 1)" ]; }
 
+# What is asked is an origin -- scheme, host and port -- not a host: a LAN
+# mirror or a devpi on plain http, or on a port of its own, is asked where it
+# serves. Asked on https:443 instead, it read as blocked and failed the check.
+origin_of() {
+    sed -nE 's#^[[:space:]]*([A-Za-z][A-Za-z0-9+.-]*)://([^/@]*@)?([^/?#[:space:]]+).*#\1://\3#p' <<<"$1" \
+        | tr '[:upper:]' '[:lower:]'
+}
+
+# An origin as the report prints it: https is the default, so only the others
+# keep their scheme.
+shown() { echo "${1#https://}"; }
+
+# An origin as an allowlist takes it: the host alone.
+host_of() { sed -E 's#^[a-z0-9+.-]+://##; s#:[0-9]+$##' <<<"$1"; }
+
 # Every server pacman would try, in its order; it moves to the next when one
 # fails, so the group answers when any of them does.
-arch_hosts() {
-    sed -n 's|^[[:space:]]*Server[[:space:]]*=[[:space:]]*[a-z]*://\([^/]*\).*|\1|p' \
-        "$MIRRORLIST" 2>/dev/null | awk '!seen[$0]++'
+arch_origins() {
+    local url
+    sed -n 's|^[[:space:]]*Server[[:space:]]*=[[:space:]]*||p' "$MIRRORLIST" 2>/dev/null \
+        | while read -r url; do origin_of "$url"; done | awk 'NF && !seen[$0]++'
 }
 
 # A pip or uv pointed at another index downloads from it instead of PyPI.
 index_url="${PIP_INDEX_URL:-${UV_DEFAULT_INDEX:-${UV_INDEX_URL:-}}}"
-index_host="$(sed -E 's#^[a-z+]+://([^/@]*@)?([^/:]+).*#\2#' <<<"$index_url")"
+index_origin="$(origin_of "$index_url")"
 
-hosts_of() {
+origins_of() {
     case "$1" in
-        arch) arch_hosts ;;
-        pypi) if [ -n "$index_host" ]; then echo "$index_host"; else field pypi 2 | tr ' ' '\n'; fi ;;
-        *) field "$1" 2 | tr ' ' '\n' ;;
+        arch) arch_origins ;;
+        pypi) if [ -n "$index_origin" ]; then echo "$index_origin"; else field pypi 2 | tr ' ' '\n' | sed 's#^#https://#'; fi ;;
+        *) field "$1" 2 | tr ' ' '\n' | sed '/^$/d; s#^#https://#' ;;
     esac
 }
 
 entries_of() {
     case "$1" in
-        arch) arch_hosts | head -n 1 ;;
-        pypi) if [ -n "$index_host" ]; then echo "$index_host"; else field pypi 3 | tr ' ' '\n'; fi ;;
+        arch) host_of "$(arch_origins | head -n 1)" ;;
+        pypi) if [ -n "$index_origin" ]; then host_of "$index_origin"; else field pypi 3 | tr ' ' '\n'; fi ;;
         *) field "$1" 3 | tr ' ' '\n' ;;
     esac
 }
@@ -96,27 +112,39 @@ for arg in "$@"; do
 done
 [ "$(( ${#required[@]} + ${#optional[@]} ))" -gt 0 ] || { echo "network_check: name a group (try --help)" >&2; exit 2; }
 
-# Every host at once, so the check takes as long as the slowest probe rather
-# than the sum. Each probe keeps the HTTP status (any status means the host
-# answered), the proxy's answer to CONNECT, and curl's exit code, which says
-# why nothing came back -- and each reason has a different fix.
+# Without curl nothing can be asked -- and every probe's empty answer used to
+# read as an answer, so the check passed on exactly the machines it was for.
+if ! command -v curl >/dev/null 2>&1; then
+    echo "  ✗ curl is not installed, so no host could be asked (sudo pacman -S curl)"
+    [ "${#required[@]}" -eq 0 ]
+    exit $?
+fi
+
+# Every origin at once, so the check takes as long as the slowest probe rather
+# than the sum. Each probe keeps curl's exit code, which says why nothing came
+# back -- and each reason has a different fix -- then the HTTP status (any
+# status means the host answered) and the proxy's answer to CONNECT. The exit
+# code comes first, so a curl that printed nothing cannot shift it into the
+# status.
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-mapfile -t all_hosts < <(for g in "${required[@]}" "${optional[@]}"; do hosts_of "$g"; done | awk 'NF && !seen[$0]++')
-for host in "${all_hosts[@]}"; do
+mapfile -t all_origins < <(for g in "${required[@]}" "${optional[@]}"; do origins_of "$g"; done | awk 'NF && !seen[$0]++')
+declare -A probe=()
+for origin in "${all_origins[@]}"; do
+    probe[$origin]="$tmp/${#probe[@]}"
     {
         out="$(curl -s -o /dev/null -w '%{http_code} %{http_connect}' --connect-timeout 5 \
-            --max-time 10 "https://$host/" 2>/dev/null)"
-        echo "$out $?"
-    } >"$tmp/$host" &
+            --max-time 10 "$origin/" 2>/dev/null)"
+        echo "$? $out"
+    } >"${probe[$origin]}" &
 done
 wait
 
-# Why a host did not answer; nothing when it did.
+# Why an origin did not answer; nothing when it did.
 why() {
-    local code connect rc
-    read -r code connect rc <"$tmp/$1" || { echo "never asked"; return; }
-    [ "$code" != "000" ] && return
+    local rc code connect
+    read -r rc code connect 2>/dev/null <"${probe[$1]:-/nonexistent}" || { echo "never asked"; return; }
+    case "$code" in ""|000) ;; *) return ;; esac
     case "$rc" in
         56) if [ "$connect" != "000" ]; then echo "refused by the proxy, $connect"; else echo "dropped"; fi ;;
         5|6) echo "does not resolve" ;;
@@ -124,6 +152,7 @@ why() {
         28) echo "timed out" ;;
         60) echo "certificate not trusted" ;;
         35) echo "TLS handshake failed" ;;
+        126|127) echo "curl could not be run" ;;
         *) echo "curl exit $rc" ;;
     esac
 }
@@ -131,21 +160,21 @@ why() {
 # reached: something answered -- a host, a proxy's refusal, a TLS handshake.
 failed=0 blocked_entries=() reached=0 untrusted=0 research_blocked=0
 report() {  # group, 1 when optional
-    local group="$1" is_optional="$2" what hosts host reason down=() up=() listed=0
+    local group="$1" is_optional="$2" what origins origin reason down=() up=() listed=0
     what="$(field "$group" 4)"
-    mapfile -t hosts < <(hosts_of "$group")
-    if [ "${#hosts[@]}" -eq 0 ]; then
+    mapfile -t origins < <(origins_of "$group")
+    if [ "${#origins[@]}" -eq 0 ]; then
         echo "  - $what: no $MIRRORLIST here, so nothing to ask"
         return
     fi
-    for host in "${hosts[@]}"; do
-        reason="$(why "$host")"
+    for origin in "${origins[@]}"; do
+        reason="$(why "$origin")"
         if [ -z "$reason" ]; then
-            up+=("$host")
+            up+=("$(shown "$origin")")
             reached=1
             continue
         fi
-        down+=("$host ($reason)")
+        down+=("$(shown "$origin") ($reason)")
         case "$reason" in
             "refused by the proxy"*) reached=1; listed=1 ;;
             # The machine's to fix, not the allowlist's.

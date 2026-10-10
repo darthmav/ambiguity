@@ -866,6 +866,65 @@ def test_a_tokenizer_nobody_can_supply_says_why_in_one_sentence(monkeypatch):
     assert isinstance(raised.value, OSError), "callers that catch OSError still do"
 
 
+def test_a_tokenizer_failure_names_the_innermost_cause_and_keeps_only_words(monkeypatch):
+    """transformers wraps the hub's LocalEntryNotFoundError, which wraps the
+    HTTP client's error, which wraps the socket's: the first non-OSError was the
+    hub's wrapper ("An error happened while trying to locate the file"), not the
+    name that did not resolve. And the live exception -- traceback, frames, the
+    client's response -- was kept for as long as the hub stayed blocked."""
+    import socket
+    import sys
+    import types
+
+    from langgraph_agent import graphrag_server
+    from langgraph_agent.graphrag_server import (
+        EMBEDDING_TOKENIZER_NAME,
+        OllamaEmbedder,
+        TokenizerUnavailable,
+    )
+
+    class LocalEntryNotFoundError(OSError):
+        pass
+
+    class RequestsConnectionError(OSError):
+        pass
+
+    class _AutoTokenizer:
+        @staticmethod
+        def from_pretrained(name, local_files_only=False):
+            if local_files_only:
+                raise OSError("not in the local cache")
+            try:
+                try:
+                    try:
+                        raise socket.gaierror(-2, "Name or service not known")
+                    except socket.gaierror as dns:
+                        raise RequestsConnectionError("Max retries exceeded") from dns
+                except RequestsConnectionError as http:
+                    raise LocalEntryNotFoundError(
+                        "An error happened while trying to locate the file on the Hub"
+                    ) from http
+            except LocalEntryNotFoundError as hub:
+                raise OSError("We couldn't connect to 'https://huggingface.co'") from hub
+
+    monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(AutoTokenizer=_AutoTokenizer))
+    embedder = OllamaEmbedder(EMBEDDING_TOKENIZER_NAME)
+
+    with pytest.raises(TokenizerUnavailable) as raised:
+        _ = embedder.tokenizer
+    message = str(raised.value)
+    assert "gaierror: [Errno -2] Name or service not known" in message
+    assert "LocalEntryNotFoundError" not in message
+
+    when, reason = graphrag_server._tokenizer_failed
+    assert reason == "gaierror: [Errno -2] Name or service not known"
+    # Asked again inside the window: the same words, and no old exception behind them.
+    with pytest.raises(TokenizerUnavailable) as again:
+        _ = embedder.tokenizer
+    assert str(again.value) == message
+    assert again.value.__cause__ is None
+
+
 def test_a_tokenizer_the_hub_refused_is_not_asked_for_again_file_by_file(monkeypatch):
     """A rebuild asks for the tokenizer once per file; each ask went back to the
     hub, which on a network that drops connections is a timeout per file."""

@@ -120,6 +120,16 @@ def ollama_base_url() -> str:
     return os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 
 
+# What httpx raises when a connection it had sent a request on is lost before
+# the reply ends: reset (`ReadError`) or closed part-way (`RemoteProtocolError`).
+_DROPPED_MID_ANSWER = ("ReadError", "RemoteProtocolError")
+
+
+def dropped_mid_answer(exc: BaseException) -> bool:
+    """Whether a call reached the daemon and lost it before the reply was complete."""
+    return any(type(cause).__name__ in _DROPPED_MID_ANSWER for cause in exception_chain(exc))
+
+
 def daemon_unreachable(exc: BaseException) -> bool:
     """Whether a failure means the Ollama daemon could not be reached at all.
 
@@ -131,6 +141,13 @@ def daemon_unreachable(exc: BaseException) -> bool:
     """
     for cause in exception_chain(exc):
         if isinstance(cause, urllib.error.HTTPError):
+            return False
+        # httpx's read-phase errors: the daemon took the request and lost the
+        # connection while answering it. It was reached, and it may have run
+        # part of the call, so this is neither an outage to retry around nor
+        # one to count; its reset is the context of the error, so it is read
+        # first.
+        if type(cause).__name__ in _DROPPED_MID_ANSWER:
             return False
         # urllib raises URLError only while connecting and sending, before any
         # response: refused, unresolvable, or a connect that timed out.
@@ -231,10 +248,26 @@ def daemon_request(path: str, payload: dict[str, Any] | None = None, *, timeout:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read())
 
-    return OLLAMA_DAEMON.call(send)
+    try:
+        return OLLAMA_DAEMON.call(send)
+    except Exception as exc:
+        if daemon_unreachable(exc):
+            _daemon_lost()
+        raise
 
 
 _ollama_tags_cache: tuple[float, list[str] | None] = (0.0, None)
+
+# When a call last found the daemon gone (monotonic). A tag list asked for
+# before then may describe a daemon that has since stopped, so it is not
+# reused: a seat whose call had just failed on a down daemon read live for as
+# long as the cache was young.
+_daemon_lost_at = 0.0
+
+
+def _daemon_lost() -> None:
+    global _daemon_lost_at
+    _daemon_lost_at = time.monotonic()
 
 
 def ollama_daemon_tags() -> list[str] | None:
@@ -244,12 +277,14 @@ def ollama_daemon_tags() -> list[str] | None:
     An empty list is a daemon with nothing pulled, which is not an unreachable
     one, and is cached like any answer; a failure is not cached, so a daemon
     that comes back shows at the next poll (its circuit keeps the asking cheap).
+    An answer older than the last call that found the daemon gone is asked for
+    again, so a down daemon reads down at once, whoever met it first.
     """
     global _ollama_tags_cache
 
     now = time.monotonic()
     cached_at, cached = _ollama_tags_cache
-    if cached is not None and now - cached_at < 30.0:
+    if cached is not None and now - cached_at < 30.0 and cached_at > _daemon_lost_at:
         return cached
 
     try:
@@ -446,15 +481,31 @@ def _failure_reason(exc: Exception) -> str:
 # three seats reading "Ollama daemon unreachable", over one outage.
 DAEMON_UNREACHABLE = "Ollama daemon unreachable"
 
+# A call the daemon took and then lost part-way. Unlike an unreachable daemon,
+# this is the seat's own last call failing, so it outlives the outage: a seat
+# whose every call takes the daemon down must not read live just because
+# systemd brought the daemon back.
+DAEMON_DROPPED_CALL = "Ollama daemon went down during this seat's last call"
+
 
 def _seat_failure_reason(provider: str, exc: Exception) -> str:
     """`_failure_reason`, with an unreachable daemon worded one way for every Ollama seat."""
+    if provider == "ollama" and dropped_mid_answer(exc):
+        return DAEMON_DROPPED_CALL
     if provider == "ollama" and (
         (isinstance(exc, CircuitOpenError) and exc.circuit == OLLAMA_DAEMON.name)
         or daemon_unreachable(exc)
     ):
         return DAEMON_UNREACHABLE
     return _failure_reason(exc)
+
+
+def _record_seat_failure(agent: str, provider: str, exc: Exception) -> None:
+    """Remember why `agent`'s call failed; a daemon it lost is lost for every reader."""
+    reason = _seat_failure_reason(provider, exc)
+    if reason in (DAEMON_UNREACHABLE, DAEMON_DROPPED_CALL):
+        _daemon_lost()
+    _seat_failures[agent] = reason
 
 
 class SeatCallAbandoned(RuntimeError):
@@ -598,14 +649,14 @@ class _SeatLLM:
                             "unforced reload", f"seat:{self._agent}", False,
                             f"{tag}: {_failure_reason(retried)}",
                         )
-                        _seat_failures[self._agent] = _seat_failure_reason(self._provider, retried)
+                        _record_seat_failure(self._agent, self._provider, retried)
                         raise
                     healing.log_recovery_action(
                         "unforced reload", f"seat:{self._agent}", True,
                         f"{tag} did not fit the cards whole, so the daemon chose the split",
                     )
                 else:
-                    _seat_failures[self._agent] = _seat_failure_reason(self._provider, exc)
+                    _record_seat_failure(self._agent, self._provider, exc)
                     raise
         # A call that works clears an older failure: the seat recovers on its
         # own.
@@ -1016,8 +1067,12 @@ def get_agent_status(agent: AgentName) -> dict[str, Any]:
         ), "BAD PROVIDER"
     # A daemon that could not be reached is the daemon's state, not the seat's,
     # so the check below says it -- OFFLINE while it lasts, nothing once the
-    # daemon answers again -- rather than this seat's last call.
-    elif failure and not (provider == "ollama" and failure == DAEMON_UNREACHABLE):
+    # daemon answers again -- rather than this seat's last call. One that went
+    # down during the call is OFFLINE the same way while it is down, and the
+    # seat's failure once it is back.
+    elif failure and not (
+        provider == "ollama" and failure in (DAEMON_UNREACHABLE, DAEMON_DROPPED_CALL)
+    ):
         live, reason, badge = False, failure, "FAILING"
     elif provider == "anthropic" and not os.getenv("ANTHROPIC_API_KEY"):
         live, reason, badge, stubbed = False, "ANTHROPIC_API_KEY not set", "NO KEY", True
@@ -1027,6 +1082,8 @@ def get_agent_status(agent: AgentName) -> dict[str, Any]:
         tags = ollama_daemon_tags()
         if tags is None:
             live, reason, badge = False, DAEMON_UNREACHABLE, "OFFLINE"
+        elif failure == DAEMON_DROPPED_CALL:
+            live, reason, badge = False, failure, "FAILING"
         # Compared as tags: `qwen3.8` is `qwen3.8:latest`.
         elif not any(_same_ollama_tag(model, tag) for tag in tags):
             live, reason, badge = False, f"{model} not pulled", "NOT PULLED"

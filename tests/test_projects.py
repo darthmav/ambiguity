@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,7 @@ from langgraph_agent.projects import (
     embedded_projects,
     list_projects,
     project_name_error,
+    project_name_rule,
     set_project_embedded,
 )
 
@@ -74,6 +76,18 @@ def test_a_project_cannot_take_the_name_of_the_opt_in_record(taken):
     """A run into project 'embedded.json' made a directory where the record
     lives, and the next rebuild pruned every opted-in project from the corpus."""
     assert "reserved" in (project_name_error(taken) or "")
+
+
+@pytest.mark.parametrize("name", ["", "..", "../x", "a/b", ".hidden", "-x", "a..b",
+                                  "chess", "my-app_2.0", "x" * 64, "x" * 65,
+                                  "embedded.json", "Embedded.JSON"])
+def test_the_rule_the_console_is_sent_is_the_one_the_server_applies(name):
+    """The page checks a name with `project_name_rule` before sending it; any
+    name the two judge apart is a goal refused after the transcript took it."""
+    rule = project_name_rule()
+    pattern = re.compile(rule["pattern"])
+    passes = bool(pattern.match(name)) and name.lower() not in rule["reserved"]
+    assert passes == (project_name_error(name) is None)
 
 
 def test_a_project_s_file_count_skips_what_the_walk_skips(tmp_path):

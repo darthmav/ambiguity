@@ -66,6 +66,7 @@ def _ensure_test_database(url: str) -> str | None:
 os.environ["DATABASE_URL"] = _test_database_url()
 _POSTGRES_PROBLEM = _ensure_test_database(os.environ["DATABASE_URL"])
 
+import langgraph_agent.graphrag_server as _graphrag_server  # noqa: E402
 import langgraph_agent.nodes as _nodes  # noqa: E402
 import langgraph_agent.web_research as _web_research  # noqa: E402
 from langgraph_agent.config import StubLLM  # noqa: E402
@@ -133,6 +134,12 @@ def _closed_circuits():
     reset_circuit()
     yield
     reset_circuit()
+
+
+@pytest.fixture(autouse=True)
+def _tokenizer_never_failed(monkeypatch):
+    """A tokenizer one test could not have is not withheld from the next."""
+    monkeypatch.setattr(_graphrag_server, "_tokenizer_failed", None)
 
 
 @pytest.fixture(autouse=True)

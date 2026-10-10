@@ -89,10 +89,25 @@ write_if_changed() {
     sudo install -D -m 0644 /dev/stdin "$path" <<<"$body" || return 2
 }
 
+# A daemon answering where ollama.service would listen while the unit is not
+# running is someone else's -- `ollama serve` in a terminal, a user unit, a
+# container. Starting the unit beside it only fails to bind the port, and with
+# no start limit that failure would repeat every two seconds, at every boot.
+foreign_daemon() {
+    ! systemctl is-active --quiet ollama.service \
+        && curl -fsS -m 3 -o /dev/null "http://$(daemon_address)/api/version" 2>/dev/null
+}
+
 install_keepalive() {
     if ! systemctl cat ollama.service >/dev/null 2>&1; then
         echo "  ✗ there is no ollama.service to keep up (sudo pacman -S ollama)"
         return 1
+    fi
+    if foreign_daemon; then
+        echo "  ! a daemon ollama.service did not start answers at $(daemon_address); keeping"
+        echo "    it running is up to whatever started it, and ollama.service is left"
+        echo "    alone, not started beside it to fight for the port"
+        return 0
     fi
     local changed=0 path body
     # Written only when it differs, so a re-run touches nothing. Restart= and
@@ -127,6 +142,9 @@ remove_watchdog() {
 
 check() {
     local bad=0
+    if foreign_daemon; then
+        echo "  ! the daemon at $(daemon_address) is not ollama.service's; what follows is the unit's"
+    fi
     if [ "$(systemctl is-enabled ollama.service 2>/dev/null)" = enabled ]; then
         echo "  ✓ ollama.service starts at boot"
     else

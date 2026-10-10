@@ -149,6 +149,37 @@ class EmbedderLoadFailed(RuntimeError):
 # put right is noticed at the next file.
 TOKENIZER_RETRY_SECONDS = 60.0
 
+# What a rebuild the tokenizer stopped names in `unavailable_circuit`. There is
+# no circuit: the monitor waits out `tokenizer_retry_in()` instead.
+TOKENIZER_UNAVAILABLE = "tokenizer"
+
+# When the tokenizer last could not be had, and why, in words. One for the
+# process, as there is one embedding model; and only the words, since the
+# exception held its traceback, its frames and the HTTP client's response for
+# as long as the hub stayed out of reach.
+_tokenizer_failed: tuple[float, str] | None = None
+
+
+def tokenizer_retry_in() -> float:
+    """Seconds until a tokenizer the hub would not supply is asked for again; 0 if now."""
+    failed = _tokenizer_failed
+    if failed is None:
+        return 0.0
+    return max(0.0, TOKENIZER_RETRY_SECONDS - (time.monotonic() - failed[0]))
+
+
+def _tokenizer_failure_reason(exc: BaseException) -> str:
+    """The innermost cause in `exc`'s chain that says anything, as `Type: first line`.
+
+    transformers wraps the hub's error, which wraps the HTTP client's, which
+    wraps the socket's: the socket's -- a name that does not resolve, a connect
+    that timed out -- or the client's 403 is the one that says what to fix.
+    """
+    chain = exception_chain(exc)
+    cause = next((e for e in reversed(chain) if str(e).strip()), chain[0])
+    text = str(cause).strip()
+    return type(cause).__name__ + (f": {text.splitlines()[0]}" if text else "")
+
 
 class TokenizerUnavailable(OSError):
     """The embedding tokenizer is neither cached nor fetchable, so nothing can be chunked.
@@ -158,18 +189,13 @@ class TokenizerUnavailable(OSError):
     a name that does not resolve -- is the part worth reading, so it leads.
     """
 
-    def __init__(self, exc: BaseException) -> None:
-        # The first error in the chain that is not transformers' own bare
-        # OSError: the HTTP client's, or the socket's.
-        chain = exception_chain(exc)
-        cause = next((e for e in chain if type(e) not in (OSError, ValueError)), chain[0])
-        reason = str(cause).strip().splitlines()[0] if str(cause).strip() else ""
+    def __init__(self, reason: str) -> None:
         super().__init__(
             f"The embedding tokenizer ({EMBEDDING_TOKENIZER_NAME}) is not cached on this "
-            f"machine, and Hugging Face did not supply it ({type(cause).__name__}"
-            f"{': ' + reason if reason else ''}). Passages are cut with it, so nothing "
-            "can be embedded until it arrives: ./install.sh caches it, and "
-            "`scripts/network_check.sh tokenizer` says whether huggingface.co is reachable."
+            f"machine, and Hugging Face did not supply it ({reason}). Passages are cut "
+            "with it, so nothing can be embedded until it arrives: ./install.sh caches "
+            "it, and `scripts/network_check.sh tokenizer` says whether huggingface.co "
+            "is reachable."
         )
 
 
@@ -185,11 +211,6 @@ class OllamaEmbedder:
     def __init__(self, model: str) -> None:
         self.model = model
         self._tokenizer: Any = None
-        # When the tokenizer last could not be had, and what stopped it. A
-        # rebuild asks once per file, and each ask went back to the hub -- a
-        # timeout apiece on a network that drops a connection rather than
-        # refusing it.
-        self._tokenizer_failed: tuple[float, BaseException] | None = None
         # How much of the model the daemon left on the CPU when it last
         # embedded. The reply is identical either way, so this is the only
         # place a split that quarters the speed shows. None until a call has
@@ -210,6 +231,7 @@ class OllamaEmbedder:
 
     @property
     def tokenizer(self) -> Any:
+        global _tokenizer_failed
         if self._tokenizer is None:
             # The tokenizer is all this process takes from transformers, which
             # otherwise announces on import that it found no PyTorch: printed
@@ -222,14 +244,23 @@ class OllamaEmbedder:
                     EMBEDDING_TOKENIZER_NAME, local_files_only=True
                 )
             except (OSError, ValueError):
-                failed = self._tokenizer_failed
-                if failed is not None and time.monotonic() - failed[0] < TOKENIZER_RETRY_SECONDS:
-                    raise TokenizerUnavailable(failed[1]) from failed[1]
+                # Not cached. The hub is asked below, outside this handler, so
+                # its failure's chain ends at its own cause, not at this miss.
+                pass
+            if self._tokenizer is None:
+                # Asked for once a window, not once a file: each ask went back
+                # to the hub, a timeout apiece on a network that drops a
+                # connection rather than refusing it.
+                failed = _tokenizer_failed
+                if failed is not None and tokenizer_retry_in() > 0:
+                    raise TokenizerUnavailable(failed[1])
                 try:
                     self._tokenizer = AutoTokenizer.from_pretrained(EMBEDDING_TOKENIZER_NAME)
                 except (OSError, ValueError) as exc:
-                    self._tokenizer_failed = (time.monotonic(), exc)
-                    raise TokenizerUnavailable(exc) from exc
+                    reason = _tokenizer_failure_reason(exc)
+                    _tokenizer_failed = (time.monotonic(), reason)
+                    raise TokenizerUnavailable(reason) from exc
+            _tokenizer_failed = None
         return self._tokenizer
 
     def encode(
@@ -908,13 +939,15 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
         metadata: dict[str, Any] | None = None,
         *,
         graph: nx.DiGraph | None = None,
+        on_commit: Callable[[], None] | None = None,
     ) -> int:
         """Add a document: its chunks to the store, one node and its entities to the graph.
 
         Chunks are stored as `doc_id#0000`, `doc_id#0001`, ...; the graph still gets
         one node per document, with entities drawn from the whole text. `graph`
         is a graph being built off to the side (a rebuild's); without one the
-        node goes into the published graph.
+        node goes into the published graph. `on_commit` is called once the store
+        has committed: from then on the document is stored, whatever fails after.
 
         Returns:
             How many chunks the document became -- the number that says it is
@@ -948,6 +981,8 @@ class GraphRAGKnowledgeBase(CorpusSpectralMixin):
                 ],
             )
             self.collection.save_document_graph(doc_id, attrs, entities)
+        if on_commit is not None:
+            on_commit()
 
         # Memory follows the store only once the store has committed.
         self._place_in_graph(doc_id, attrs, entities, graph=graph)
@@ -1726,19 +1761,33 @@ def store_uploaded_document(
     # how a document is corrected; `add_document` removes its previous chunks.
     replaced = path.exists()
     previous = path.read_bytes() if replaced else None
-    path.write_text(content, encoding="utf-8")
+    committed = False
+
+    def stored() -> None:
+        nonlocal committed
+        committed = True
 
     try:
-        chunks = kb.add_document(str(path), content, _document_metadata(path))
-    except BaseException:
+        # Inside the `try`: the write truncates the previous version first, so
+        # one that fails part-way -- a full disk -- is undone like an embed.
+        path.write_text(content, encoding="utf-8")
+        chunks = kb.add_document(
+            str(path), content, _document_metadata(path), on_commit=stored
+        )
+    except BaseException as exc:
         # The archive goes back to how it was. The file is what the next
         # rebuild embeds, so leaving it stored the document the console was
         # told was "not stored" -- and a failed re-upload left the corpus
-        # holding the chunks of a version no longer on disk.
-        if previous is None:
-            path.unlink(missing_ok=True)
-        else:
-            path.write_bytes(previous)
+        # holding the chunks of a version no longer on disk. Once the store
+        # has committed the new version, though, the file stays to match it.
+        if not committed:
+            try:
+                if previous is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.write_bytes(previous)
+            except OSError as undo:
+                exc.add_note(f"{path} could not be put back as it was: {undo}")
         raise
 
     report: dict[str, Any] = {
@@ -1832,8 +1881,9 @@ def index_corpus_files(
 
     `progress(done, total)` follows each file; `should_stop` is asked before each
     file and between embedding batches. A stop, or a circuit the embedder needs
-    opening -- the daemon's, or `EMBEDDER_LOAD` -- ends the pass early: `stopped`,
-    or `unavailable` with the circuit named in `unavailable_circuit`. Either
+    opening -- the daemon's, or `EMBEDDER_LOAD` -- or a tokenizer nobody can
+    supply ends the pass early: `stopped`, or `unavailable` with the circuit (or
+    `TOKENIZER_UNAVAILABLE`) named in `unavailable_circuit`. Either
     leaves the corpus part-built for the next rebuild to finish. A database that
     cannot be reached is `unavailable` before anything is embedded; any other
     failure to read what the store holds raises, rather than re-embedding the
@@ -1909,6 +1959,12 @@ def index_corpus_files(
             # This document's load opened the embedder's circuit, which would
             # refuse every document left.
             unavailable, unavailable_circuit = f"{file_path}: {exc}", EMBEDDER_LOAD.name
+            break
+        except TokenizerUnavailable as exc:
+            # Every passage is cut with it, so every document left would fail
+            # the same way -- and recorded as each file's error, the rebuild
+            # was not one the monitor waits to redo.
+            unavailable, unavailable_circuit = str(exc), TOKENIZER_UNAVAILABLE
             break
         except Exception as exc:
             errors.append(f"{file_path}: {exc}")

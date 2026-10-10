@@ -530,7 +530,13 @@ async function rpc(method, params, quiet){
   const j = await r.json().catch(() => ({error:{message:"bad JSON"}}));
   const ms = j.elapsed_ms ?? Math.round(performance.now() - t0);
   goOnline();
-  if(j.error){ if(!quiet) ev(method+" — "+(j.error.message || j.error), ms, true); throw new Error(j.error.message || "failed"); }
+  if(j.error){
+    if(!quiet) ev(method+" — "+(j.error.message || j.error), ms, true);
+    const err = new Error(j.error.message || "failed");
+    // run_goal's: the run that started before it failed, and wrote a snapshot.
+    if(j.error.run_id) err.runId = j.error.run_id;
+    throw err;
+  }
   if(!quiet) ev(method, ms, false);
   return j.result;
 }
@@ -1379,11 +1385,22 @@ async function loadProjects(){
 
 // The server's rule for a project name (`project_name_error`), checked here so
 // a bad name is refused at the field instead of after the goal has gone into
-// the transcript. The server still decides; its reserved names are its own.
-const PROJECT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+// the transcript. Sent with the status (`project_name_rule`): a copy written
+// here once left out the reserved names. The server still decides, and until
+// the rule arrives only it does.
+let PROJECT_NAME_RULE = null;
+function applyProjectNameRule(rule){
+  if(!rule || typeof rule.pattern !== "string") return;
+  try{
+    PROJECT_NAME_RULE = {pattern: new RegExp(rule.pattern),
+                         reserved: new Set((rule.reserved || []).map(n => String(n).toLowerCase()))};
+  }catch(e){ /* a pattern this browser cannot compile: the server still checks */ }
+}
 function projectNameProblem(name){
-  if(!name) return "";
-  return PROJECT_NAME.test(name) && !name.includes("..") ? ""
+  if(!name || !PROJECT_NAME_RULE) return "";
+  if(PROJECT_NAME_RULE.reserved.has(name.toLowerCase()))
+    return `'${name}' is reserved: the record of embedded projects sits under that name.`;
+  return PROJECT_NAME_RULE.pattern.test(name) ? ""
     : "Letters, digits, '.', '_' or '-', starting with a letter or digit, at most 64 characters.";
 }
 $("#eng-project").addEventListener("input", e => {
@@ -1922,9 +1939,6 @@ async function run(){
     return;
   }
   CURRENT.inflight = true; CURRENT.stopping = false; CURRENT.runId = "";
-  // The snapshot on screen before this run: a failure renders the server's
-  // snapshot only if this run wrote a newer one.
-  const priorSnapshot = SHOWN_SNAPSHOT;
   setRunButtons();
   $("#director").innerHTML += `<div class="msg user">${esc(goal)}`
     + (expectFail ? ` <span class="badge">expect failures</span>` : "")
@@ -2002,12 +2016,15 @@ async function run(){
     const live = $("#run-live");
     if(live) live.remove();
     // A failed run still produced whatever it produced, and the server kept it
-    // -- but only a run that started writes a snapshot. One refused before it
-    // began (a bad project name, a run already going) leaves the last run's,
-    // which used to be rendered under the refusal as if it had followed it.
+    // -- but only a run that started writes a snapshot, and its error names
+    // that run. One refused before it began (a bad project name, a run already
+    // going) names none and leaves the last run's, which used to be rendered
+    // under the refusal as if it had followed it, even when another tab ran it.
     let snapshot = null;
-    try{ snapshot = (await rpc("last_run", {}, true)).snapshot; }catch(err){ /* offline */ }
-    if(snapshot && snapshot.run_id && snapshot.run_id !== priorSnapshot){
+    if(e.runId){
+      try{ snapshot = (await rpc("last_run", {}, true)).snapshot; }catch(err){ /* offline */ }
+    }
+    if(snapshot && e.runId && snapshot.run_id === e.runId){
       renderRun(snapshot);
     }else{
       // The director pane is where the goal was typed and where a finished run
@@ -2248,12 +2265,8 @@ function recoveryBlock(r){
   return parts.join("\n\n");
 }
 
-// The run whose result the transcript last showed (see run()).
-let SHOWN_SNAPSHOT = "";
-
 function renderRun(r, note){
   $("#state-dump").textContent = JSON.stringify(r, null, 2);
-  if(r.run_id) SHOWN_SNAPSHOT = r.run_id;
 
   // The run is over, so the line that was tracking it is replaced by the
   // answer rather than left behind reading "Running".
@@ -2669,9 +2682,11 @@ async function pollOnce(quiet){
     updateGraphHold();
     BUILDS_ON_RUN = st.indexes_on_run !== false;
     applyIndexableSuffixes(st.indexable_suffixes);
+    applyProjectNameRule(st.project_name_rule);
     setCorpusState(stats.corpus || (stats.total_chunks ? "indexed" : "empty"));
-    ARCHIVE = typeof stats.archive === "number" ? stats.archive
-      : typeof stats.staleness?.expected === "number" ? stats.staleness.expected : null;
+    // The server's count of what a rebuild would index, unreadable files left
+    // out; the walk's own total counted them and promised a rebuild of nothing.
+    ARCHIVE = typeof stats.archive === "number" ? stats.archive : null;
     UNINDEXED = CORPUS === "empty" && stats.staleness?.stale
       ? (stats.staleness.missing_count || 0) : 0;
     // Four zeros read as a knowledge base that happens to be empty. When none

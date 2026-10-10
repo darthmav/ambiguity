@@ -31,6 +31,8 @@ WALK_CACHE_SECONDS = 30.0
 STALENESS_SAMPLE = 12
 
 _walk_cache: dict[str, tuple[float, frozenset[str], tuple[str, ...]]] = {}
+# `archive_size`'s answer, kept as long as a walk is: it reads every file.
+_archive_cache: dict[str, tuple[float, int]] = {}
 
 
 def _walk(root: str, use_cache: bool) -> tuple[frozenset[str], tuple[str, ...]]:
@@ -73,13 +75,21 @@ def _walk(root: str, use_cache: bool) -> tuple[frozenset[str], tuple[str, ...]]:
 
 
 def archive_size(root: str = ".") -> int:
-    """How many files a rebuild would index -- the walk's indexable count, cached.
+    """How many files a rebuild would index: the walk's indexable count, cached,
+    less the files that are not UTF-8 text, which the indexer skips.
 
     What tells "nothing indexed yet" from "nothing to index": on a fresh machine
     a restart or a run rebuilds from an archive that holds nothing, and saying
-    either would help sent the operator round that loop.
+    either would help sent the operator round that loop. Counted with the
+    unreadable files, an archive of Latin-1 notes promised a rebuild that then
+    indexed nothing.
     """
-    return len(_walk(root, use_cache=True)[0])
+    cached = _archive_cache.get(root)
+    if cached is not None and time.monotonic() - cached[0] < WALK_CACHE_SECONDS:
+        return cached[1]
+    count = sum(1 for path in _walk(root, use_cache=True)[0] if _indexer_can_read(path))
+    _archive_cache[root] = (time.monotonic(), count)
+    return count
 
 
 def forget_cached_walk() -> None:
@@ -89,6 +99,7 @@ def forget_cached_walk() -> None:
     changes the moment someone acts on it.
     """
     _walk_cache.clear()
+    _archive_cache.clear()
 
 
 def _indexer_can_read(path: str) -> bool:

@@ -121,6 +121,7 @@ python example_usage.py
 │   ├── test_spectral_graph.py # The spectral_graph package, against closed-form spectra
 │   ├── test_dwell_tool.py     # The command-line dwell tool's confinement to this folder
 │   ├── test_ollama_keepalive.py # The keep-alive drop-in and hang watchdog, against stand-in systemctl
+│   ├── test_network_check.py  # The network preflight's origins and verdicts, against a stand-in curl
 │   ├── test_browser_agent.py  # The browser agent's guard, passes and tools; live ones under BROWSER_TESTS=1
 │   ├── test_diagnose_machine.py # The machine diagnostic: parsers, redaction, a degraded machine
 │   └── test_claude_tools.py   # Claude Code setup, against stand-in claude, npx and git
@@ -472,7 +473,8 @@ its lock and never holds it across a call, so it never serializes them),
 and every action lands in the healing journal (`get_healing_logger()`), which
 the console reads and a run's snapshot carries (each run is one healing
 session). An open spell is one story however long it lasts: its first refusal
-and first failed trial are journalled, the rest counted into the line that
+(once in each healing session, so a run that starts mid-outage carries it) and
+its first failed trial are journalled, the rest counted into the line that
 closes it. Where it is used:
 
 - **The database is one circuit, `POSTGRES`** (`corpus_store.py`), opened only
@@ -493,8 +495,13 @@ closes it. Where it is used:
   drop-in (`scripts/ollama_keepalive.sh`) -- enabled at boot, `Restart=always`,
   no start limit -- and `ollama-watchdog.timer`, which asks `/api/ps` once a
   minute and restarts a daemon that is up but has stopped answering three asks
-  in a row; never within its start's grace, never a daemon someone stopped. Every Ollama seat words an unreachable daemon the same way
-  (`DAEMON_UNREACHABLE`), as OFFLINE, until it answers.
+  in a row; never within its start's grace, never a daemon someone stopped.
+  A daemon `ollama.service` did not start is left alone: the unit is not
+  started beside it. Every Ollama seat words an unreachable daemon the same way
+  (`DAEMON_UNREACHABLE`), as OFFLINE, until it answers -- and a tag list cached
+  before a call found it gone is asked for again. A call the daemon dropped
+  part-way is not an outage: never retried, and once the daemon is back that
+  seat reads FAILING (`DAEMON_DROPPED_CALL`) until a call of its own succeeds.
 - **The embedder** retries a failed model load (5xx) on its own longer
   schedule, and a schedule that still ends in a 5xx opens `EMBEDDER_LOAD`
   (`embedder-load`): every embed is refused at once until a single-attempt
@@ -528,7 +535,9 @@ closes it. Where it is used:
   stopped because the embedder could not be reached. The console shows an open
   circuit in the header (click it to let the next call through now) and the
   journal in the telemetry feed and the State tab. A corpus whose rebuild met
-  `embedder-load` is rebuilt the same way, once that circuit's cooldown is over.
+  `embedder-load` is rebuilt the same way, once that circuit's cooldown is over,
+  and one a missing tokenizer stopped (`TOKENIZER_UNAVAILABLE`) once
+  `tokenizer_retry_in()` says the hub may be asked again.
 
 Retrying never extends a deadline's guarantee: work under `_with_deadline`
 still never writes to state, and a retry inside an abandoned seat call ends on

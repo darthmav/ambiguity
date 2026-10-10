@@ -84,6 +84,9 @@ def _raised_from(outer: BaseException, inner: BaseException) -> BaseException:
     (_raised_from(httpx.ConnectError("refused"), ConnectionRefusedError()), True),
     (TimeoutError("timed out reading the reply"), False),
     (ValueError("model not found"), False),
+    # Reached, then lost while answering: the reset is only the context.
+    (_raised_from(httpx.ReadError("reset"), ConnectionResetError(104, "reset")), False),
+    (httpx.RemoteProtocolError("peer closed connection"), False),
 ])
 def test_only_an_unreachable_daemon_counts_as_one(exc, unreachable):
     assert config.daemon_unreachable(exc) is unreachable
@@ -281,6 +284,75 @@ def test_a_seat_that_met_the_down_daemon_reads_like_every_other_seat(monkeypatch
                         lambda path, payload=None, *, timeout: {"models": [{"name": config.DOLPHIN_9B}]})
     assert config.get_agent_status("planner")["live"] is True
     config._agent_llm_overrides.pop("planner", None)
+
+
+def _tags(*models: str) -> Any:
+    return lambda path, payload=None, *, timeout: {"models": [{"name": m} for m in models]}
+
+
+def _refused_request(path: str, payload: Any = None, *, timeout: float) -> Any:
+    raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+
+def test_a_seat_that_just_lost_the_daemon_does_not_read_live_off_the_cached_tags(
+    no_waits, monkeypatch
+):
+    """The tag list is cached for 30s, and a seat whose call had just failed on
+    a down daemon was passed to it: the daemon had answered moments before, so
+    the seat read live -- and the console's poll after a failed run, meant to
+    drop the chip at once, showed it green."""
+    monkeypatch.setattr(config, "_seat_failures", {})
+    monkeypatch.setattr(config, "_ollama_tags_cache", (0.0, None))
+    monkeypatch.setattr(config, "_agent_llm_overrides", {})
+    config.set_agent_llm("planner", "ollama", config.DOLPHIN_9B)
+    monkeypatch.setattr(config, "daemon_request", _tags(config.DOLPHIN_9B))
+    assert config.get_agent_status("planner")["live"] is True
+
+    monkeypatch.setattr(config, "daemon_request", _refused_request)
+    inner = _Model(99, _raised_from(httpx.ConnectError("refused"), ConnectionRefusedError()))
+    with pytest.raises(httpx.ConnectError):
+        config._SeatLLM("planner", inner, provider="ollama").invoke(["prompt"])
+
+    down = config.get_agent_status("planner")
+    assert (down["live"], down["badge"], down["reason"]) == (
+        False, "OFFLINE", config.DAEMON_UNREACHABLE)
+    # Every seat, not only the one whose call met it.
+    assert config.get_agent_status("researcher")["badge"] == "OFFLINE"
+
+
+def test_a_seat_whose_call_the_daemon_dropped_stays_failing_once_it_is_back(
+    no_waits, monkeypatch
+):
+    """A daemon that dies under a seat's call, and is restarted by systemd,
+    answers the next poll: worded as an outage, the seat then read live on
+    every poll, hiding a seat whose every call takes the daemon down."""
+    monkeypatch.setattr(config, "_seat_failures", {})
+    monkeypatch.setattr(config, "_ollama_tags_cache", (0.0, None))
+    monkeypatch.setattr(config, "_agent_llm_overrides", {})
+    config.set_agent_llm("planner", "ollama", config.DOLPHIN_9B)
+    inner = _Model(1, _raised_from(httpx.ReadError("reset"), ConnectionResetError(104, "reset")))
+    seat = config._SeatLLM("planner", inner, provider="ollama")
+
+    with pytest.raises(httpx.ReadError):
+        seat.invoke(["prompt"])
+    # It ran part of the call: not asked again, and not counted as an outage.
+    assert inner.calls == 1
+    assert _circuit("ollama-daemon")["failures"] == 0
+    assert config._seat_failures["planner"] == config.DAEMON_DROPPED_CALL
+
+    # While the daemon is down, it reads like every other seat.
+    monkeypatch.setattr(config, "daemon_request", _refused_request)
+    assert config.get_agent_status("planner")["badge"] == "OFFLINE"
+
+    # Back, the seat's own last call is what it reports.
+    monkeypatch.setattr(config, "daemon_request", _tags(config.DOLPHIN_9B))
+    back = config.get_agent_status("planner")
+    assert (back["live"], back["badge"], back["reason"]) == (
+        False, "FAILING", config.DAEMON_DROPPED_CALL)
+    assert config.get_agent_status("researcher")["live"] is True
+
+    assert seat.invoke(["prompt"]) == "answered"
+    assert config.get_agent_status("planner")["live"] is True
 
 
 def test_a_daemon_answering_with_an_error_is_up(monkeypatch):
@@ -585,6 +657,50 @@ def test_a_rebuild_stops_when_the_model_will_not_load(tmp_path):
     assert report["unavailable_circuit"] == "embedder-load"
     assert "a.md" in report["unavailable"] and "out of memory" in report["unavailable"]
     assert report["errors"] == [], "named once, as the reason, not again as a file error"
+
+
+class _NoTokenizerKB(_IndexingKB):
+    """No passage can be cut: the tokenizer is not cached and the hub is blocked."""
+
+    def add_document(
+        self, doc_id: str, content: str, metadata: dict[str, Any], **kwargs: Any
+    ) -> int:
+        self.added.append(doc_id)
+        raise gs.TokenizerUnavailable("ConnectError: [Errno -2] Name or service not known")
+
+
+def test_a_rebuild_stops_when_there_is_no_tokenizer(tmp_path):
+    """Recorded once per file, as N identical errors, the rebuild was not
+    `unavailable`, so the monitor never redid it once the hub was reachable."""
+    uploads = tmp_path / gs.UPLOADS_DIR
+    uploads.mkdir()
+    for name in ("a.md", "b.md", "c.md"):
+        (uploads / name).write_text(f"{name} text", encoding="utf-8")
+    kb = _NoTokenizerKB()
+
+    report = gs.index_corpus_files(kb, str(tmp_path))  # type: ignore[arg-type]
+
+    assert len(kb.added) == 1
+    assert report["unavailable_circuit"] == gs.TOKENIZER_UNAVAILABLE
+    assert "Name or service not known" in report["unavailable"]
+    assert report["errors"] == []
+
+
+def test_the_monitor_redoes_a_rebuild_the_tokenizer_stopped_once_it_may_ask_again(
+    monitor, monkeypatch
+):
+    serve._last_rebuild.update(source="unavailable", unavailable_circuit=gs.TOKENIZER_UNAVAILABLE)
+    monkeypatch.setattr(gs, "_tokenizer_failed", (gs.time.monotonic(), "ConnectError: blocked"))
+
+    serve._heal()
+
+    assert monitor == [], "rebuilt inside the window, where the hub is not asked"
+    assert "tokenizer could not be fetched" in serve._health["corpus"]["details"]
+
+    monkeypatch.setattr(gs, "TOKENIZER_RETRY_SECONDS", 0.0)
+    serve._heal()
+
+    assert monitor == ["on asking for the tokenizer again"]
 
 
 def test_a_model_that_will_not_load_is_not_called_unreachable():
