@@ -444,6 +444,24 @@ def test_stop_is_pressed_only_on_the_agents_own_run(monkeypatch, progress, page_
     assert (ba._not_our_run(check) == "") is ours
 
 
+def test_page_javascript_runs_only_with_allow_eval():
+    # What eval runs has the page's own powers, which the guard cannot follow.
+    def runner(allow):
+        r = object.__new__(ba.ToolRunner)
+        r.recorder = ba.Recorder()
+        r.session = SimpleNamespace(allow=frozenset(allow))
+        r.t_eval = r.t_wait = lambda args: "ran"
+        return r
+    for step in ({"tool": "eval", "js": "1"}, {"tool": "wait", "fn": "() => true"}):
+        tool, args = ba.parse_step(step)
+        with pytest.raises(ba.ToolError, match="--allow eval"):
+            runner([]).run(tool, args)
+        assert runner(["eval"]).run(tool, args) == "ran"
+    tool, args = ba.parse_step({"tool": "wait", "selector": "#x"})
+    assert runner([]).run(tool, args) == "ran"
+    assert ba.parse_allow("eval") == {"eval"}
+
+
 def test_shared_workers_are_off_whatever_the_launch():
     # What a shared worker sends never meets the page's route.
     for headed in (False, True):
@@ -1023,7 +1041,8 @@ def test_the_tools_round_trip_in_one_batch(tmp_path, fixture_site, capsys):
     ]
     file = tmp_path / "steps.json"
     file.write_text(json.dumps(steps))
-    code = ba.main(["batch", str(file), "--open", url, "--images", str(tmp_path / "images")])
+    code = ba.main(["batch", str(file), "--open", url, "--images", str(tmp_path / "images"),
+                    "--allow", "eval"])
     out = capsys.readouterr().out
     assert code == 0, out
     assert "ada lovelace" in out
@@ -1070,7 +1089,7 @@ def test_a_page_cannot_route_a_refused_call_around_the_guard(tmp_path, fixture_s
     url, received = fixture_site
     file = tmp_path / "steps.json"
     file.write_text(json.dumps([{"tool": "eval", "js": EVADE_JS}]))
-    code = ba.main(["batch", str(file), "--open", url])
+    code = ba.main(["batch", str(file), "--open", url, "--allow", "eval"])
     out = capsys.readouterr().out
     assert code == 0, out
     assert received == [], f"refused calls reached the server: {received}\n{out}"

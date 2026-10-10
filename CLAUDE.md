@@ -450,8 +450,8 @@ a Builder that runs programs. No CORS header is sent; the page is same-origin.
   `clear_corpus`, `set_seat`, `set_thinking`, `embed_project` and
   `dismiss_pull_request` are never sent; a `stop_run` must name its run, and
   Stop is pressed only on a run the agent started. The guard is the page's
-  route, so shared and service workers are off and `eval` is for reading
-  only: code it runs has the page's powers. `--spawn` runs a console of its own
+  route, so shared and service workers are off, and `eval` / `wait --fn`
+  (code with the page's own powers) need `--allow eval`. `--spawn` runs a console of its own
   from a temporary directory (own corpus schema, `RUNS_DIR`,
   `FOLLOW_PULL_REQUESTS=0`); `--stub-seats` sets every key to an empty string,
   which `load_dotenv` cannot refill, and refuses to go on unless all four seats
