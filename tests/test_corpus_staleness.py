@@ -268,4 +268,41 @@ def test_an_absent_corpus_says_whether_there_is_anything_to_build_it_from(monkey
     (tmp_path / "uploads" / "notes.md").write_text("The Planner breaks it down.\n")
     forget_cached_walk()
     assert serve.rpc_rag_stats({})["archive"] == 1
+
+    # Not UTF-8: in the walk, skipped by the indexer, so nothing a rebuild has.
+    (tmp_path / "uploads" / "latin.md").write_bytes("caf\xe9 au lait".encode("latin-1"))
     forget_cached_walk()
+    assert serve.rpc_rag_stats({})["archive"] == 1
+    forget_cached_walk()
+
+
+def test_an_empty_corpus_of_unreadable_files_has_no_archive_to_rebuild_from(
+    monkeypatch, tmp_path
+):
+    """The hint read "a restart or the next run rebuilds it from the archive"
+    over an archive of Latin-1 files, and both left the corpus empty again."""
+    import networkx as nx
+
+    import serve
+
+    class _EmptyKB:
+        graph = nx.DiGraph()
+
+        def stats(self):
+            return {"total_documents": 0, "total_chunks": 0,
+                    "total_nodes": 0, "total_edges": 0}
+
+    (tmp_path / "latin").mkdir()
+    (tmp_path / "latin" / "notes.md").write_bytes("caf\xe9 au lait".encode("latin-1"))
+    root = str(tmp_path / "latin")
+    monkeypatch.setitem(serve._run_progress, "running", False)
+    monkeypatch.setitem(serve._background_rebuild, "running", False)
+    monkeypatch.setattr(serve, "_open_kb", lambda: _EmptyKB())
+    monkeypatch.setattr(serve, "corpus_staleness",
+                        lambda docs: corpus_staleness(docs, root, use_cache=False))
+
+    stats = serve.rpc_rag_stats({})
+
+    assert stats["corpus"] == "empty"
+    assert stats["staleness"]["expected"] == 1
+    assert stats["archive"] == 0

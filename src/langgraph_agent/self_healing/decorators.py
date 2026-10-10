@@ -68,7 +68,8 @@ class CircuitOpenError(Exception):
     ) -> None:
         self.circuit = circuit
         self.retry_in = retry_in
-        # The first call this open spell refused: the one worth journalling.
+        # The first call this open spell refused in the current healing
+        # session: the one worth journalling.
         self.first_refusal = first_refusal
         if testing:
             detail = "a trial call is testing it now"
@@ -95,7 +96,10 @@ class _Breaker:
     trial and counts the rest, reporting them when it closes. Journalled call
     by call, a daemon that stayed down wrote the same refusal seventy times a
     minute while the console was open, and pushed everything else out of the
-    journal within minutes.
+    journal within minutes. The first refusal is journalled once in each
+    healing session the spell reaches, though: a run that starts mid-outage
+    carries its own record, and without it that record said nothing of why
+    every call was refused.
     """
 
     def __init__(
@@ -119,9 +123,11 @@ class _Breaker:
         # settle the state a later trial is testing.
         self._trial = 0
         self._trial_running = False
-        # This open spell's refused calls and failed trials, since it opened.
+        # This open spell's refused calls and failed trials, since it opened,
+        # and the healing sessions already told of it.
         self._refused = 0
         self._failed_trials = 0
+        self._sessions_told: set[str | None] = set()
 
     def retry_in(self) -> float:
         """Seconds until an open circuit lets a trial call through; 0 if it would now."""
@@ -138,14 +144,10 @@ class _Breaker:
             if self.state == STATE_CLOSED:
                 return 0
             if self.state == STATE_OPEN and self.retry_in() > 0:
-                self._refused += 1
-                raise CircuitOpenError(
-                    self.name, self.retry_in(), first_refusal=self._refused == 1
-                )
+                raise CircuitOpenError(self.name, self.retry_in(), first_refusal=self._refuse())
             if self._trial_running:
-                self._refused += 1
                 raise CircuitOpenError(
-                    self.name, 0.0, testing=True, first_refusal=self._refused == 1
+                    self.name, 0.0, testing=True, first_refusal=self._refuse()
                 )
             first_trial = self.state != STATE_HALF_OPEN and not self._failed_trials
             self.state = STATE_HALF_OPEN
@@ -156,11 +158,28 @@ class _Breaker:
             self._logger.log_circuit_half_open(self.name)
         return trial
 
+    def _refuse(self) -> bool:
+        """Count a refused call; True when its healing session has not been told yet."""
+        self._refused += 1
+        session = self._logger.session_id
+        if session in self._sessions_told:
+            return False
+        self._sessions_told.add(session)
+        return True
+
+    def _end_spell(self) -> tuple[int, int]:
+        """The spell's refused calls and failed trials, its books started afresh."""
+        counts = (self._refused, self._failed_trials)
+        self._refused = self._failed_trials = 0
+        self._sessions_told = set()
+        return counts
+
     def settle(self, trial: int, exc: BaseException | None) -> None:
         """Record how a call admitted by `admit` ended: `exc` None for success."""
         failed = exc is not None and self._counts(exc)
         interrupted = exc is not None and not isinstance(exc, Exception)
         opened = closed = trial_failed = False
+        refused = failed_trials = 0
         with self._lock:
             ours = trial != 0 and trial == self._trial and self._trial_running
             if ours:
@@ -180,13 +199,12 @@ class _Breaker:
                     self.fail_counter += 1
                     if self.fail_counter >= self.fail_max:
                         self.state, self._opened_at, opened = STATE_OPEN, time.monotonic(), True
-                        self._refused = self._failed_trials = 0
+                        self._end_spell()
                 else:
                     self.fail_counter = 0
             failures = self.fail_counter
-            refused, failed_trials = self._refused, self._failed_trials
             if closed:
-                self._refused = self._failed_trials = 0
+                refused, failed_trials = self._end_spell()
         if opened:
             self._logger.log_circuit_opened(self.name, failures)
         if trial_failed:
@@ -195,14 +213,22 @@ class _Breaker:
             self._logger.log_circuit_closed(self.name, refused, failed_trials)
 
     def open(self) -> bool:
-        """Open the circuit now; False if it already was."""
+        """Open the circuit now; False if it already was.
+
+        From half-open the spell goes on -- its trial is what was cut short --
+        so its counts are kept for the line that closes it, and its opening,
+        already journalled, is not journalled again.
+        """
         with self._lock:
-            if self.state == STATE_OPEN:
+            was = self.state
+            if was == STATE_OPEN:
                 return False
             self.state, self._opened_at = STATE_OPEN, time.monotonic()
             self._trial_running = False
-            self._refused = self._failed_trials = 0
-        self._logger.log_circuit_opened(self.name, 0)
+            if was == STATE_CLOSED:
+                self._end_spell()
+        if was == STATE_CLOSED:
+            self._logger.log_circuit_opened(self.name, 0)
         return True
 
     def close(self) -> None:
@@ -211,8 +237,7 @@ class _Breaker:
             was = self.state
             self.state, self.fail_counter, self._opened_at = STATE_CLOSED, 0, None
             self._trial_running = False
-            refused, failed_trials = self._refused, self._failed_trials
-            self._refused = self._failed_trials = 0
+            refused, failed_trials = self._end_spell()
         if was != STATE_CLOSED:
             self._logger.log_circuit_closed(self.name, refused, failed_trials)
 

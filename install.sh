@@ -155,7 +155,10 @@ fi
 NETWORK_OK=1
 if ! scripts/network_check.sh "${net_groups[@]}"; then
     NETWORK_OK=0
-    problem "the network did not let through every host this install needs; allow the entries above"
+    # Not a problem of its own: a host matters only to a step that downloads
+    # from it, and each of those fails and says so. A re-run on a finished
+    # install downloads nothing, and offline it used to end in a failure.
+    echo "  ! not every host answered; a step below that needs one will fail, and say so"
 fi
 
 # ---------------------------------------------------------------------------
@@ -370,14 +373,23 @@ else
 fi
 
 PY="$VENV/bin/python"
-"$PY" -m pip install --quiet --upgrade pip
+# Nothing after this step works without the venv, so pip failing ends the
+# install; behind a network that blocked its index, that is where to start.
+pip_failed() {
+    if [ "$NETWORK_OK" -eq 0 ]; then
+        echo "  pip failed, and the Network step above found hosts that did not" >&2
+        echo "  answer: start there, then re-run ./install.sh." >&2
+    fi
+    exit 1
+}
+"$PY" -m pip install --quiet --upgrade pip || pip_failed
 
 # The browser extra is Playwright, for scripts/browser_agent.py. It is not part
 # of dev, so CI, which tests the agent's logic without a browser, installs none.
 extras=dev
 [ "$BROWSER_AGENT" -eq 1 ] && extras=dev,browser
 echo "  installing the project and its dev tools (pip install -e \".[$extras]\")"
-"$PY" -m pip install --quiet -e ".[$extras]"
+"$PY" -m pip install --quiet -e ".[$extras]" || pip_failed
 ok "langgraph-agent installed in editable mode"
 # What the venv was installed from. launch_console.sh reinstalls when
 # pyproject.toml no longer matches it, so a launch right after this one installs
@@ -461,7 +473,7 @@ else
             if sudo mkdir -p "${one_model%/*}" \
                 && printf '%s' "$one_model_body" | sudo tee "$one_model" >/dev/null \
                 && sudo systemctl daemon-reload \
-                && sudo systemctl restart ollama.service; then
+                && sudo systemctl try-restart ollama.service; then
                 for _ in $(seq 1 20); do daemon_up && break; sleep 0.5; done
                 ok "the daemon holds one model at a time"
             else
@@ -1596,6 +1608,10 @@ if [ "${#PROBLEMS[@]}" -eq 0 ]; then
 fi
 echo "  Installed, with ${#PROBLEMS[@]} thing(s) left to fix:"
 for p in "${PROBLEMS[@]}"; do echo "    - $p"; done
+if [ "$NETWORK_OK" -eq 0 ]; then
+    echo "  The Network step found hosts that did not answer: for a download that"
+    echo "  failed, allow the entries it printed first."
+fi
 print_notes
 if [ -n "$machine_report" ]; then
     echo "  This machine's diagnosis: $machine_report"

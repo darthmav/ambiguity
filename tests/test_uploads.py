@@ -14,6 +14,7 @@ it and records what it was asked to store.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -43,8 +44,13 @@ class _RecordingKB:
         self.added: list[tuple[str, str, dict[str, Any]]] = []
         self.graph = nx.DiGraph()
 
-    def add_document(self, doc_id: str, content: str, metadata: dict[str, Any]) -> int:
+    def add_document(
+        self, doc_id: str, content: str, metadata: dict[str, Any],
+        *, on_commit: Callable[[], None] | None = None,
+    ) -> int:
         self.added.append((doc_id, content, metadata))
+        if on_commit is not None:
+            on_commit()
         self.graph.add_node(doc_id, type="document")
         return max(1, len(content) // 100)
 
@@ -115,7 +121,10 @@ def test_the_id_and_metadata_match_what_a_reindex_would_write(kb, tmp_path, monk
 class _FailingKB(_RecordingKB):
     """An embedder that cannot embed: the daemon down, the tokenizer missing."""
 
-    def add_document(self, doc_id: str, content: str, metadata: dict[str, Any]) -> int:
+    def add_document(
+        self, doc_id: str, content: str, metadata: dict[str, Any],
+        *, on_commit: Callable[[], None] | None = None,
+    ) -> int:
         raise OSError("the embedding tokenizer is not cached here")
 
 
@@ -139,6 +148,49 @@ def test_a_re_upload_that_fails_to_embed_keeps_the_version_the_corpus_holds(kb, 
         store_uploaded_document(_FailingKB(), "spec.md", "Second draft.", root)
 
     assert (Path(root) / UPLOADS_DIR / "spec.md").read_text() == "First draft."
+
+
+def test_a_write_that_fails_part_way_puts_the_previous_version_back(kb, root, monkeypatch):
+    """The write truncates the good file before it writes; on a full disk it
+    stopped part-way outside the rollback, leaving half a document for the next
+    rebuild to embed while the corpus held the old one."""
+    store_uploaded_document(kb, "spec.md", "First draft.", root)
+    target = Path(root) / UPLOADS_DIR / "spec.md"
+
+    def full_disk(self: Path, data: str, encoding: str | None = None) -> int:
+        with open(self, "w", encoding=encoding) as handle:
+            handle.write(data[:3])
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(Path, "write_text", full_disk)
+    with pytest.raises(OSError, match="No space left"):
+        store_uploaded_document(kb, "spec.md", "Second draft.", root)
+
+    assert target.read_text() == "First draft."
+    assert len(kb.added) == 1
+
+
+class _StoredThenFailedKB(_RecordingKB):
+    """The store committed the new version; the in-memory graph did not follow."""
+
+    def add_document(
+        self, doc_id: str, content: str, metadata: dict[str, Any],
+        *, on_commit: Callable[[], None] | None = None,
+    ) -> int:
+        if on_commit is not None:
+            on_commit()
+        raise RuntimeError("placing the node failed")
+
+
+def test_a_failure_after_the_store_committed_keeps_the_file_the_store_holds(kb, root):
+    """Rolled back then, the file went back to the old version while the store
+    kept the new chunks -- the mismatch the rollback exists to prevent."""
+    store_uploaded_document(kb, "spec.md", "First draft.", root)
+
+    with pytest.raises(RuntimeError, match="placing the node"):
+        store_uploaded_document(_StoredThenFailedKB(), "spec.md", "Second draft.", root)
+
+    assert (Path(root) / UPLOADS_DIR / "spec.md").read_text() == "Second draft."
 
 
 def test_re_uploading_a_name_replaces_rather_than_accumulates(kb, root):

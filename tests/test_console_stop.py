@@ -249,6 +249,28 @@ def test_a_run_that_raises_still_clears_the_flag_and_leaves_a_snapshot(monkeypat
     assert snapshot["error"] == "seat died"
 
 
+def test_a_failed_run_names_itself_and_a_refused_one_does_not(monkeypatch):
+    """The console renders the last run under a failure only when that run is
+    this request's. It used to guess from the run it had shown last, so a run
+    refused before it began rendered another tab's result under its goal."""
+    monkeypatch.setattr(
+        serve, "graph", _FakeGraph(["architect"], raises=RuntimeError("seat died"))
+    )
+    socket = _Socket()
+    _rpc_handler(socket).handle_rpc({"method": "run_goal", "params": {"goal": "Do a thing"}})
+
+    error = json.loads(socket.data.split(b"\r\n\r\n", 1)[1])["error"]
+    assert error["message"] == "seat died"
+    assert error["run_id"] == serve.rpc_last_run({})["snapshot"]["run_id"]
+
+    socket = _Socket()
+    _rpc_handler(socket).handle_rpc(
+        {"method": "run_goal", "params": {"goal": "g", "project": "../escape"}})
+    error = json.loads(socket.data.split(b"\r\n\r\n", 1)[1])["error"]
+    assert "not a project name" in error["message"]
+    assert "run_id" not in error
+
+
 def test_the_snapshot_survives_the_console(monkeypatch):
     """A reloaded page reads the run's outcome back off disk."""
     def trip():

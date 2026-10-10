@@ -116,6 +116,29 @@ def test_install_sets_the_watchdog_ticking(host):
     assert "restarts the daemon when it stops answering" in done.stdout
 
 
+def test_install_leaves_a_daemon_it_did_not_start_alone(host):
+    """`ollama serve` in a terminal answers on the port while ollama.service is
+    stopped: enabled and started beside it, the unit could only fail to bind,
+    and with no start limit it failed every two seconds, at every boot."""
+    (host.state / "active").write_text("no")
+
+    done = _run(host, "install")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "ollama.service did not start" in done.stdout
+    calls = host.log.read_text() if host.log.exists() else ""
+    assert not [c for c in calls.splitlines() if c.split()[0] in ("enable", "start", "restart")]
+    assert not host.dropin.exists()
+
+    # `check` says why its unit lines read as they do.
+    assert "is not ollama.service's" in _run(host, "check").stdout
+
+    # Nothing answering: the unit is the daemon, and is set up as before.
+    (host.state / "curl").write_text("7")
+    assert _run(host, "install").returncode == 0
+    assert "enable --now ollama.service" in host.log.read_text()
+
+
 def test_a_second_install_rewrites_nothing(host):
     _run(host, "install")
     host.log.write_text("")

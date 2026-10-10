@@ -97,7 +97,10 @@ net_groups=(arch dockerhub pypi ollama hf github --optional tokenizer research c
 NETWORK_OK=1
 if ! scripts/network_check.sh "${net_groups[@]}"; then
     NETWORK_OK=0
-    problem "the network did not let through every host this install needs; allow the entries above"
+    # Not a problem of its own: a host matters only to a step that downloads
+    # from it, and each of those fails and says so. A re-run on a finished
+    # install downloads nothing, and offline it used to end in a failure.
+    echo "  ! not every host answered; a step below that needs one will fail, and say so"
 fi
 
 # ---------------------------------------------------------------------------
@@ -256,7 +259,7 @@ if systemctl cat ollama.service >/dev/null 2>&1; then
     elif sudo mkdir -p "${one_model%/*}" \
             && printf '%s' "$one_model_body" | sudo tee "$one_model" >/dev/null \
             && sudo systemctl daemon-reload \
-            && sudo systemctl restart ollama.service; then
+            && sudo systemctl try-restart ollama.service; then
         for _ in $(seq 1 20); do daemon_up && break; sleep 0.5; done
         ok "limited the daemon to one model at a time ($one_model)"
     else
@@ -444,6 +447,10 @@ if [ "${#PROBLEMS[@]}" -eq 0 ]; then
 else
     echo "  ${#PROBLEMS[@]} thing(s) left to fix:"
     for p in "${PROBLEMS[@]}"; do echo "    - $p"; done
+    if [ "$NETWORK_OK" -eq 0 ]; then
+        echo "  The Network step found hosts that did not answer: for a download that"
+        echo "  failed, allow the entries it printed first."
+    fi
     echo "  Fix them and re-run ./docker/install.sh; finished steps are skipped."
 fi
 if [ "${#NOTES[@]}" -gt 0 ]; then

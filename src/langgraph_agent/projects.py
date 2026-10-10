@@ -56,20 +56,31 @@ def skipped_dir(name: str) -> bool:
 
 
 # A project name is one path component a person would type: no separators, no
-# leading dot (a hidden directory the console would never list), no `..`.
-_PROJECT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# leading dot (a hidden directory the console would never list), no `..`. One
+# pattern, in the syntax Python and JavaScript share, since the console checks
+# a name with it before sending one (`project_name_rule`).
+_PROJECT_NAME = re.compile(r"^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 def project_name_error(name: Any) -> str | None:
     """Why `name` cannot name a project, or None when it can."""
     if isinstance(name, str) and name.lower() in _RESERVED_NAMES:
         return f"{name!r} is reserved: the record of embedded projects sits under that name."
-    if not isinstance(name, str) or not _PROJECT_NAME.match(name) or ".." in name:
+    if not isinstance(name, str) or not _PROJECT_NAME.match(name):
         return (
             f"{name!r} is not a project name: use letters, digits, '.', '_' or "
             "'-', starting with a letter or digit, at most 64 characters."
         )
     return None
+
+
+def project_name_rule() -> dict[str, Any]:
+    """`project_name_error`'s rule as data, for a client that checks a name first.
+
+    A copy written into the console went without the reserved names, and a
+    name it passed was refused only after the goal had gone into the transcript.
+    """
+    return {"pattern": _PROJECT_NAME.pattern, "reserved": sorted(_RESERVED_NAMES)}
 
 
 def project_dir(name: str) -> str:

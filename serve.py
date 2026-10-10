@@ -75,6 +75,7 @@ from langgraph_agent.graphrag_server import (  # noqa: E402
     EMBEDDER_LOAD,
     EMBEDDING_MODEL_NAME,
     INDEXABLE_SUFFIXES,
+    TOKENIZER_UNAVAILABLE,
     WEB_RESEARCH_DIR,
     GraphRAGKnowledgeBase,
     absent_corpus,
@@ -91,6 +92,7 @@ from langgraph_agent.graphrag_server import (  # noqa: E402
     remove_corpus_sources,
     resolve_persist_dir,
     store_uploaded_document,
+    tokenizer_retry_in,
 )
 from langgraph_agent.mcp_client import MCPClient  # noqa: E402
 from langgraph_agent.projects import (  # noqa: E402
@@ -98,6 +100,7 @@ from langgraph_agent.projects import (  # noqa: E402
     list_projects,
     project_dir,
     project_name_error,
+    project_name_rule,
     set_project_embedded,
 )
 from langgraph_agent.self_healing import (  # noqa: E402
@@ -305,6 +308,10 @@ def rpc_rag_stats(_: dict[str, Any]) -> dict[str, Any]:
             _run_progress.get("running") or _background_rebuild.get("running")
         ):
             report = {**report, "stale": False, "settling": True}
+        # What a rebuild would index, as for an absent corpus: the walk less
+        # what the indexer cannot read. An empty corpus lacks every file, so
+        # every one of them was read for `unreadable_count`.
+        stats["archive"] = report["expected"] - report["unreadable_count"]
         # An empty corpus is held to the walk too. Clear deletes what a
         # rebuild walks, so after one nothing is missing; what an empty corpus
         # lacks is files that did not index, which "corpus empty" alone hid.
@@ -797,6 +804,9 @@ def rpc_status(_: dict[str, Any]) -> dict[str, Any]:
         # What an upload may be, for the console's pickers and tooltips. From
         # the walk's own list, so the page cannot promise a different one.
         "indexable_suffixes": list(INDEXABLE_SUFFIXES),
+        # What a project may be called, for the field that names one: the
+        # server's own rule, so the page cannot pass a name the run refuses.
+        "project_name_rule": project_name_rule(),
         # Pull requests a run left waiting on their checks, which the monitor
         # merges once they pass, and the last word on each.
         "pull_requests": pull_requests_snapshot(),
@@ -1526,6 +1536,12 @@ def _corpus_feed_line(report: dict[str, Any], *, when: str = "before the run") -
             "the corpus once a load fits; `nvidia-smi` names what else holds the "
             "cards."
         )
+    if source == "unavailable" and report.get("unavailable_circuit") == TOKENIZER_UNAVAILABLE:
+        return (
+            f"[Corpus] The rebuild stopped {when} after {report.get('indexed', 0)} "
+            f"document(s): {report.get('unavailable')}{note} The console rebuilds "
+            "the corpus once the tokenizer arrives."
+        )
     if source == "unavailable":
         return (
             f"[Corpus] The embedder could not be reached {when}, so the rebuild "
@@ -1895,6 +1911,9 @@ def rpc_run_goal(params: dict[str, Any]) -> dict[str, Any]:
             error=str(exc),
             project_removed=_drop_unused_project(output_dir, created_project),
         ))
+        # Sent back with the error: only a run that got this far wrote a
+        # snapshot, and the console renders the last one only when it is this.
+        exc.run_id = run_id  # type: ignore[attr-defined]
         raise
     finally:
         # Whatever ended the run, a pull request it left waiting on its checks
@@ -1956,6 +1975,8 @@ def _check_health() -> dict[str, dict[str, str]]:
             "details": (
                 "the last rebuild stopped because the embedding model would not load"
                 if circuit == EMBEDDER_LOAD.name
+                else "the last rebuild stopped because the embedding tokenizer could not be fetched"
+                if circuit == TOKENIZER_UNAVAILABLE
                 else "the last rebuild stopped because the database could not be reached"
                 if circuit == POSTGRES.name
                 else "the last rebuild stopped because the embedder could not be reached"
@@ -1985,19 +2006,22 @@ def _heal() -> None:
     # failure is not one waiting on a service, and a run rebuilds before it
     # starts anyway. A model that would not load is waited out for its
     # circuit's cooldown, which a rebuild tried every pass would only meet as a
-    # refusal, logged each time. Every rebuild needs both services.
+    # refusal, logged each time; a tokenizer the hub would not supply, for the
+    # window before it is asked for again. Every rebuild needs both services.
     with _run_lock:
-        stopped_by_database = _last_rebuild.get("unavailable_circuit") == POSTGRES.name
+        stopped_by = _last_rebuild.get("unavailable_circuit")
     if (
         REBUILD_CORPUS
         and results["corpus"]["status"] == "unhealthy"
         and results["ollama-daemon"]["status"] == "healthy"
         and results["postgres"]["status"] == "healthy"
         and not EMBEDDER_LOAD.retry_in
+        and not tokenizer_retry_in()
         and not _run_in_flight()
     ):
         when = (
-            "after the database came back" if stopped_by_database
+            "after the database came back" if stopped_by == POSTGRES.name
+            else "on asking for the tokenizer again" if stopped_by == TOKENIZER_UNAVAILABLE
             else "after the embedder came back"
         )
         report = _rebuild_the_corpus_in_background(when)
@@ -2465,7 +2489,11 @@ class Handler(SimpleHTTPRequestHandler):
         except Exception as exc:
             elapsed = int((time.perf_counter() - started) * 1000)
             print(f"[RPC] {method} FAILED {elapsed}ms: {exc}")
-            payload = self._encode({"error": {"message": str(exc)}, "elapsed_ms": elapsed})
+            error: dict[str, Any] = {"message": str(exc)}
+            # A run that started before it failed names itself (rpc_run_goal).
+            if isinstance(run_id := getattr(exc, "run_id", None), str):
+                error["run_id"] = run_id
+            payload = self._encode({"error": error, "elapsed_ms": elapsed})
 
         try:
             self._send_payload(payload)

@@ -396,6 +396,64 @@ def test_a_new_outage_is_journalled_afresh():
                        "circuit_closed"] * 2
 
 
+def test_a_run_that_starts_mid_outage_carries_the_refusal_in_its_own_record():
+    """A spell journalled its first refusal once, so a run that began after it
+    -- every call refused -- saved a snapshot whose healing record was empty.
+    Each healing session the spell reaches is told once; nothing more."""
+    journal = get_healing_logger()
+    journal.end_healing_session()
+    mark = journal.events()[-1]["seq"] if journal.events() else 0
+    circuit = Circuit("outage_across_runs", failure_threshold=1, recovery_timeout=60)
+    with pytest.raises(ConnectionError):
+        circuit.call(lambda: (_ for _ in ()).throw(ConnectionError("down")))
+    with pytest.raises(CircuitOpenError):
+        circuit.call(lambda: "refused between runs")
+
+    journal.start_healing_session("run-mid-outage")
+    try:
+        for _ in range(5):
+            with pytest.raises(CircuitOpenError):
+                circuit.call(lambda: "refused in the run")
+    finally:
+        journal.end_healing_session()
+    with pytest.raises(CircuitOpenError):
+        circuit.call(lambda: "refused after it")
+
+    in_run = [e["action"] for e in journal.events(session_id="run-mid-outage")
+              if e.get("function") == "outage_across_runs"]
+    assert in_run == ["circuit_prevented"]
+    every = [e["action"] for e in journal.events(since=mark)
+             if e.get("function") == "outage_across_runs"]
+    assert every == ["circuit_opened", "circuit_prevented", "circuit_prevented"]
+    reset_circuit("outage_across_runs")
+
+
+def test_a_trip_during_the_trial_keeps_the_spell_s_counts():
+    """`trip` from half-open went through `open`, which started the books
+    again, so the line that closed the spell under-reported it."""
+    journal = get_healing_logger()
+    mark = journal.events()[-1]["seq"] if journal.events() else 0
+    circuit = Circuit("tripped_mid_trial", failure_threshold=1, recovery_timeout=0.05)
+    with pytest.raises(ConnectionError):
+        circuit.call(lambda: (_ for _ in ()).throw(ConnectionError("down")))
+    for _ in range(4):
+        with pytest.raises(CircuitOpenError):
+            circuit.call(lambda: "refused")
+    time.sleep(0.06)
+    with pytest.raises(ConnectionError):
+        with circuit.guarding():
+            circuit.trip("the load failed outright")
+            raise ConnectionError("down")
+    assert circuit.is_open
+    time.sleep(0.06)
+    assert circuit.call(lambda: "up") == "up"
+
+    events = [e for e in journal.events(since=mark) if e.get("function") == "tripped_mid_trial"]
+    assert [e["action"] for e in events].count("circuit_opened") == 1
+    assert events[-1]["action"] == "circuit_closed"
+    assert events[-1]["refused"] == 4
+
+
 def test_a_success_clears_the_count_of_a_closed_circuit():
     circuit = Circuit("count_clears", failure_threshold=2, recovery_timeout=60)
     for _ in range(3):
