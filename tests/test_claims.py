@@ -569,10 +569,16 @@ def test_no_capital_forced_by_position_becomes_a_hub_entity():
 
 
 # The twenty best-connected entities, as a person last read and accepted them:
-# 2026-10-02, when a Researcher's replan began counting toward the step
+# 2026-10-09, when the browser agent and the machine diagnostic arrived.
+# `ANTHROPIC_API_KEY` (the variable a stub seat must have emptied, and the one
+# a Claude Code sign-in check must not inherit) and `OSError` (an exception
+# class, ruled like `ValueError` and `Exception`) reached a seventh document;
+# `AGENTS` fell to six, and `RECURSION_LIMIT`, still at seven, lost the tie for
+# the twentieth slot by name -- both remain real terms, outside the twenty.
+# Before that, 2026-10-02, when a Researcher's replan began counting toward the step
 # ceiling and `MAX_STEPS` (graph.py's constant) reached a seventh document;
 # `Architecture` left at the tie for the twentieth slot, six documents settled
-# by name, which `AGENTS` now holds -- all three are real terms. Earlier the
+# by name, which `AGENTS` then held -- all three are real terms. Earlier the
 # same day `Circuit` (the self-healing class) reached a sixth document and took
 # the place of `CircuitOpenError`. The 2026-10-01 audit, when the census widened back to
 # all the prose the checkout ships, ruled `ValueError`, `GraphRAG`, `Callable`,
@@ -582,7 +588,7 @@ def test_no_capital_forced_by_position_becomes_a_hub_entity():
 AUDITED_TOP_ENTITIES = frozenset({
     "Builder", "Architect", "Planner", "Researcher", "Exception", "ValueError",
     "GraphRAG", "Ollama", "Python", "AgentState", "Callable", "Search",
-    "Verdict", "Anthropic", "Fiedler", "Laplacian", "RECURSION_LIMIT", "AGENTS",
+    "Verdict", "Anthropic", "Fiedler", "Laplacian", "ANTHROPIC_API_KEY", "OSError",
     "MAX_STEPS", "Circuit",
 })
 

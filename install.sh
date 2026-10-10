@@ -14,7 +14,9 @@
 # account: an Ollama Cloud tag -- which a free ollama.com account can run -- is
 # pulled as an extra seat choice only when the daemon is signed in, and a
 # sign-in is asked for only when a seat is set up to use one. Nothing here asks
-# for an API key: Anthropic stays optional, and unconfigured.
+# for an API key: Anthropic stays optional, and unconfigured. Claude Code, set
+# up so a session on this machine can drive the console in a browser, asks for
+# one claude.ai consent, once, at a terminal -- and only for Claude in Chrome.
 #
 # The driver is the machine's own setup, not this script's -- Omarchy installs
 # it. Nothing in this project touches torch or a card itself: the daemon owns
@@ -41,7 +43,15 @@
 #   ./install.sh --no-checks    skip ruff / mypy / pytest
 #   ./install.sh --no-probe     do not send each seat a one-word test prompt
 #   ./install.sh --no-desktop   do not add the console to the app launcher
-#   ./install.sh --yes          never prompt (pacman --noconfirm, no sign-ins)
+#   ./install.sh --no-browser-agent
+#                               no browser agent (scripts/browser_agent.py):
+#                               no Playwright in the venv, no ffmpeg, and no
+#                               pass of the console through a real browser
+#   ./install.sh --no-claude    do not set up Claude Code, its Playwright MCP
+#                               server or Claude in Chrome
+#                               (scripts/claude_tools.sh)
+#   ./install.sh --yes          never prompt (pacman --noconfirm, no sign-ins;
+#                               a missing Claude Code is installed unasked)
 #
 #   SEARXNG_PORT=8899 ./install.sh
 #                               another loopback port for SearxNG when 8888 is
@@ -54,6 +64,7 @@ ROOT="$(pwd)"
 VENV="$ROOT/.venv"
 
 MINIMAL=0 SYSTEM=1 CUDA12=1 SEARXNG=1 POSTGRES=1 DOCKER_GROUP=1 CHECKS=1 PROBE=1 DESKTOP=1 ASSUME_YES=0
+BROWSER_AGENT=1 CLAUDE=1
 for arg in "$@"; do
     case "$arg" in
         --minimal)    MINIMAL=1 ;;
@@ -65,6 +76,8 @@ for arg in "$@"; do
         --no-checks)  CHECKS=0 ;;
         --no-probe)   PROBE=0 ;;
         --no-desktop) DESKTOP=0 ;;
+        --no-browser-agent) BROWSER_AGENT=0 ;;
+        --no-claude)  CLAUDE=0 ;;
         --yes|-y)     ASSUME_YES=1 ;;
         -h|--help)    sed -n '2,/^$/{s/^# \{0,1\}//;p}' "$0"; exit 0 ;;
         *) echo "Unknown option: $arg (try --help)" >&2; exit 2 ;;
@@ -82,6 +95,29 @@ NOTES=()
 step()    { echo; echo "► $1"; }
 ok()      { echo "  ✓ $1"; }
 interactive() { [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; }
+
+# This run's reports, in one directory: the browser check's and, when something
+# is left to fix, the machine diagnostic's. reports/diagnostics/ is never
+# committed.
+INSTALL_REPORTS="reports/diagnostics/install-$(date +%Y%m%d-%H%M%S)"
+
+# The system's Chromium, found the way scripts/claude_tools.sh looks first --
+# the binary before Arch's launcher, which adds ~/.config/chromium-flags.conf to
+# every start. Empty when none, and then Playwright's own build is fetched
+# (steps 6b and 12): the MCP server's last resort, and the browser agent's
+# first choice whenever it is there.
+system_chromium() {
+    local name
+    if [ -n "${BROWSER_AGENT_CHROMIUM:-}" ]; then
+        if [ -x "$BROWSER_AGENT_CHROMIUM" ]; then echo "$BROWSER_AGENT_CHROMIUM"; fi
+        return 0
+    fi
+    if [ -x /usr/lib/chromium/chromium ]; then echo /usr/lib/chromium/chromium; return 0; fi
+    for name in chromium chromium-browser google-chrome-stable; do
+        if command -v "$name" 2>/dev/null; then return 0; fi
+    done
+    return 0
+}
 
 echo "============================================"
 echo "  Ambiguity 4-Agent Console -- install"
@@ -106,8 +142,17 @@ step "Network (the hosts this install downloads from)"
 net_groups=(pypi ollama hf tokenizer github)
 [ "$SYSTEM" -eq 1 ] && net_groups+=(arch)
 { [ "$POSTGRES" -eq 1 ] || [ "$SEARXNG" -eq 1 ]; } && net_groups+=(dockerhub)
+# Everything after --optional is reported and never stops the install: no
+# seat needs Claude Code, and npx fetches the MCP server again when it starts.
+net_groups+=(--optional research cloud)
+[ "$CLAUDE" -eq 1 ] && net_groups+=(npm claude)
+# Playwright's own browser builds, fetched (steps 6b and 12) only on a machine
+# that will have no chromium: --no-system installs none.
+if [ "$BROWSER_AGENT" -eq 1 ] && [ "$SYSTEM" -eq 0 ] && [ -z "$(system_chromium)" ]; then
+    net_groups+=(playwright)
+fi
 NETWORK_OK=1
-if ! scripts/network_check.sh "${net_groups[@]}" --optional research cloud; then
+if ! scripts/network_check.sh "${net_groups[@]}"; then
     NETWORK_OK=0
     problem "the network did not let through every host this install needs; allow the entries above"
 fi
@@ -149,6 +194,16 @@ POSTGRES_PACKAGES=(docker postgresql-libs)
 # docker.service and the docker group are still set up by the PostgreSQL step.
 CONTAINER_PACKAGES=(docker docker-compose docker-buildx podman crun)
 
+# The browser agent (scripts/browser_agent.py) drives Chromium itself -- the
+# binary, not whichever browser you browse with -- so it is installed whatever
+# other browser is here. nodejs and npm are npx, which runs the Playwright MCP
+# server; ffmpeg turns a recording of the agent's passes into a GIF.
+BROWSER_AGENT_PACKAGES=(chromium nodejs npm ffmpeg)
+
+# The Playwright MCP server (scripts/claude_tools.sh) drives the same Chromium,
+# through npx, with or without the browser agent.
+CLAUDE_PACKAGES=(chromium nodejs npm)
+
 # Useful: nothing breaks without them, but working on this repo is worse.
 USEFUL=(
     ripgrep      # rg: searching a codebase this size
@@ -156,6 +211,12 @@ USEFUL=(
     jq           # reading /rpc replies: curl ... | jq
     shellcheck   # linting this script and launch_console.sh
     btop         # watching the embedder and the test suite use the machine
+    nvtop        # GPU memory and load per process: which model holds which card
+    pciutils     # lspci: the cards, and the driver bound to each
+    lsof         # which process holds a port, or a file under the corpus
+    noto-fonts   # text in the browser agent's screenshots, instead of boxes
+    noto-fonts-emoji  # the console's symbols in those screenshots
+    wl-clipboard # wl-copy: gh puts its one-time sign-in code on the clipboard
 )
 
 if [ "$SYSTEM" -eq 1 ]; then
@@ -171,17 +232,20 @@ if [ "$SYSTEM" -eq 1 ]; then
     [ "$SEARXNG" -eq 1 ] && wanted+=("${SEARXNG_PACKAGES[@]}")
     [ "$POSTGRES" -eq 1 ] && wanted+=("${POSTGRES_PACKAGES[@]}")
     [ "$MINIMAL" -eq 0 ] && wanted+=("${USEFUL[@]}" "${CONTAINER_PACKAGES[@]}")
+    [ "$BROWSER_AGENT" -eq 1 ] && wanted+=("${BROWSER_AGENT_PACKAGES[@]}")
+    [ "$CLAUDE" -eq 1 ] && wanted+=("${CLAUDE_PACKAGES[@]}")
 
     # The console needs a browser, and Omarchy ships Chromium. Only a machine
-    # with none at all gets one, so an existing choice is never second-guessed.
+    # with none at all gets one, so an existing choice is never second-guessed
+    # (the browser agent's Chromium above is the agent's, not a default).
     browser_found=0
     for b in chromium firefox brave google-chrome-stable librewolf zen-browser vivaldi; do
         command -v "$b" >/dev/null && { browser_found=1; break; }
     done
     [ "$browser_found" -eq 0 ] && wanted+=(chromium)
 
-    # docker, podman and crun each sit in two groups; each is named once, so
-    # the counts below are packages rather than mentions.
+    # docker, podman, crun, chromium, nodejs and npm each sit in two groups;
+    # each is named once, so the counts below are packages rather than mentions.
     mapfile -t wanted < <(printf '%s\n' "${wanted[@]}" | awk '!seen[$0]++')
 
     # `pacman -T` prints what is not satisfied, provides included, so a rerun
@@ -226,6 +290,25 @@ else
     chmod 600 .env
     ok "created .env from .env.example (no key needed for the default seats)"
 fi
+# Which sign-in key variables the shell running this script exported, read
+# before .env is. One that only .env sets is for an Anthropic seat and is read
+# by the project alone; one the shell exports also reaches every claude started
+# from that shell and turns Claude in Chrome off, which the machine diagnosis
+# below is there to point out -- so it is shown the second kind, not the first.
+KEY_VARS=(ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN)
+shell_keys=" "
+for var in "${KEY_VARS[@]}"; do
+    if [ -n "${!var:-}" ]; then shell_keys+="$var "; fi
+done
+# Runs a command without the key variables that came from .env alone. What it
+# runs from the project reloads .env itself, so a seat's key is not lost.
+without_dotenv_keys() {
+    local drop=() var
+    for var in "${KEY_VARS[@]}"; do
+        case "$shell_keys" in *" $var "*) ;; *) drop+=(-u "$var") ;; esac
+    done
+    env "${drop[@]}" "$@"
+}
 set -a
 # shellcheck source=/dev/null
 . ./.env
@@ -288,8 +371,12 @@ fi
 PY="$VENV/bin/python"
 "$PY" -m pip install --quiet --upgrade pip
 
-echo "  installing the project and its dev tools (pip install -e \".[dev]\")"
-"$PY" -m pip install --quiet -e ".[dev]"
+# The browser extra is Playwright, for scripts/browser_agent.py. It is not part
+# of dev, so CI, which tests the agent's logic without a browser, installs none.
+extras=dev
+[ "$BROWSER_AGENT" -eq 1 ] && extras=dev,browser
+echo "  installing the project and its dev tools (pip install -e \".[$extras]\")"
+"$PY" -m pip install --quiet -e ".[$extras]"
 ok "langgraph-agent installed in editable mode"
 # What the venv was installed from. launch_console.sh reinstalls when
 # pyproject.toml no longer matches it, so a launch right after this one installs
@@ -614,7 +701,11 @@ else
         gh_signed_in() { gh auth status --hostname github.com >/dev/null 2>&1; }
         if ! gh_signed_in && interactive; then
             echo "  gh is not signed in to github.com; git_dwell opens pull requests, reads their checks and merges them with it"
-            if gh auth login --hostname github.com --git-protocol https; then
+            # Straight to the browser, without gh's menu of questions; the
+            # one-time code goes on the clipboard too, where there is one.
+            gh_login=(gh auth login --hostname github.com --git-protocol https --web)
+            command -v wl-copy >/dev/null && gh_login+=(--clipboard)
+            if "${gh_login[@]}"; then
                 # Makes gh git's credential helper for github.com, which is
                 # what lets git_dwell's plain `git push` authenticate. Only
                 # after a sign-in this script started: an existing setup's
@@ -628,6 +719,40 @@ else
             problem "gh is not signed in: run 'gh auth login', then re-run ./install.sh"
         fi
     fi
+fi
+
+# ---------------------------------------------------------------------------
+# 6b. Claude Code, to drive the console in a browser
+# ---------------------------------------------------------------------------
+
+if [ "$CLAUDE" -eq 1 ]; then
+    step "Claude tools (Claude Code, the Playwright MCP server, Claude in Chrome)"
+    # What a Claude Code session on this machine needs to open the console in a
+    # browser itself; the console and its seats need none of it. Beside gh, so
+    # the sign-ins sit together. scripts/claude_tools.sh says exactly what it
+    # does; its notes -- the steps only you can take, like the one click Claude
+    # in Chrome needs -- join this script's own.
+    #
+    # --no-system installs no chromium, and the browser agent's step fetches
+    # Playwright's own build only after this one has looked for a browser, so
+    # the MCP server went unregistered until the next run. Fetched here first;
+    # the browser agent's step then finds it.
+    if [ "$BROWSER_AGENT" -eq 1 ] && [ "$SYSTEM" -eq 0 ] && [ -z "$(system_chromium)" ]; then
+        echo "  no system Chromium, and --no-system installs none: fetching Playwright's own, for the MCP server and the browser agent"
+        if ! "$PY" -m playwright install chromium; then
+            echo "  Playwright's Chromium was not fetched; the browser agent's step tries again"
+        fi
+    fi
+    claude_tools=(scripts/claude_tools.sh install)
+    [ "$ASSUME_YES" -eq 1 ] && claude_tools+=(--yes)
+    claude_notes="$(mktemp)"
+    if ! CLAUDE_TOOLS_NOTES="$claude_notes" "${claude_tools[@]}"; then
+        problem "Claude Code is not fully set up to drive the console; scripts/claude_tools.sh check says what is missing"
+    fi
+    while IFS= read -r claude_note; do
+        if [ -n "$claude_note" ]; then NOTES+=("$claude_note"); fi
+    done <"$claude_notes"
+    rm -f "$claude_notes"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1185,10 +1310,15 @@ step "Console"
 # without it this check started a first build -- the embedding model loaded
 # onto the cards, a corpus schema created -- and then killed it seconds in. SIGTERM,
 # not SIGINT: bash starts background jobs with SIGINT ignored, and the server
-# would never see it.
+# would never see it. FOLLOW_PULL_REQUESTS=0 and a runs directory of its own
+# keep its monitor from following a pull request a real run left pending in
+# runs/ -- reading its checks, merging it -- which it starts on as soon as it
+# is up.
 console_log=/tmp/ambiguity-console-check.log
 console_port="$("$PY" -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
-PORT="$console_port" REBUILD_CORPUS=0 "$PY" serve.py >"$console_log" 2>&1 &
+console_runs="$(mktemp -d)"
+PORT="$console_port" REBUILD_CORPUS=0 FOLLOW_PULL_REQUESTS=0 RUNS_DIR="$console_runs" \
+    "$PY" serve.py >"$console_log" 2>&1 &
 console_pid=$!
 console_up=0
 for _ in $(seq 1 60); do
@@ -1212,6 +1342,63 @@ else
 fi
 kill "$console_pid" 2>/dev/null || true
 wait "$console_pid" 2>/dev/null || true
+rm -rf "$console_runs"
+
+# ---------------------------------------------------------------------------
+# 12. Browser agent: the console in a real browser
+# ---------------------------------------------------------------------------
+
+if [ "$BROWSER_AGENT" -eq 1 ]; then
+    step "Browser agent (the console in a real browser)"
+    # First whether a browser launches here at all, and if not why: a missing
+    # binary, or a sandbox the kernel will not give it. Then the read-only
+    # passes, against a console the agent starts for itself -- its own port,
+    # runs directory and corpus, stub seats, no rebuild -- so no model loads and
+    # nothing a real run left is touched. The one click it makes on the corpus
+    # tab is the first of clear's two, which arms the button and nothing more.
+    doctor_status=0
+    doctor_json="$("$PY" scripts/browser_agent.py doctor --json 2>/dev/null)" || doctor_status=$?
+    if [ "$doctor_status" -eq 2 ] && [ "$SYSTEM" -eq 0 ]; then
+        # --no-system installs no chromium, so Playwright's own build is
+        # fetched into its cache instead (the playwright group in step 0):
+        # by step 6b already, unless --no-claude or that fetch failed.
+        echo "  no browser here, and --no-system installs none: fetching Playwright's own Chromium"
+        if "$PY" -m playwright install chromium; then
+            doctor_status=0
+            doctor_json="$("$PY" scripts/browser_agent.py doctor --json 2>/dev/null)" || doctor_status=$?
+        fi
+    fi
+    # doctor's one JSON object, said in one line: the browser it launched, or
+    # why none would launch and what fixes that.
+    doctor_said="$("$PY" - "$doctor_json" 2>/dev/null <<'PY' || echo "browser_agent.py doctor printed no report"
+import json
+import sys
+
+report = json.loads(sys.argv[1])
+if report.get("ok"):
+    browser = report.get("browser") or {}
+    sandbox = "on" if report.get("sandbox") else "off"
+    print(f"{browser.get('path')} ({browser.get('version') or 'version unknown'}), sandbox {sandbox}")
+else:
+    print("; ".join([*report.get("problems", []), *report.get("fixes", [])]) or "no reason given")
+PY
+    )"
+    if [ "$doctor_status" -ne 0 ]; then
+        problem "no browser launches here for the browser agent: $doctor_said"
+    elif [ "$console_up" -eq 0 ]; then
+        ok "a browser launches: $doctor_said"
+        echo "  (no pass through it: the console did not start, above)"
+    else
+        ok "a browser launches: $doctor_said"
+        browser_report="$INSTALL_REPORTS/browser"
+        if "$PY" scripts/browser_agent.py check --spawn --stub-seats --no-rebuild \
+                --passes tour,viewports,clear-arm,exit --out "$browser_report"; then
+            ok "the console passes its tour, viewports, clear-arm and exit in the browser ($browser_report/report.md)"
+        else
+            problem "the console did not pass in the browser; see $browser_report/report.md"
+        fi
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # Summary: can the embedder and each seat actually run?
@@ -1350,6 +1537,39 @@ print_notes() {
     for n in "${NOTES[@]}"; do echo "    - $n"; done
 }
 
+# A machine left with something to fix is diagnosed now, while what went wrong
+# is fresh: the GPU, the daemon, the database, the console, with this run's
+# problems and notes and the logs its steps wrote, in one report to read or
+# send. Written to files rather than by teeing this script, which would take
+# the terminal away from sudo and gh.
+machine_report=""
+if [ "${#PROBLEMS[@]}" -gt 0 ] && [ -f scripts/diagnose_machine.py ]; then
+    step "Diagnosing this machine (scripts/diagnose_machine.py --quick)"
+    mkdir -p "$INSTALL_REPORTS"
+    install_summary="$INSTALL_REPORTS/install-summary.txt"
+    {
+        echo "install.sh $*, finished $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "problems:"
+        printf '  - %s\n' "${PROBLEMS[@]}"
+        if [ "${#NOTES[@]}" -gt 0 ]; then
+            echo "notes:"
+            printf '  - %s\n' "${NOTES[@]}"
+        fi
+    } >"$install_summary"
+    # Only logs this run wrote: the venv's is written only when one is made.
+    logs=("$install_summary" /tmp/ambiguity-embedder.log "$console_log")
+    if [ "$CHECKS" -eq 1 ]; then logs+=(/tmp/ambiguity-check-*.log); fi
+    save_logs=()
+    for log in "${logs[@]}"; do
+        if [ -f "$log" ]; then save_logs+=(--save-log "$log"); fi
+    done
+    without_dotenv_keys "$PY" scripts/diagnose_machine.py --quick --out "$INSTALL_REPORTS/machine" \
+        "${save_logs[@]}" || true
+    if [ -f "$INSTALL_REPORTS/machine/report.md" ]; then
+        machine_report="$INSTALL_REPORTS/machine/report.md"
+    fi
+fi
+
 echo
 echo "============================================"
 if [ "${#PROBLEMS[@]}" -eq 0 ]; then
@@ -1357,12 +1577,20 @@ if [ "${#PROBLEMS[@]}" -eq 0 ]; then
     echo "    ./launch_console.sh"
     [ "$DESKTOP" -eq 1 ] && echo "  or pick \"Ambiguity Console\" from the app launcher."
     print_notes
+    echo "  To diagnose this machine later: .venv/bin/python scripts/diagnose_machine.py"
     echo "============================================"
     exit 0
 fi
 echo "  Installed, with ${#PROBLEMS[@]} thing(s) left to fix:"
 for p in "${PROBLEMS[@]}"; do echo "    - $p"; done
 print_notes
+if [ -n "$machine_report" ]; then
+    echo "  This machine's diagnosis: $machine_report"
+    if [ -f "$INSTALL_REPORTS/machine-share.tar.gz" ]; then
+        echo "  (to send it: $INSTALL_REPORTS/machine-share.tar.gz)"
+    fi
+fi
+echo "  To diagnose it again: .venv/bin/python scripts/diagnose_machine.py"
 echo "  Fix them and re-run ./install.sh; finished steps are skipped."
 echo "============================================"
 exit 1

@@ -800,6 +800,10 @@ def rpc_status(_: dict[str, Any]) -> dict[str, Any]:
         # Pull requests a run left waiting on their checks, which the monitor
         # merges once they pass, and the last word on each.
         "pull_requests": pull_requests_snapshot(),
+        # Whether the monitor is finishing one right now, and which: a stored
+        # entry reads `pending` throughout, so only this says a run would be
+        # refused, and a diagnostic waits rather than load the cards beside it.
+        "pull_request_follow": _pull_request_follow_status(),
     }
 
 
@@ -821,7 +825,24 @@ _run_lock = threading.Lock()
 # The last run's final state, so a stopped run is recoverable; also on disk, so
 # it survives a reload and a restart.
 _last_run_snapshot: dict[str, Any] | None = None
-RUNS_DIR = Path(__file__).parent / "runs"
+
+
+def _runs_dir() -> Path:
+    """Where a run's record lives: `runs/` beside this file, unless `RUNS_DIR` says.
+
+    Everything this console keeps about its runs is under it -- the last run's
+    snapshot and the pull requests the monitor follows -- so a second console
+    started beside the operator's own (the browser agent's `--spawn`) is given
+    a directory of its own and neither reads nor replaces theirs. A relative
+    path is taken from where the console was started, once, at import.
+    """
+    configured = os.getenv("RUNS_DIR", "").strip()
+    if not configured:
+        return Path(__file__).parent / "runs"
+    return Path(configured).expanduser().resolve()
+
+
+RUNS_DIR = _runs_dir()
 LAST_RUN_PATH = RUNS_DIR / "last_run.json"
 
 
@@ -2004,6 +2025,16 @@ def _heal() -> None:
 PULL_REQUEST_FOLLOW_SECONDS = float(os.getenv("PULL_REQUEST_FOLLOW_SECONDS", "60"))
 PULL_REQUEST_FOLLOW_HOURS = float(os.getenv("PULL_REQUEST_FOLLOW_HOURS", "24"))
 
+# Whether this console finishes them at all. On by default: a pending pull
+# request is the run's unfinished work. Off for a console that is not the
+# operator's -- one the browser agent or the installer starts to look at --
+# since finishing means a squash-merge, a deleted branch and a fast-forward in
+# someone's repository, which such a console has no business doing even with
+# `RUNS_DIR` apart. Off, a recorded pull request is still shown, never touched.
+FOLLOW_PULL_REQUESTS = os.getenv(
+    "FOLLOW_PULL_REQUESTS", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+
 # Answers in a row that were neither a verdict nor "still running" -- gh signed
 # out, GitHub down, a push by someone else -- before the console stops asking.
 PULL_REQUEST_FOLLOW_FAILURES = 3
@@ -2094,6 +2125,17 @@ def pull_requests_snapshot() -> list[dict[str, Any]]:
     return [{field: entry.get(field) for field in _PULL_REQUEST_FIELDS} for entry in entries]
 
 
+def _pull_request_follow_status() -> dict[str, Any]:
+    """Whether the monitor is finishing a pull request now: `{running, number}`.
+
+    A copy, read under `_run_lock` where it is written, so a reader never sees
+    `running` from one finish and `number` from the next.
+    """
+    with _run_lock:
+        return {"running": bool(_pull_request_follow["running"]),
+                "number": _pull_request_follow["number"]}
+
+
 def _finish_one(entry: Mapping[str, Any]) -> dict[str, Any]:
     """Ask GitHub once about one followed pull request; return what changed."""
     number, now = entry.get("number"), time.time()
@@ -2156,7 +2198,11 @@ def _follow_pull_requests() -> None:
     Never while a run is: its Builder may be working in the same repository,
     and the cleanup switches branches. The lock is not held across GitHub: a
     finish asks gh several times, and the header reads the list meanwhile.
+    Never with `FOLLOW_PULL_REQUESTS` off, either: then nothing is asked,
+    merged or written, and the file stays exactly as the runs left it.
     """
+    if not FOLLOW_PULL_REQUESTS:
+        return
     now = time.time()
     with _pull_requests_lock:
         due = [

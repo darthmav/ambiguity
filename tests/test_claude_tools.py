@@ -1,0 +1,655 @@
+"""Claude Code set up to drive the console: what scripts/claude_tools.sh does.
+
+Run against stand-ins for `claude`, `npx`, `git`, `curl` and the venv's python
+on a PATH of their own, with HOME in a temporary directory, so nothing here
+installs, signs in or registers anything: every call the script makes is
+recorded with its arguments, the directory it ran in and which key variables
+its environment still held, and the stand-in `claude` keeps its sign-in and its
+MCP registration in files the tests read back.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from shlex import quote as shlex_quote
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "scripts" / "claude_tools.sh"
+KEYS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
+PIN = "@playwright/mcp@0.0.83"
+MANIFEST = "com.anthropic.claude_code_browser_extension.json"
+
+# One stand-in for every tool, told apart by the name it is run under. Each call
+# is a line in calls.jsonl; behaviour is steered by files and STANDIN_ variables.
+STANDIN = r'''#!{python}
+import json, os, sys
+from pathlib import Path
+
+state = Path(os.environ["STANDIN_STATE"])
+tool = Path(sys.argv[0]).name
+argv = sys.argv[1:]
+keys = [k for k in {keys!r} if k in os.environ]
+with open(state / "calls.jsonl", "a") as log:
+    log.write(json.dumps({{"tool": tool, "argv": argv, "keys": keys, "cwd": os.getcwd()}}) + "\n")
+
+if tool == "claude":
+    if argv == ["--version"]:
+        print("2.1.295 (Claude Code)")
+    elif argv[:2] == ["auth", "status"]:
+        auth = state / "auth"
+        method = auth.read_text().strip() if auth.exists() else "none"
+        print(json.dumps({{"loggedIn": method != "none", "authMethod": method}}, indent=2))
+        sys.exit(0 if method != "none" else 1)
+    elif argv[:2] == ["auth", "login"]:
+        if os.environ.get("STANDIN_LOGIN_FAILS"):
+            sys.exit(1)
+        (state / "auth").write_text("claude.ai")
+    elif argv == ["mcp", "get", "playwright"]:
+        mcp = state / "mcp"
+        if not mcp.exists():
+            print('No MCP server named "playwright". Run `claude mcp add` to add one.', file=sys.stderr)
+            sys.exit(1)
+        command, args = json.loads(mcp.read_text())
+        print("playwright:\n  Scope: Local config (private to you in this project)\n"
+              "  Status: ✓ Connected\n  Type: stdio\n"
+              f"  Command: {{command}}\n  Args: {{' '.join(args)}}\n  Environment:\n\n"
+              'To remove this server, run: claude mcp remove "playwright" -s local')
+    elif argv[:2] == ["mcp", "add"]:
+        rest = argv[argv.index("--") + 1:]
+        (state / "mcp").write_text(json.dumps([rest[0], rest[1:]]))
+        print("Added stdio MCP server playwright to local config")
+elif tool == "npx":
+    sys.exit(int(os.environ.get("STANDIN_NPX_STATUS", "0")))
+elif tool == "git":
+    email = os.environ.get("STANDIN_GIT_EMAIL", "")
+    if argv == ["config", "user.email"] and email:
+        print(email)
+    else:
+        sys.exit(1)
+elif tool == "curl":
+    # What the native installer amounts to here: claude, in ~/.local/bin.
+    print('mkdir -p "$HOME/.local/bin" && cp "$STANDIN_STATE/standin" "$HOME/.local/bin/claude"'
+          ' && chmod 755 "$HOME/.local/bin/claude"')
+elif tool == "python":
+    if argv[:1] == ["-c"]:  # does the venv have Playwright
+        sys.exit(1 if os.environ.get("STANDIN_NO_PLAYWRIGHT") else 0)
+    print("mcp-check stand-in")
+    sys.exit(int(os.environ.get("STANDIN_MCP_CHECK_STATUS", "0")))
+elif tool == "id":
+    # Not root unless a test says so, whoever runs the suite: CI is not, a
+    # container is.
+    print(os.environ.get("STANDIN_UID", "1000"))
+'''
+
+# What the script runs besides the stand-ins. Linked one by one into a
+# directory of their own, so a real claude, npx or Chrome on this machine --
+# CI runners ship Chrome, an Arch machine with npm has /usr/bin/npx -- is never
+# on the PATH the script sees.
+SYSTEM_TOOLS = ("bash", "sh", "env", "timeout", "sed", "head", "tail", "grep",
+                "readlink", "dirname", "basename", "mkdir", "cp", "chmod")
+
+
+@pytest.fixture
+def host(tmp_path):
+    """A HOME, a PATH of stand-ins and system tools, and the call log."""
+    home = tmp_path / "home"
+    home.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "calls.jsonl").write_text("")
+    standin = state / "standin"
+    standin.write_text(STANDIN.format(python=sys.executable, keys=KEYS))
+    standin.chmod(0o755)
+
+    stand_ins = tmp_path / "bin"
+    stand_ins.mkdir()
+    for tool in ("claude", "npx", "git", "curl", "id"):
+        shutil.copy(standin, stand_ins / tool)
+    venv_python = tmp_path / "venv" / "python"
+    venv_python.parent.mkdir()
+    shutil.copy(standin, venv_python)
+    browser = tmp_path / "chromium-bin" / "chromium"
+    browser.parent.mkdir()
+    browser.write_text("#!/bin/sh\nexit 0\n")
+    browser.chmod(0o755)
+
+    system = tmp_path / "system"
+    system.mkdir()
+    for tool in SYSTEM_TOOLS:
+        found = shutil.which(tool)
+        assert found, f"{tool} is not on this machine's PATH"
+        (system / tool).symlink_to(found)
+
+    env = {
+        "HOME": str(home),
+        "PATH": f"{stand_ins}:{system}",
+        "LANG": "C.UTF-8",
+        "STANDIN_STATE": str(state),
+        "STANDIN_GIT_EMAIL": "someone@example.org",
+        "CLAUDE_TOOLS_PYTHON": str(venv_python),
+        "CLAUDE_TOOLS_SYSTEM_CHROMIUM": str(tmp_path / "no-such-chromium"),
+        "CLAUDE_TOOLS_INTERACTIVE": "0",
+        "BROWSER_AGENT_CHROMIUM": str(browser),
+        "CLAUDE_TOOLS_NOTES": str(tmp_path / "notes.txt"),
+    }
+
+    class Host:
+        pass
+
+    h = Host()
+    h.env, h.home, h.state, h.bin, h.browser, h.notes = (
+        env, home, state, stand_ins, browser, tmp_path / "notes.txt")
+    return h
+
+
+def _run(host, *args, stdin=""):
+    return subprocess.run(["bash", str(SCRIPT), *args], env=host.env, input=stdin,
+                          capture_output=True, text=True, timeout=60)
+
+
+def _calls(host, tool=None):
+    lines = (host.state / "calls.jsonl").read_text().splitlines()
+    calls = [json.loads(line) for line in lines if line]
+    return [c for c in calls if tool is None or c["tool"] == tool]
+
+
+def _notes(host):
+    return host.notes.read_text().splitlines() if host.notes.exists() else []
+
+
+def _expected_mcp_args(browser, root=False):
+    return ["-y", PIN, "--executable-path", str(browser), "--isolated",
+            "--output-dir", str(ROOT / "reports" / "diagnostics" / "playwright-mcp"),
+            *(["--no-sandbox"] if root else [])]
+
+
+def _register(host, command="npx", args=None):
+    (host.state / "mcp").write_text(json.dumps([command, args or _expected_mcp_args(host.browser)]))
+
+
+# ---------------------------------------------------------------------------
+# the CLI
+# ---------------------------------------------------------------------------
+
+
+def test_install_leaves_an_installed_claude_alone(host):
+    done = _run(host, "install", "--yes")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _calls(host, "curl") == [], "the native installer ran with claude already there"
+    assert "Claude Code 2.1.295" in done.stdout
+
+
+def test_yes_installs_a_missing_claude_with_the_native_installer(host):
+    (host.bin / "claude").unlink()
+
+    done = _run(host, "install", "--yes")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert [c["argv"] for c in _calls(host, "curl")] == [["-fsSL", "https://claude.ai/install.sh"]]
+    assert (host.home / ".local" / "bin" / "claude").exists()
+    # Found there for the rest of the run, without touching the shell's config...
+    assert any(c["tool"] == "claude" and c["argv"][:2] == ["mcp", "add"] for c in _calls(host))
+    assert not list(host.home.glob(".*rc")) and not (host.home / ".profile").exists()
+    # ...and the PATH that lacks it is named instead.
+    assert any(".local/bin" in n and "PATH" in n for n in _notes(host))
+
+
+@pytest.mark.parametrize("interactive, answer, said", [
+    ("0", "y\n", "without a terminal nothing asked"),
+    ("1", "n\n", "was not installed, as asked"),
+    ("1", "", "was not installed, as asked"),
+])
+def test_a_missing_claude_is_installed_only_on_a_yes(host, interactive, answer, said):
+    (host.bin / "claude").unlink()
+    host.env["CLAUDE_TOOLS_INTERACTIVE"] = interactive
+
+    declined = _run(host, "install", stdin=answer)
+
+    # Not a failure: nothing was tried, and the note says how to add it later.
+    assert declined.returncode == 0, declined.stdout + declined.stderr
+    assert _calls(host, "curl") == []
+    assert any(said in n for n in _notes(host)), _notes(host)
+    assert _calls(host, "npx") == [], "the MCP server was set up for a claude that is not there"
+
+
+def test_an_interactive_yes_installs_it(host):
+    (host.bin / "claude").unlink()
+    host.env["CLAUDE_TOOLS_INTERACTIVE"] = "1"
+
+    done = _run(host, "install", stdin="y\n")
+
+    assert len(_calls(host, "curl")) == 1, done.stdout + done.stderr
+
+
+def test_more_than_one_claude_on_path_is_named(host):
+    shadow = host.home / "shims"
+    shadow.mkdir()
+    shutil.copy(host.bin / "claude", shadow / "claude")
+    host.env["PATH"] = f"{shadow}:{host.env['PATH']}"
+
+    _run(host, "install", "--yes")
+
+    assert any("more than one claude" in n for n in _notes(host))
+
+
+# ---------------------------------------------------------------------------
+# the sign-in
+# ---------------------------------------------------------------------------
+
+
+def test_every_claude_call_runs_without_the_key_variables(host):
+    for key in KEYS:
+        host.env[key] = "planted-" + key.lower()
+    host.env["CLAUDE_TOOLS_INTERACTIVE"] = "1"
+
+    done = _run(host, "install")
+
+    claude_calls = _calls(host, "claude")
+    assert any(c["argv"][:2] == ["auth", "status"] for c in claude_calls)
+    assert any(c["argv"][:2] == ["auth", "login"] for c in claude_calls), done.stdout
+    leaked = [c for c in claude_calls if c["keys"]]
+    assert not leaked, f"claude saw key variables: {leaked}"
+
+
+def test_an_interactive_login_is_claude_ai_with_the_git_email(host):
+    host.env["CLAUDE_TOOLS_INTERACTIVE"] = "1"
+
+    done = _run(host, "install")
+
+    logins = [c["argv"] for c in _calls(host, "claude") if c["argv"][:2] == ["auth", "login"]]
+    assert logins == [["auth", "login", "--claudeai", "--email", "someone@example.org"]]
+    assert "signed in with claude.ai" in done.stdout
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_a_noreply_address_is_not_filled_in(host):
+    host.env["CLAUDE_TOOLS_INTERACTIVE"] = "1"
+    host.env["STANDIN_GIT_EMAIL"] = "12345+someone@users.noreply.github.com"
+
+    _run(host, "install")
+
+    logins = [c["argv"] for c in _calls(host, "claude") if c["argv"][:2] == ["auth", "login"]]
+    assert logins == [["auth", "login", "--claudeai"]]
+
+
+def test_a_login_that_does_not_take_fails_the_install(host):
+    host.env["CLAUDE_TOOLS_INTERACTIVE"] = "1"
+    host.env["STANDIN_LOGIN_FAILS"] = "1"
+
+    done = _run(host, "install")
+
+    assert done.returncode == 1
+    assert "still not signed in with claude.ai" in done.stdout
+
+
+@pytest.mark.parametrize("interactive", ["0", "1"])
+def test_yes_never_signs_in_and_leaves_a_note(host, interactive):
+    host.env["CLAUDE_TOOLS_INTERACTIVE"] = interactive
+
+    done = _run(host, "install", "--yes")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not any(c["argv"][:2] == ["auth", "login"] for c in _calls(host, "claude"))
+    assert any("claude auth login --claudeai" in n for n in _notes(host))
+
+
+def test_an_api_key_sign_in_does_not_count(host):
+    (host.state / "auth").write_text("api_key")
+
+    _run(host, "install", "--yes")
+
+    assert any("not signed in with claude.ai (api_key)" in n for n in _notes(host))
+
+
+def test_a_claude_ai_sign_in_is_left_alone(host):
+    (host.state / "auth").write_text("claude.ai")
+    host.env["CLAUDE_TOOLS_INTERACTIVE"] = "1"
+
+    done = _run(host, "install")
+
+    assert not any(c["argv"][:2] == ["auth", "login"] for c in _calls(host, "claude"))
+    assert "signed in with claude.ai" in done.stdout
+
+
+# ---------------------------------------------------------------------------
+# the Playwright MCP server
+# ---------------------------------------------------------------------------
+
+
+def test_the_server_is_registered_with_the_pinned_command_line(host):
+    done = _run(host, "install", "--yes")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    adds = [c for c in _calls(host, "claude") if c["argv"][:2] == ["mcp", "add"]]
+    assert [c["argv"] for c in adds] == [
+        ["mcp", "add", "--scope", "local", "playwright", "--", "npx",
+         *_expected_mcp_args(host.browser)]
+    ]
+    # Local scope is keyed by the project's path, so it is asked from the root.
+    assert {c["cwd"] for c in _calls(host, "claude") if c["argv"][0] == "mcp"} == {str(ROOT)}
+    # Fetched into npx's cache first, at the same pin.
+    assert [c["argv"] for c in _calls(host, "npx")] == [["-y", PIN, "--help"]]
+
+
+def test_as_root_the_server_is_registered_without_the_sandbox(host):
+    # Chromium cannot sandbox itself as root, and the server's default is the
+    # sandbox on: registered as before, every page it opened failed.
+    host.env["STANDIN_UID"] = "0"
+
+    done = _run(host, "install", "--yes")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    adds = [c["argv"] for c in _calls(host, "claude") if c["argv"][:2] == ["mcp", "add"]]
+    assert adds == [["mcp", "add", "--scope", "local", "playwright", "--", "npx",
+                     *_expected_mcp_args(host.browser, root=True)]]
+    # And what it registered reads back as this checkout's.
+    _all_present(host, registered=False)
+    assert _run(host, "check").returncode == 0
+
+
+def test_a_registered_server_is_not_added_again(host):
+    _register(host)
+
+    done = _run(host, "install", "--yes")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not any(c["argv"][:2] == ["mcp", "add"] for c in _calls(host, "claude"))
+    assert "registered for this checkout" in done.stdout
+
+
+def test_a_server_registered_otherwise_is_left_and_named(host):
+    _register(host, args=["-y", "@playwright/mcp@0.0.1", "--headless"])
+
+    done = _run(host, "install", "--yes")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not any(c["argv"][1:2] in (["add"], ["remove"]) for c in _calls(host, "claude"))
+    note = next(n for n in _notes(host) if "already registered with other arguments" in n)
+    assert 'claude mcp remove "playwright" -s local' in note
+    assert PIN in note and str(host.browser) in note
+
+
+def test_the_browser_is_resolved_in_order(host):
+    system = host.home / "usr-lib-chromium"
+    system.write_text("#!/bin/sh\n")
+    system.chmod(0o755)
+    on_path = host.bin / "chromium"
+    shutil.copy(host.browser, on_path)
+
+    def registered_browser():
+        (host.state / "mcp").unlink(missing_ok=True)
+        _run(host, "install", "--yes")
+        add = next(c["argv"] for c in _calls(host, "claude") if c["argv"][:2] == ["mcp", "add"])
+        (host.state / "calls.jsonl").write_text("")
+        return add[add.index("--executable-path") + 1]
+
+    assert registered_browser() == str(host.browser)
+    del host.env["BROWSER_AGENT_CHROMIUM"]
+    assert registered_browser() == str(on_path)
+    host.env["CLAUDE_TOOLS_SYSTEM_CHROMIUM"] = str(system)
+    assert registered_browser() == str(system)
+
+
+def _playwright_build(cache, revision):
+    build = cache / f"chromium-{revision}" / "chrome-linux" / "chrome"
+    build.parent.mkdir(parents=True)
+    build.write_text("#!/bin/sh\nexit 0\n")
+    build.chmod(0o755)
+    return build
+
+
+def test_playwright_s_own_build_is_the_last_resort(host):
+    # All ./install.sh --no-system leaves: no chromium installed, and
+    # Playwright's own build fetched for the browser agent.
+    del host.env["BROWSER_AGENT_CHROMIUM"]
+    cache = host.home / ".cache" / "ms-playwright"
+    _playwright_build(cache, 1187)
+    newest = _playwright_build(cache, 1194)
+    (cache / "chromium_headless_shell-1200" / "chrome-linux").mkdir(parents=True)
+
+    def registered_browser():
+        (host.state / "mcp").unlink(missing_ok=True)
+        (host.state / "calls.jsonl").write_text("")
+        done = _run(host, "install", "--yes")
+        add = next((c["argv"] for c in _calls(host, "claude") if c["argv"][:2] == ["mcp", "add"]),
+                   None)
+        assert add, done.stdout + done.stderr
+        return add[add.index("--executable-path") + 1]
+
+    assert registered_browser() == str(newest)
+    # PLAYWRIGHT_BROWSERS_PATH first, as Playwright and the browser agent read it.
+    elsewhere = _playwright_build(host.home / "browsers", 1190)
+    host.env["PLAYWRIGHT_BROWSERS_PATH"] = str(host.home / "browsers")
+    assert registered_browser() == str(elsewhere)
+    # A chromium the system has still comes first.
+    shutil.copy(host.browser, host.bin / "chromium")
+    assert registered_browser() == str(host.bin / "chromium")
+
+
+@pytest.mark.parametrize("venv_has_playwright", [True, False])
+def test_no_browser_at_all_is_a_note_that_needs_no_pacman_where_it_can(host, venv_has_playwright):
+    del host.env["BROWSER_AGENT_CHROMIUM"]
+    if not venv_has_playwright:
+        host.env["STANDIN_NO_PLAYWRIGHT"] = "1"
+
+    done = _run(host, "install", "--yes")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not any(c["argv"][:2] == ["mcp", "add"] for c in _calls(host, "claude"))
+    note = next(n for n in _notes(host) if "no Chromium for the Playwright MCP server" in n)
+    assert "sudo pacman -S chromium" in note
+    assert ("-m playwright install chromium" in note) is venv_has_playwright, note
+
+
+def test_the_check_starts_the_server_with_the_registered_browser(host):
+    done = _run(host, "install", "--yes")
+
+    checks = [c["argv"] for c in _calls(host, "python")]
+    assert checks == [["scripts/browser_agent.py", "mcp-check", "--npx", str(host.bin / "npx"),
+                       "--chromium", str(host.browser)]], done.stdout
+    assert "starts and drives" in done.stdout
+
+
+def test_a_failed_server_check_fails_the_install(host):
+    host.env["STANDIN_MCP_CHECK_STATUS"] = "1"
+
+    done = _run(host, "install", "--yes")
+
+    assert done.returncode == 1
+    assert "did not pass its check" in done.stdout
+
+
+def test_no_npx_is_a_note_not_a_failure(host):
+    (host.bin / "npx").unlink()
+
+    done = _run(host, "install", "--yes")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not any(c["argv"][:2] == ["mcp", "add"] for c in _calls(host, "claude"))
+    assert any("nodejs npm" in n for n in _notes(host))
+
+
+# ---------------------------------------------------------------------------
+# Claude in Chrome, and check
+# ---------------------------------------------------------------------------
+
+
+def _all_present(host, browser_dir="chromium", registered=True):
+    (host.state / "auth").write_text("claude.ai")
+    if registered:
+        _register(host)
+    manifest = host.home / ".config" / browser_dir / "NativeMessagingHosts" / MANIFEST
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("{}")
+    return manifest
+
+
+@pytest.mark.parametrize("browser_dir", ["chromium", "google-chrome", "BraveSoftware/Brave-Browser"])
+def test_the_chrome_host_is_found_under_each_browser(host, browser_dir):
+    manifest = _all_present(host, browser_dir)
+
+    done = _run(host, "check")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert str(manifest) in done.stdout
+
+
+def test_a_missing_chrome_host_is_a_note_with_the_store_link(host):
+    done = _run(host, "install", "--yes")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    note = next(n for n in _notes(host) if "Claude in Chrome is not set up" in n)
+    assert "https://chromewebstore.google.com/detail/claude/fcoeoabgfenejglbffodgkkbkcdhcgfn" in note
+    assert "claude --chrome" in note and "/chrome" in note
+
+
+def test_check_passes_when_everything_is_in_place(host):
+    _all_present(host)
+
+    done = _run(host, "check")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stdout.count("✓") == 4 and "✗" not in done.stdout
+
+
+@pytest.mark.parametrize("missing", ["cli", "sign-in", "mcp", "chrome"])
+def test_check_fails_when_one_thing_is_missing(host, missing):
+    manifest = _all_present(host)
+    if missing == "cli":
+        (host.bin / "claude").unlink()
+    elif missing == "sign-in":
+        (host.state / "auth").write_text("oauth_token")
+    elif missing == "mcp":
+        (host.state / "mcp").unlink()
+    else:
+        manifest.unlink()
+
+    done = _run(host, "check")
+
+    assert done.returncode == 1, done.stdout
+    assert "✗" in done.stdout
+    # check only looks.
+    assert not any(c["argv"][:2] in (["mcp", "add"], ["auth", "login"]) for c in _calls(host, "claude"))
+
+
+def test_an_unknown_command_is_refused(host):
+    assert _run(host, "uninstall").returncode == 2
+    assert _run(host, "install", "--force").returncode == 2
+
+
+# ---------------------------------------------------------------------------
+# at a terminal
+# ---------------------------------------------------------------------------
+
+# What the real CLI does at its start when its stdin is a terminal: sets the
+# terminal up. From the background process group timeout runs it in, that stops
+# it (SIGTTOU), so a call bounded that way returned nothing, or never returned.
+TERMINAL_CLAUDE = r'''#!{python}
+import os, sys, termios
+if sys.stdin.isatty():
+    termios.tcsetattr(0, termios.TCSANOW, termios.tcgetattr(0))
+os.execv({claude!r}, [{claude!r}, *sys.argv[1:]])
+'''
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux") or not shutil.which("script"),
+                    reason="needs util-linux script(1) for a terminal")
+@pytest.mark.parametrize("args, said", [
+    (("check",), "registered for this checkout"),
+    (("install", "--yes"), "registered for this checkout"),
+])
+def test_at_a_terminal_every_unanswered_claude_call_still_answers(host, tmp_path, args, said):
+    _all_present(host)
+    # The stand-in tells tools apart by name, so it is run as `claude` still.
+    real = tmp_path / "real" / "claude"
+    real.parent.mkdir()
+    shutil.copy(host.state / "standin", real)
+    (host.bin / "claude").write_text(TERMINAL_CLAUDE.format(python=sys.executable, claude=str(real)))
+    log = tmp_path / "terminal.log"
+    command = " ".join(["bash", shlex_quote(str(SCRIPT)), *args])
+
+    try:
+        done = subprocess.run([shutil.which("script"), "-qec", command, str(log)], env=host.env,
+                              stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"scripts/claude_tools.sh {' '.join(args)} hung at a terminal")
+    shown = log.read_text(encoding="utf-8", errors="replace")
+
+    assert done.returncode == 0, shown
+    assert "signed in with claude.ai" in shown and said in shown, shown
+    assert "unknown" not in shown, shown
+
+
+# ---------------------------------------------------------------------------
+# the installers
+# ---------------------------------------------------------------------------
+
+
+def test_both_installers_set_up_the_claude_tools():
+    for installer in ("install.sh", "docker/install.sh"):
+        text = (ROOT / installer).read_text(encoding="utf-8")
+        assert "scripts/claude_tools.sh install" in text, installer
+        assert "CLAUDE_TOOLS_NOTES" in text, f"{installer} drops the notes"
+        assert "--no-claude" in text, installer
+
+
+def _install_key_lines() -> str:
+    """install.sh's own lines that decide which key variables its diagnosis sees:
+    from `KEY_VARS=(` to the end of `without_dotenv_keys`."""
+    lines = (ROOT / "install.sh").read_text(encoding="utf-8").splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("KEY_VARS=("))
+    end = next(i for i in range(start, len(lines)) if lines[i] == "}")
+    return "\n".join(lines[start:end + 1])
+
+
+@pytest.mark.parametrize("from_shell, shown", [
+    ({}, []),
+    ({"ANTHROPIC_API_KEY": "sk-from-the-shell"}, ["ANTHROPIC_API_KEY"]),
+    ({"ANTHROPIC_AUTH_TOKEN": "from-the-shell"}, ["ANTHROPIC_AUTH_TOKEN"]),
+])
+def test_the_install_diagnosis_sees_only_the_keys_the_shell_exported(tmp_path, from_shell, shown):
+    # A key kept in .env for an Anthropic seat is the project's own, and the
+    # diagnosis would call it an override of Claude Code's sign-in and say to
+    # remove it. One the shell exports really is one, so it is still shown.
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-from-dotenv\n", encoding="utf-8")
+    probe = f"import json, os; print(json.dumps([k for k in {KEYS!r} if k in os.environ]))"
+    script = "\n".join([
+        "set -euo pipefail",
+        _install_key_lines(),
+        "set -a", ". ./.env", "set +a",
+        f'without_dotenv_keys "$PY" -c {shlex_quote(probe)}',
+    ])
+    env = {k: v for k, v in os.environ.items() if k not in KEYS}
+    done = subprocess.run(["bash", "-c", script], cwd=tmp_path, capture_output=True, text=True,
+                          timeout=30, env={**env, **from_shell, "PY": sys.executable})
+
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout) == shown
+
+
+def test_install_runs_its_diagnosis_without_the_dotenv_keys():
+    text = (ROOT / "install.sh").read_text(encoding="utf-8")
+    assert 'without_dotenv_keys "$PY" scripts/diagnose_machine.py' in text
+    # Read before .env is sourced, or every key would look exported by the shell.
+    assert text.index("KEY_VARS=(") < text.index(". ./.env")
+
+
+@pytest.mark.parametrize("installer, flags", [
+    ("install.sh", ("--no-browser-agent", "--no-claude")),
+    ("docker/install.sh", ("--no-claude",)),
+])
+def test_the_installers_document_their_new_flags(installer, flags):
+    shown = subprocess.run(["bash", str(ROOT / installer), "--help"], capture_output=True,
+                           text=True, timeout=30, env={**os.environ, "LANG": "C.UTF-8"})
+
+    assert shown.returncode == 0, shown.stderr
+    for flag in flags:
+        assert flag in shown.stdout, f"{installer} --help does not list {flag}"

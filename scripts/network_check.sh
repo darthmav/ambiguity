@@ -16,6 +16,7 @@
 #   scripts/network_check.sh GROUP... [--optional GROUP...]
 #
 #   Groups: arch pypi ollama hf tokenizer dockerhub github research cloud
+#           npm claude playwright
 #   A group after --optional is reported but never fails the check. Exit
 #   status: 0 when every required group answers, 1 when one does not, 2 on a
 #   group it does not know.
@@ -30,7 +31,11 @@ set -uo pipefail
 # The entries are wider than the probes where a download is redirected to a
 # CDN whose host is not fixed: Ollama's blobs come from Cloudflare R2, Hugging
 # Face's from its Xet bridge under hf.co, Docker Hub's from Cloudflare. arch's
-# hosts are whatever pacman's mirrorlist names.
+# hosts are whatever pacman's mirrorlist names. Claude Code's installer at
+# claude.ai/install.sh redirects to its bootstrap on downloads.claude.ai, and
+# the CLI, once installed, signs in through claude.ai and talks to
+# api.anthropic.com. Playwright's own browser builds are needed only where no
+# system chromium is.
 TABLE='
 arch|||system packages (pacman)
 pypi|pypi.org files.pythonhosted.org|pypi.org files.pythonhosted.org|Python packages (pip, uv)
@@ -41,6 +46,9 @@ dockerhub|registry-1.docker.io auth.docker.io|registry-1.docker.io auth.docker.i
 github|github.com api.github.com|github.com api.github.com *.githubusercontent.com|GitHub (gh, git_dwell)
 research|html.duckduckgo.com|duckduckgo.com *.duckduckgo.com|online research without a SearxNG
 cloud|ollama.com|ollama.com|Ollama Cloud tags and ollama signin
+npm|registry.npmjs.org|registry.npmjs.org|Node packages (npx @playwright/mcp)
+claude|claude.ai downloads.claude.ai|claude.ai *.claude.ai claude.com *.claude.com api.anthropic.com|the Claude Code installer, sign-in and updates
+playwright|cdn.playwright.dev|cdn.playwright.dev playwright.download.prss.microsoft.com|browser builds from Playwright (only without a system chromium)
 '
 
 MIRRORLIST="${MIRRORLIST:-/etc/pacman.d/mirrorlist}"

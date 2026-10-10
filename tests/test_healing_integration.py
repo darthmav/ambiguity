@@ -10,7 +10,11 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import subprocess
+import sys
 import urllib.error
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -1041,6 +1045,102 @@ def test_a_run_waits_while_a_pull_request_is_being_finished(monkeypatch):
 
     with pytest.raises(ValueError, match="finishing pull request #12"):
         serve.rpc_run_goal({"goal": "ship it"})
+
+
+def test_the_status_says_while_a_pull_request_is_being_finished(monkeypatch):
+    """The stored entry reads `pending` throughout a finish, so only this tells a
+    client -- the machine diagnostic among them -- that a run would be refused."""
+    seen: list[dict[str, Any]] = []
+
+    def finish(run: Any, **kwargs: Any) -> dict[str, Any]:
+        seen.append(serve.rpc_status({})["pull_request_follow"])
+        return {"success": True, "pending": "waiting on test"}
+
+    monkeypatch.setattr(serve, "finish_pull_request", finish)
+    serve._track_pull_request(_PENDING, "run", "ship it")
+    assert serve.rpc_status({})["pull_request_follow"] == {"running": False, "number": None}
+
+    serve._follow_pull_requests()
+
+    assert seen == [{"running": True, "number": 12}]
+    assert serve.rpc_status({})["pull_request_follow"] == {"running": False, "number": None}
+
+
+_HEALTHY = {
+    component: {"status": "healthy", "details": "fine"}
+    for component in ("ollama-daemon", "postgres", "corpus")
+}
+
+
+def test_with_following_off_the_monitor_finishes_nothing(finishes, monkeypatch):
+    """A console started only to be looked at -- the browser agent's spawned
+    one, the installer's check -- must not merge what a real run left pending.
+
+    Finishing is a squash-merge, a deleted branch and a fast-forward in
+    someone's repository. Off, the monitor's pass asks GitHub nothing and
+    leaves the file byte for byte as the run wrote it; the header still shows
+    the pull request, so nothing about it is hidden.
+    """
+    asked, answers = finishes
+    monkeypatch.setattr(serve, "_check_health", lambda: dict(_HEALTHY))
+    monkeypatch.setattr(serve, "_health", {})
+    serve._track_pull_request(_PENDING, "run", "ship it")
+    recorded = serve._pull_requests_path().read_bytes()
+
+    monkeypatch.setattr(serve, "FOLLOW_PULL_REQUESTS", False)
+    serve._heal()
+    serve._follow_pull_requests()
+
+    assert asked == []
+    assert serve._pull_requests_path().read_bytes() == recorded
+    [entry] = serve.pull_requests_snapshot()
+    assert (entry["number"], entry["status"]) == (12, "pending")
+    with serve._run_lock:
+        assert serve._pull_request_follow["running"] is False
+
+    # The same entry, the default switch: followed on the monitor's next pass.
+    monkeypatch.setattr(serve, "FOLLOW_PULL_REQUESTS", True)
+    answers.append({"success": True, "pending": "waiting on test"})
+    serve._heal()
+
+    assert len(asked) == 1
+    assert asked[0]["number"] == 12
+
+
+def test_following_is_on_unless_the_environment_switches_it_off(tmp_path):
+    """Read at import, in the words every other switch here takes, any case.
+
+    In a process of its own, reloaded once per value: the switch is a module
+    constant, and this suite's own process has long since imported it.
+    """
+    root = Path(serve.__file__).resolve().parent
+    values = [None, "", "1", "yes", "on", "0", "false", "No", "OFF", " off "]
+    script = (
+        "import importlib, json, os, sys\n"
+        f"sys.path[:0] = [{str(root)!r}, {str(root / 'src')!r}]\n"
+        "import serve\n"
+        "seen = []\n"
+        f"for value in {values!r}:\n"
+        "    if value is None:\n"
+        "        os.environ.pop('FOLLOW_PULL_REQUESTS', None)\n"
+        "    else:\n"
+        "        os.environ['FOLLOW_PULL_REQUESTS'] = value\n"
+        "    seen.append(importlib.reload(serve).FOLLOW_PULL_REQUESTS)\n"
+        "print(json.dumps(seen))\n"
+    )
+    env = {**os.environ, "RUNS_DIR": str(tmp_path / "runs"), "REBUILD_CORPUS": "0",
+           "PYTHONDONTWRITEBYTECODE": "1"}
+    env.pop("FOLLOW_PULL_REQUESTS", None)
+    done = subprocess.run([sys.executable, "-c", script], cwd=tmp_path, env=env,
+                          capture_output=True, text=True, timeout=120)
+
+    assert done.returncode == 0, done.stderr[-2000:]
+    seen = json.loads(done.stdout.strip().splitlines()[-1])
+    assert dict(zip(map(repr, values), seen, strict=True)) == {
+        "None": True, "''": True, "'1'": True, "'yes'": True, "'on'": True,
+        "'0'": False, "'false'": False, "'No'": False, "'OFF'": False, "' off '": False,
+    }
+    assert not (tmp_path / "runs").exists(), "reading a switch wrote nothing"
 
 
 def test_a_followed_pull_request_can_be_dismissed():

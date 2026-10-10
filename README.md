@@ -244,6 +244,16 @@ server with pgvector.
 ./install.sh            # --help lists --minimal, --no-system, --no-searxng, ...
 ```
 
+It also sets up what drives the console in a browser: Chromium, Node.js and
+ffmpeg, the `browser` extra (Playwright for Python), and a check that a browser
+launches and walks a throwaway console. Then Claude Code: its CLI from
+Anthropic's native installer when it is missing, a claude.ai sign-in (one
+consent page in your browser, your `git config user.email` filled in; it is
+never scripted past that, and `--yes` skips it), and the Playwright MCP server
+registered for this checkout. `--no-browser-agent` and `--no-claude` leave
+those out. When anything is left as a problem, the installer ends by
+diagnosing the machine (below) and says where the report is.
+
 The Ollama daemon serves every default seat and the embedder, so the installer
 keeps it running: `ollama.service` is enabled at boot and a systemd drop-in
 restarts it whenever it exits, with no start limit to give up at
@@ -541,6 +551,75 @@ directory (a `chdir`), never in the project. Reports land in
 Nothing here is a benchmark. One short exercise per configuration is a data
 point against non-deterministic models, not a ranking.
 
+## Driving the console in a browser
+
+`scripts/browser_agent.py` is the console's user: it opens the console in a
+real Chromium through Playwright for Python, clicks, types and reads the page
+as a person would, and records everything the page and the server said while
+it did. It needs `pip install -e ".[dev,browser]"` and a Chromium (the system
+one, or Playwright's own).
+
+```bash
+python scripts/browser_agent.py doctor     # can a browser launch here, and if not, why
+python scripts/browser_agent.py check      # walk the running console, read-only
+python scripts/browser_agent.py check --spawn --stub-seats --no-rebuild
+python scripts/browser_agent.py tools      # the one-shot tools, with their Claude in Chrome names
+```
+
+`check` runs scripted passes -- every tab and seat card, three screen widths,
+the graph, a search, the corpus analyses, Clear armed once and never
+confirmed -- and writes `reports/diagnostics/<time>/browser/` with a report,
+every RPC with its timing, the page's console, and screenshots (`--trace` and
+`--gif` add a Playwright trace and a GIF). Anything that changes the console is
+off until you name it: `--allow run` sends a discussion-only goal and presses
+Stop. The Builder writes no files and no project is made, but it is a real run:
+its seats answer, the corpus is rebuilt first as before every run, and the
+console's last run (`runs/last_run.json`) is replaced -- so try it on `--spawn`
+first. `upload`, `circuit` and `exit` are off likewise, and only ever sent to a
+console on this machine. Every `/rpc` call the page makes, and every one the
+agent makes itself, is checked before it leaves: a method you did not allow is
+answered with an error and never sent, a Stop is sent only for a run the agent
+started, and clearing the corpus is never allowed. The guard sits on the
+page's requests, so code you hand the page through the `eval` tool acts with
+the page's own powers -- a beacon sent as the page unloads goes around it --
+and is for reading the page, never for calling the console.
+`--spawn` starts a console of its own from a temporary directory instead -- its
+own corpus, runs and uploads, and pull-request following off -- and
+`--stub-seats` makes every seat a keyless stub, verified before anything runs.
+
+The one-shot tools (`snapshot`, `find`, `click`, `type`, `screenshot`,
+`console`, `network`, `resize`, `upload`, ...) and `batch` (a JSON list of
+steps in one browser session) give a script or a Claude Code session the
+vocabulary Claude in Chrome has, built on Playwright rather than an extension.
+For browsing interactively from a Claude Code session, `install.sh` registers
+the Playwright MCP server for this checkout (`scripts/claude_tools.sh check`
+says whether it is); Claude in Chrome itself needs its extension, one click in
+the Chrome Web Store, and `claude --chrome`.
+
+## Diagnosing a machine
+
+```bash
+python scripts/diagnose_machine.py --quick      # a couple of minutes
+python scripts/diagnose_machine.py              # adds the embedder, seat probes and a GPU sampler
+python scripts/diagnose_machine.py --with-runs  # adds one real discussion-only run through the browser
+```
+
+One command, one report on everything the console depends on: tools and their
+versions, sign-ins (whether, never what), the network check, each GPU and what
+holds it, the Ollama daemon (its keep-alive, the one-model settings, which tags
+are pulled, where each model sits), a cold and a warm embed, each seat's probe
+and speed, PostgreSQL and each corpus, SearxNG, the console before and after,
+and the browser agent's walk. Every problem comes with the fix from the
+troubleshooting notes. It writes `reports/diagnostics/<time>/report.md` and a
+`…-share.tar.gz` beside it with secrets, addresses and home paths taken out of
+every text file -- send that, or paste the report. The browser pass's
+screenshots go in as they are: they are pictures of your console, so look
+through them before sending the bundle anywhere. It is read-only unless `--with-runs` (real
+seats answer, the corpus is rebuilt first and the last run is replaced), never
+starts the console itself, and skips the model-loading sections while the
+console is busy. `--gist` uploads the report as a secret gist after a typed
+"yes".
+
 ## Development Tools
 
 The same checks CI runs:
@@ -621,7 +700,7 @@ other tool has effects, and running one twice is not a recovery.
 ├── prompts/               # one system prompt per seat
 ├── frontend/              # the web console
 ├── spectral_graph/        # spectral graph theory behind the corpus diagnostics
-├── scripts/               # the seat diagnostic, the cloud smoke run, benchmarks
+├── scripts/               # the browser agent, the machine and seat diagnostics, benchmarks
 ├── tests/                 # the suite; runs offline on the stub LLM
 ├── serve.py               # the console's server and its self-healing monitor
 ├── install.sh             # Arch / Omarchy: everything, from nothing to a running console

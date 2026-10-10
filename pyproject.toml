@@ -48,6 +48,14 @@ dev = [
     "langgraph-agent[tools]",
     "mypy>=1.10",
 ]
+# The browser agent, scripts/browser_agent.py, which drives the console in a
+# real Chromium. Pinned, because it drives a browser whose version it does not
+# choose -- the system's own, or one Playwright downloads -- and a moved pin is
+# something to test on purpose. Not in dev: CI tests the agent's logic without
+# a browser, and install.sh asks for ".[dev,browser]".
+browser = [
+    "playwright==1.63.0",
+]
 
 [tool.pytest.ini_options]
 # Collection starts at tests/ alone: a bare `pytest` from the root must never

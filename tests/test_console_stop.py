@@ -9,8 +9,13 @@ do cover is the bookkeeping around a run -- the flag, the snapshot, and the
 from __future__ import annotations
 
 import json
+import os
 import signal
+import subprocess
+import sys
 import threading
+import uuid
+from pathlib import Path
 
 import pytest
 
@@ -538,3 +543,70 @@ def test_a_project_that_was_there_before_the_run_is_never_removed(tmp_path, monk
 
     assert result["project_removed"] is False
     assert (tmp_path / "projects" / "mine").is_dir()
+
+
+# ---------------------------------------------------------------------------
+# Where a console keeps its runs
+# ---------------------------------------------------------------------------
+
+
+def test_runs_live_beside_the_console_unless_runs_dir_says(tmp_path, monkeypatch):
+    """`RUNS_DIR` names another directory; blank or unset is the checkout's runs/."""
+    beside = Path(serve.__file__).parent / "runs"
+    monkeypatch.delenv("RUNS_DIR", raising=False)
+    assert serve._runs_dir() == beside
+    monkeypatch.setenv("RUNS_DIR", "   ")
+    assert serve._runs_dir() == beside
+
+    monkeypatch.setenv("RUNS_DIR", str(tmp_path / "elsewhere"))
+    assert serve._runs_dir() == (tmp_path / "elsewhere").resolve()
+
+    # Relative to where the console was started, as `--spawn` starts it.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("RUNS_DIR", "spawned/runs")
+    assert serve._runs_dir() == (tmp_path / "spawned" / "runs").resolve()
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("RUNS_DIR", "~/runs")
+    assert serve._runs_dir() == (tmp_path / "home" / "runs").resolve()
+
+
+def test_runs_dir_moves_everything_a_console_keeps_about_its_runs(tmp_path):
+    """A console started with `RUNS_DIR` -- the browser agent's spawned one --
+    writes its last run and the pull requests it follows there, and nothing to
+    the checkout's runs/, which holds the operator's own.
+
+    In a process of its own: the paths are fixed at import, and the fixtures
+    above point this process's at a scratch directory anyway, which is what
+    would hide a path that did not follow the switch.
+    """
+    root = Path(serve.__file__).resolve().parent
+    # Unique to this test, so a live console writing its own runs/ meanwhile
+    # cannot be mistaken for this one, nor this one for it.
+    marker = f"spawned-{uuid.uuid4().hex}"
+    script = (
+        "import json, sys\n"
+        f"sys.path[:0] = [{str(root)!r}, {str(root / 'src')!r}]\n"
+        "import serve\n"
+        f"serve._save_snapshot({{'run_id': {marker!r}}})\n"
+        "serve._track_pull_request({'status': 'pending', 'number': 7, 'head': 'abc123',\n"
+        f"                           'branch': 'agent/x', 'cwd': ''}}, {marker!r}, 'goal')\n"
+        "print(json.dumps([str(serve.RUNS_DIR), str(serve.LAST_RUN_PATH),\n"
+        "                  str(serve._pull_requests_path())]))\n"
+    )
+    env = {**os.environ, "RUNS_DIR": "spawned-runs", "REBUILD_CORPUS": "0",
+           "PYTHONDONTWRITEBYTECODE": "1"}
+    done = subprocess.run([sys.executable, "-c", script], cwd=tmp_path, env=env,
+                          capture_output=True, text=True, timeout=120)
+
+    assert done.returncode == 0, done.stderr[-2000:]
+    runs, last_run, pull_requests = map(Path, json.loads(done.stdout.strip().splitlines()[-1]))
+    moved = (tmp_path / "spawned-runs").resolve()
+    assert (runs, last_run, pull_requests) == (
+        moved, moved / "last_run.json", moved / "pull_requests.json")
+    assert json.loads(last_run.read_text())["run_id"] == marker
+    assert [e["run_id"] for e in json.loads(pull_requests.read_text())] == [marker]
+    for name in ("last_run.json", "pull_requests.json"):
+        theirs = root / "runs" / name
+        assert not theirs.exists() or marker not in theirs.read_text(encoding="utf-8"), (
+            f"the checkout's runs/{name} was written to")
