@@ -120,7 +120,7 @@ python example_usage.py
 │   ├── test_projects.py       # Generated projects: the held-out walk, the write scope, embedding
 │   ├── test_spectral_graph.py # The spectral_graph package, against closed-form spectra
 │   ├── test_dwell_tool.py     # The command-line dwell tool's confinement to this folder
-│   ├── test_ollama_keepalive.py # The keep-alive drop-in, against stand-in sudo and systemctl
+│   ├── test_ollama_keepalive.py # The keep-alive drop-in and hang watchdog, against stand-in systemctl
 │   ├── test_browser_agent.py  # The browser agent's guard, passes and tools; live ones under BROWSER_TESTS=1
 │   ├── test_diagnose_machine.py # The machine diagnostic: parsers, redaction, a degraded machine
 │   └── test_claude_tools.py   # Claude Code setup, against stand-in claude, npx and git
@@ -131,7 +131,7 @@ python example_usage.py
 │   ├── diagnose_seats.py      # Role probes + team runs per seating
 │   ├── dwell.py               # The dwell pipeline from the command line, confined to this folder
 │   ├── network_check.sh       # Which download hosts the network lets through; the installers' first step
-│   ├── ollama_keepalive.sh    # systemd keeps the daemon running: enabled at boot, restarted on any exit
+│   ├── ollama_keepalive.sh    # systemd keeps the daemon running: at boot, on any exit, and when it hangs
 │   ├── browser_agent.py       # The console in a real browser: scripted passes, one-shot tools, an RPC guard
 │   ├── diagnose_machine.py    # One redacted, shareable report on the machine the console runs on
 │   └── claude_tools.sh        # Claude Code, its claude.ai sign-in and the Playwright MCP server, per machine
@@ -491,7 +491,9 @@ closes it. Where it is used:
   unreachable daemon ran nothing; the emergency stop ends the wait. Underneath
   it systemd keeps the daemon running: both installers write a keep-alive
   drop-in (`scripts/ollama_keepalive.sh`) -- enabled at boot, `Restart=always`,
-  no start limit. Every Ollama seat words an unreachable daemon the same way
+  no start limit -- and `ollama-watchdog.timer`, which asks `/api/ps` once a
+  minute and restarts a daemon that is up but has stopped answering three asks
+  in a row; never within its start's grace, never a daemon someone stopped. Every Ollama seat words an unreachable daemon the same way
   (`DAEMON_UNREACHABLE`), as OFFLINE, until it answers.
 - **The embedder** retries a failed model load (5xx) on its own longer
   schedule, and a schedule that still ends in a 5xx opens `EMBEDDER_LOAD`
@@ -577,7 +579,8 @@ every checkout has, so `uploads/`, `projects/` and fetched pages are out.
   its circuit opened, so calls fail at once instead of each waiting it out.
   It closes by itself once the daemon answers a trial call; clicking the chip
   lets the next call through now. A rebuild it interrupted is redone by the
-  monitor once the daemon is back. systemd restarts a daemon that exited;
+  monitor once the daemon is back. systemd restarts a daemon that exited, and
+  the watchdog one that hung (`journalctl -u ollama-watchdog`);
   `scripts/ollama_keepalive.sh check` says whether the installer set that up.
 - **The header shows `embedder-load down`** -- the embedding model's forced
   load failed a whole retry schedule. `journalctl -u ollama` names the card and

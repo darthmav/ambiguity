@@ -473,12 +473,13 @@ else
     fi
 
     # Every seat and the embedder are this one daemon, so it is kept running:
-    # enabled at boot and restarted whenever it exits (scripts/ollama_keepalive.sh).
+    # enabled at boot, restarted whenever it exits, and restarted by a watchdog
+    # timer when it stops answering (scripts/ollama_keepalive.sh).
     if [ -z "${OLLAMA_BASE_URL:-}" ] && systemctl cat ollama.service >/dev/null 2>&1; then
         if scripts/ollama_keepalive.sh check >/dev/null 2>&1; then
-            ok "the daemon starts at boot and is restarted whenever it exits"
+            ok "the daemon starts at boot and is restarted whenever it exits or hangs"
         elif [ "$SYSTEM" -eq 1 ]; then
-            echo "  starting the daemon at boot and restarting it whenever it exits"
+            echo "  starting the daemon at boot and restarting it whenever it exits or hangs"
             scripts/ollama_keepalive.sh install \
                 || problem "the daemon is not kept running; scripts/ollama_keepalive.sh check says what is missing"
         else

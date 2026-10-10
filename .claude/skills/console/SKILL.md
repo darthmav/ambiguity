@@ -359,7 +359,7 @@ skip into a failure, as CI does.
 |---|---|
 | `ModuleNotFoundError: No module named 'langgraph'` | venv missing or not used. `./launch_console.sh` rebuilds it; `driver.py` picks up `.venv` automatically. In the container: the image predates the code (the entrypoint says so) -- `docker compose up --build`. |
 | Graph tab empty, `rag_stats` corpus=absent | The archive is empty. Upload a document, or run a goal with research online. |
-| Header shows `ollama-daemon down` | The daemon stopped answering. Start it; the circuit closes on the next trial call, or `rpc reset_circuit` now. `scripts/ollama_keepalive.sh check` says whether systemd restarts it on its own. |
+| Header shows `ollama-daemon down` | The daemon stopped answering. Start it; the circuit closes on the next trial call, or `rpc reset_circuit` now. `scripts/ollama_keepalive.sh check` says whether systemd restarts it on its own, exited or hung (`journalctl -u ollama-watchdog`). |
 | Shell command exits 144, server still running | `pkill -f serve.py` matched its own caller. Use `driver.py down`. |
 | `{"error": {"message": "bad JSON"}}` | Shell quoting mangled the payload, not a server fault. Use `driver.py rpc`. |
 | Seats badge `NOT PULLED`, runs fail | Expected on a fresh box. Pull the tag, or set a seat to a provider you have via `rpc set_seat`. |

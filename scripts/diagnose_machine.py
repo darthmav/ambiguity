@@ -442,11 +442,11 @@ FIXES: dict[str, str] = {
     "ollama-missing": "`sudo pacman -S ollama`, or re-run `./install.sh`",
     "daemon-down": (
         "`sudo systemctl restart ollama`; once `scripts/ollama_keepalive.sh install` has run, "
-        "systemd restarts a daemon that exits (`scripts/ollama_keepalive.sh check` says whether "
-        "it has)"),
+        "systemd restarts a daemon that exits, and its watchdog one that hangs "
+        "(`scripts/ollama_keepalive.sh check` says whether it has)"),
     "keepalive": (
         "`scripts/ollama_keepalive.sh install`: the daemon then starts at boot and is restarted "
-        "whenever it exits"),
+        "whenever it exits or stops answering"),
     "one-model": (
         "re-run `./install.sh`: its ollama step writes the one-model drop-in "
         "(OLLAMA_MAX_LOADED_MODELS=1, OLLAMA_NUM_PARALLEL=1) and restarts the daemon"),
