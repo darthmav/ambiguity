@@ -175,12 +175,22 @@ def test_a_mutation_needs_its_key_and_loopback():
     assert "--allow run" in ba.rpc_refusal("run_goal", [], LOOPBACK)
     assert "--allow run" in ba.rpc_refusal("run_goal", ["upload", "exit"], LOOPBACK)
     assert ba.rpc_refusal("run_goal", ["run"], LOOPBACK) == ""
-    assert ba.rpc_refusal("stop_run", ["run"], "http://[::1]:8080/rpc") == ""
+    assert ba.rpc_refusal("stop_run", ["run"], "http://[::1]:8080/rpc", {"run_id": "r1"}) == ""
     assert "loopback" in ba.rpc_refusal("run_goal", ["run"], "http://192.168.1.4:8080/rpc")
     assert ba.rpc_refusal("upload_document", ["upload"], LOOPBACK) == ""
     assert ba.rpc_refusal("reset_circuit", ["circuit"], LOOPBACK) == ""
     assert ba.rpc_refusal("shutdown", ["exit"], LOOPBACK) == ""
     assert "--allow exit" in ba.rpc_refusal("shutdown", ["run"], LOOPBACK)
+
+
+def test_a_stop_must_name_the_run_it_stops():
+    # The server reads an empty run_id as whatever run is armed, which may be
+    # the operator's: the agent sends a stop only for a run it can name.
+    for params in (None, {}, {"run_id": ""}, {"reason": "x"}, ["r1"]):
+        assert "names no run" in ba.rpc_refusal("stop_run", ["run"], LOOPBACK, params), params
+    assert ba.rpc_refusal("stop_run", ["run"], LOOPBACK, {"run_id": "r1"}) == ""
+    with pytest.raises(ba.RpcRefused, match="names no run"):
+        ba.rpc_call(LOOPBACK, "stop_run", {"run_id": ""}, allow=["run"])
 
 
 def test_reads_always_go_and_unknown_methods_never_do():
@@ -412,10 +422,45 @@ def test_the_agent_never_asks_for_no_sandbox():
 
 
 def test_wayland_gets_the_ozone_hint_only_when_headed():
-    assert ba.launch_options("/x", headed=True, euid=1, env={"WAYLAND_DISPLAY": "w"})["args"] == [
-        "--ozone-platform-hint=auto"]
-    assert ba.launch_options("/x", headed=False, euid=1, env={"WAYLAND_DISPLAY": "w"})["args"] == []
-    assert ba.launch_options("/x", headed=True, euid=1, env={"DISPLAY": ":0"})["args"] == []
+    hint = "--ozone-platform-hint=auto"
+    assert hint in ba.launch_options("/x", headed=True, euid=1, env={"WAYLAND_DISPLAY": "w"})["args"]
+    assert hint not in ba.launch_options("/x", headed=False, euid=1, env={"WAYLAND_DISPLAY": "w"})["args"]
+    assert hint not in ba.launch_options("/x", headed=True, euid=1, env={"DISPLAY": ":0"})["args"]
+
+
+@pytest.mark.parametrize("progress, page_id, ours", [
+    ({"running": True, "goal": ba.DISCUSSION_GOAL, "run_id": "r1"}, "r1", True),
+    ({"running": True, "goal": "the operator's own goal", "run_id": "r2"}, "r2", False),
+    ({"running": True, "goal": ba.DISCUSSION_GOAL, "run_id": "r2"}, "r1", False),
+    ({"running": True, "goal": ba.DISCUSSION_GOAL, "run_id": "r1"}, "", False),
+    ({"running": False, "goal": "", "run_id": ""}, "", False),
+])
+def test_stop_is_pressed_only_on_the_agents_own_run(monkeypatch, progress, page_id, ours):
+    # The console holds one run at a time, and the one in flight may be the
+    # operator's, started between the agent's look and its click.
+    monkeypatch.setattr(ba, "rpc_call", lambda base, method, *a, **k: dict(progress))
+    page = SimpleNamespace(evaluate=lambda js: page_id)
+    check = SimpleNamespace(base=LOOPBACK, session=SimpleNamespace(page=page))
+    assert (ba._not_our_run(check) == "") is ours
+
+
+def test_shared_workers_are_off_whatever_the_launch():
+    # What a shared worker sends never meets the page's route.
+    for headed in (False, True):
+        for euid in (0, 1000):
+            assert "--disable-shared-workers" in ba.launch_options(
+                "/x", headed=headed, euid=euid, env={})["args"]
+
+
+def test_stub_seats_without_spawn_is_refused_not_ignored(tmp_path, capsys):
+    # Ignored, it would let a run reach the real seats of the console at --base.
+    for flags in (["--stub-seats"], ["--no-rebuild"], ["--stub-seats", "--no-rebuild"]):
+        code = ba.main(["check", "--base", "http://127.0.0.1:9", "--allow", "run",
+                        "--passes", "run", "--out", str(tmp_path), *flags])
+        capsys.readouterr()
+        assert code == 2, flags
+        problems = json.loads((tmp_path / "results.json").read_text())["problems"]
+        assert any("--spawn" in p for p in problems), problems
 
 
 def _resolver(tmp_path, *, files=(), env=None, on_path=None, playwright=None):
@@ -1115,6 +1160,22 @@ def test_mcp_check_speaks_mcp_to_the_pinned_server(tmp_path, monkeypatch, capsys
     assert ("sandbox=false" in report["snapshot_excerpt"]) is root
     assert ("sandbox=unset" in report["snapshot_excerpt"]) is (not root)
     assert report["run_code_unsafe"]["offered"] is True
+
+
+def test_the_mcp_server_is_handed_no_keys_or_tokens():
+    env = {
+        "PATH": "/usr/bin", "HOME": "/home/x", "LANG": "C.UTF-8", "LC_ALL": "C",
+        "HTTPS_PROXY": "http://proxy:3128", "no_proxy": "localhost",
+        "NODE_EXTRA_CA_CERTS": "/ca.pem", "PLAYWRIGHT_BROWSERS_PATH": "/opt/pw",
+        "npm_config_cache": "/c", "WAYLAND_DISPLAY": "wayland-1",
+        "ANTHROPIC_API_KEY": "k", "ANTHROPIC_AUTH_TOKEN": "t", "GH_TOKEN": "g",
+        "GITHUB_TOKEN": "g", "OLLAMA_API_KEY": "o", "DATABASE_URL": "postgresql://u:p@h/d",
+        "AWS_SECRET_ACCESS_KEY": "s",
+    }
+    kept = ba.mcp_environment(env)
+    assert set(kept) == {"PATH", "HOME", "LANG", "LC_ALL", "HTTPS_PROXY", "no_proxy",
+                         "NODE_EXTRA_CA_CERTS", "PLAYWRIGHT_BROWSERS_PATH",
+                         "npm_config_cache", "WAYLAND_DISPLAY"}
 
 
 def test_mcp_check_without_npx_exits_2(monkeypatch, capsys, tmp_path):

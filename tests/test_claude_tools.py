@@ -78,8 +78,14 @@ elif tool == "curl":
     print('mkdir -p "$HOME/.local/bin" && cp "$STANDIN_STATE/standin" "$HOME/.local/bin/claude"'
           ' && chmod 755 "$HOME/.local/bin/claude"')
 elif tool == "python":
+    if argv[:1] == ["-c"]:  # does the venv have Playwright
+        sys.exit(1 if os.environ.get("STANDIN_NO_PLAYWRIGHT") else 0)
     print("mcp-check stand-in")
     sys.exit(int(os.environ.get("STANDIN_MCP_CHECK_STATUS", "0")))
+elif tool == "id":
+    # Not root unless a test says so, whoever runs the suite: CI is not, a
+    # container is.
+    print(os.environ.get("STANDIN_UID", "1000"))
 '''
 
 # What the script runs besides the stand-ins. Linked one by one into a
@@ -104,7 +110,7 @@ def host(tmp_path):
 
     stand_ins = tmp_path / "bin"
     stand_ins.mkdir()
-    for tool in ("claude", "npx", "git", "curl"):
+    for tool in ("claude", "npx", "git", "curl", "id"):
         shutil.copy(standin, stand_ins / tool)
     venv_python = tmp_path / "venv" / "python"
     venv_python.parent.mkdir()
@@ -158,9 +164,10 @@ def _notes(host):
     return host.notes.read_text().splitlines() if host.notes.exists() else []
 
 
-def _expected_mcp_args(browser):
+def _expected_mcp_args(browser, root=False):
     return ["-y", PIN, "--executable-path", str(browser), "--isolated",
-            "--output-dir", str(ROOT / "reports" / "diagnostics" / "playwright-mcp")]
+            "--output-dir", str(ROOT / "reports" / "diagnostics" / "playwright-mcp"),
+            *(["--no-sandbox"] if root else [])]
 
 
 def _register(host, command="npx", args=None):
@@ -332,6 +339,22 @@ def test_the_server_is_registered_with_the_pinned_command_line(host):
     assert [c["argv"] for c in _calls(host, "npx")] == [["-y", PIN, "--help"]]
 
 
+def test_as_root_the_server_is_registered_without_the_sandbox(host):
+    # Chromium cannot sandbox itself as root, and the server's default is the
+    # sandbox on: registered as before, every page it opened failed.
+    host.env["STANDIN_UID"] = "0"
+
+    done = _run(host, "install", "--yes")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    adds = [c["argv"] for c in _calls(host, "claude") if c["argv"][:2] == ["mcp", "add"]]
+    assert adds == [["mcp", "add", "--scope", "local", "playwright", "--", "npx",
+                     *_expected_mcp_args(host.browser, root=True)]]
+    # And what it registered reads back as this checkout's.
+    _all_present(host, registered=False)
+    assert _run(host, "check").returncode == 0
+
+
 def test_a_registered_server_is_not_added_again(host):
     _register(host)
 
@@ -375,6 +398,57 @@ def test_the_browser_is_resolved_in_order(host):
     assert registered_browser() == str(system)
 
 
+def _playwright_build(cache, revision):
+    build = cache / f"chromium-{revision}" / "chrome-linux" / "chrome"
+    build.parent.mkdir(parents=True)
+    build.write_text("#!/bin/sh\nexit 0\n")
+    build.chmod(0o755)
+    return build
+
+
+def test_playwright_s_own_build_is_the_last_resort(host):
+    # All ./install.sh --no-system leaves: no chromium installed, and
+    # Playwright's own build fetched for the browser agent.
+    del host.env["BROWSER_AGENT_CHROMIUM"]
+    cache = host.home / ".cache" / "ms-playwright"
+    _playwright_build(cache, 1187)
+    newest = _playwright_build(cache, 1194)
+    (cache / "chromium_headless_shell-1200" / "chrome-linux").mkdir(parents=True)
+
+    def registered_browser():
+        (host.state / "mcp").unlink(missing_ok=True)
+        (host.state / "calls.jsonl").write_text("")
+        done = _run(host, "install", "--yes")
+        add = next((c["argv"] for c in _calls(host, "claude") if c["argv"][:2] == ["mcp", "add"]),
+                   None)
+        assert add, done.stdout + done.stderr
+        return add[add.index("--executable-path") + 1]
+
+    assert registered_browser() == str(newest)
+    # PLAYWRIGHT_BROWSERS_PATH first, as Playwright and the browser agent read it.
+    elsewhere = _playwright_build(host.home / "browsers", 1190)
+    host.env["PLAYWRIGHT_BROWSERS_PATH"] = str(host.home / "browsers")
+    assert registered_browser() == str(elsewhere)
+    # A chromium the system has still comes first.
+    shutil.copy(host.browser, host.bin / "chromium")
+    assert registered_browser() == str(host.bin / "chromium")
+
+
+@pytest.mark.parametrize("venv_has_playwright", [True, False])
+def test_no_browser_at_all_is_a_note_that_needs_no_pacman_where_it_can(host, venv_has_playwright):
+    del host.env["BROWSER_AGENT_CHROMIUM"]
+    if not venv_has_playwright:
+        host.env["STANDIN_NO_PLAYWRIGHT"] = "1"
+
+    done = _run(host, "install", "--yes")
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not any(c["argv"][:2] == ["mcp", "add"] for c in _calls(host, "claude"))
+    note = next(n for n in _notes(host) if "no Chromium for the Playwright MCP server" in n)
+    assert "sudo pacman -S chromium" in note
+    assert ("-m playwright install chromium" in note) is venv_has_playwright, note
+
+
 def test_the_check_starts_the_server_with_the_registered_browser(host):
     done = _run(host, "install", "--yes")
 
@@ -408,9 +482,10 @@ def test_no_npx_is_a_note_not_a_failure(host):
 # ---------------------------------------------------------------------------
 
 
-def _all_present(host, browser_dir="chromium"):
+def _all_present(host, browser_dir="chromium", registered=True):
     (host.state / "auth").write_text("claude.ai")
-    _register(host)
+    if registered:
+        _register(host)
     manifest = host.home / ".config" / browser_dir / "NativeMessagingHosts" / MANIFEST
     manifest.parent.mkdir(parents=True)
     manifest.write_text("{}")
@@ -468,6 +543,49 @@ def test_check_fails_when_one_thing_is_missing(host, missing):
 def test_an_unknown_command_is_refused(host):
     assert _run(host, "uninstall").returncode == 2
     assert _run(host, "install", "--force").returncode == 2
+
+
+# ---------------------------------------------------------------------------
+# at a terminal
+# ---------------------------------------------------------------------------
+
+# What the real CLI does at its start when its stdin is a terminal: sets the
+# terminal up. From the background process group timeout runs it in, that stops
+# it (SIGTTOU), so a call bounded that way returned nothing, or never returned.
+TERMINAL_CLAUDE = r'''#!{python}
+import os, sys, termios
+if sys.stdin.isatty():
+    termios.tcsetattr(0, termios.TCSANOW, termios.tcgetattr(0))
+os.execv({claude!r}, [{claude!r}, *sys.argv[1:]])
+'''
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux") or not shutil.which("script"),
+                    reason="needs util-linux script(1) for a terminal")
+@pytest.mark.parametrize("args, said", [
+    (("check",), "registered for this checkout"),
+    (("install", "--yes"), "registered for this checkout"),
+])
+def test_at_a_terminal_every_unanswered_claude_call_still_answers(host, tmp_path, args, said):
+    _all_present(host)
+    # The stand-in tells tools apart by name, so it is run as `claude` still.
+    real = tmp_path / "real" / "claude"
+    real.parent.mkdir()
+    shutil.copy(host.state / "standin", real)
+    (host.bin / "claude").write_text(TERMINAL_CLAUDE.format(python=sys.executable, claude=str(real)))
+    log = tmp_path / "terminal.log"
+    command = " ".join(["bash", shlex_quote(str(SCRIPT)), *args])
+
+    try:
+        done = subprocess.run([shutil.which("script"), "-qec", command, str(log)], env=host.env,
+                              stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"scripts/claude_tools.sh {' '.join(args)} hung at a terminal")
+    shown = log.read_text(encoding="utf-8", errors="replace")
+
+    assert done.returncode == 0, shown
+    assert "signed in with claude.ai" in shown and said in shown, shown
+    assert "unknown" not in shown, shown
 
 
 # ---------------------------------------------------------------------------

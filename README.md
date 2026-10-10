@@ -571,11 +571,18 @@ the graph, a search, the corpus analyses, Clear armed once and never
 confirmed -- and writes `reports/diagnostics/<time>/browser/` with a report,
 every RPC with its timing, the page's console, and screenshots (`--trace` and
 `--gif` add a Playwright trace and a GIF). Anything that changes the console is
-off until you name it: `--allow run` sends a discussion-only goal (nothing is
-written, no project is made) and presses Stop; `upload`, `circuit` and `exit`
-likewise, and only against a console on this machine. Every `/rpc` call the
-page makes is checked before it leaves the browser, so a method you did not
-allow never reaches the server, and clearing the corpus is never allowed.
+off until you name it: `--allow run` sends a discussion-only goal and presses
+Stop. The Builder writes no files and no project is made, but it is a real run:
+its seats answer, the corpus is rebuilt first as before every run, and the
+console's last run (`runs/last_run.json`) is replaced -- so try it on `--spawn`
+first. `upload`, `circuit` and `exit` are off likewise, and only ever sent to a
+console on this machine. Every `/rpc` call the page makes, and every one the
+agent makes itself, is checked before it leaves: a method you did not allow is
+answered with an error and never sent, a Stop is sent only for a run the agent
+started, and clearing the corpus is never allowed. The guard sits on the
+page's requests, so code you hand the page through the `eval` tool acts with
+the page's own powers -- a beacon sent as the page unloads goes around it --
+and is for reading the page, never for calling the console.
 `--spawn` starts a console of its own from a temporary directory instead -- its
 own corpus, runs and uploads, and pull-request following off -- and
 `--stub-seats` makes every seat a keyless stub, verified before anything runs.
@@ -604,8 +611,10 @@ are pulled, where each model sits), a cold and a warm embed, each seat's probe
 and speed, PostgreSQL and each corpus, SearxNG, the console before and after,
 and the browser agent's walk. Every problem comes with the fix from the
 troubleshooting notes. It writes `reports/diagnostics/<time>/report.md` and a
-`…-share.tar.gz` beside it with secrets, addresses and home paths taken out --
-send that, or paste the report. It is read-only unless `--with-runs` (real
+`…-share.tar.gz` beside it with secrets, addresses and home paths taken out of
+every text file -- send that, or paste the report. The browser pass's
+screenshots go in as they are: they are pictures of your console, so look
+through them before sending the bundle anywhere. It is read-only unless `--with-runs` (real
 seats answer, the corpus is rebuilt first and the last run is replaced), never
 starts the console itself, and skips the model-loading sections while the
 console is busy. `--gist` uploads the report as a secret gist after a typed

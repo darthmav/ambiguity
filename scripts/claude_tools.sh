@@ -28,6 +28,7 @@
 #        claude mcp add --scope local playwright -- npx -y @playwright/mcp@0.0.83
 #          --executable-path CHROMIUM --isolated
 #          --output-dir CHECKOUT/reports/diagnostics/playwright-mcp
+#      and --no-sandbox as root, where Chromium cannot sandbox itself.
 #      A server already registered under that name is never replaced: one with
 #      other arguments is named, with the commands that would replace it. When
 #      the project's venv is here, scripts/browser_agent.py mcp-check then starts
@@ -97,7 +98,15 @@ unset_keys=()
 for var in "${KEY_VARS[@]}"; do unset_keys+=(-u "$var"); done
 claude_run() { env "${unset_keys[@]}" claude "$@"; }
 # Bounded, for the calls nobody answers: `mcp get` health-checks the server.
-claude_bounded() { local secs="$1"; shift; timeout "$secs" env "${unset_keys[@]}" claude "$@"; }
+# Their stdin is /dev/null, never the terminal: timeout puts claude in a process
+# group of its own, and a claude that sets up a terminal from there is stopped
+# (SIGTTOU) until the bound ends it, having printed nothing -- at a terminal,
+# every sign-in read as unknown and check hung. -k kills one still stopped.
+claude_bounded() {
+    local secs="$1"
+    shift
+    timeout -k 10 "$secs" env "${unset_keys[@]}" claude "$@" </dev/null
+}
 
 # Where the native installer puts claude. Added for this run only, and last, so
 # a claude already on PATH still wins.
@@ -121,7 +130,9 @@ auth_method() {
 # The browser the MCP server drives. The binary itself comes before Arch's
 # /usr/bin/chromium launcher, which adds ~/.config/chromium-flags.conf (on
 # Omarchy, an extension to load) to every start; BROWSER_AGENT_CHROMIUM, which
-# the browser agent reads too, comes before both.
+# the browser agent reads too, comes before both. Playwright's own build comes
+# last: on ./install.sh --no-system, which installs no chromium and fetches that
+# build for the browser agent instead, it is the only browser there is.
 resolve_browser() {
     local name
     if [ -n "${BROWSER_AGENT_CHROMIUM:-}" ]; then
@@ -132,10 +143,33 @@ resolve_browser() {
     for name in chromium chromium-browser google-chrome-stable; do
         command -v "$name" 2>/dev/null && return
     done
+    playwright_chromium
+}
+
+# The newest chromium-<revision>/chrome-linux*/chrome under PLAYWRIGHT_BROWSERS_PATH,
+# else under Playwright's cache: where scripts/browser_agent.py looks too.
+playwright_chromium() {
+    local cache build revision candidate best="" best_revision=-1
+    for cache in ${PLAYWRIGHT_BROWSERS_PATH:+"$PLAYWRIGHT_BROWSERS_PATH"} "$HOME/.cache/ms-playwright"; do
+        for build in "$cache"/chromium-*; do
+            revision="${build##*/chromium-}"
+            [[ "$revision" =~ ^[0-9]+$ ]] || continue
+            for candidate in "$build"/chrome-linux*/chrome; do
+                if [ -x "$candidate" ] && [ "$revision" -gt "$best_revision" ]; then
+                    best="$candidate" best_revision="$revision"
+                fi
+            done
+        done
+        if [ -n "$best" ]; then echo "$best"; return; fi
+    done
 }
 
 mcp_args_for() {  # browser
     MCP_ARGS=(-y "$MCP_PACKAGE" --executable-path "$1" --isolated --output-dir "$MCP_OUTPUT_DIR")
+    # Chromium cannot sandbox itself as root (a container, a CI box), and the
+    # server keeps the sandbox on unless told: as root, every page it opened
+    # failed. One of the arguments, so a registration made as root reads as ours.
+    if [ "$(id -u 2>/dev/null)" = 0 ]; then MCP_ARGS+=(--no-sandbox); fi
 }
 
 # What Claude Code has registered as `playwright` for this checkout: sets
@@ -260,7 +294,7 @@ sign_in() {
 }
 
 install_mcp() {
-    local browser npx_path add_out check_out check_status
+    local browser npx_path add_out check_out check_status fetch
     if ! npx_path="$(command -v npx)"; then
         note "npx is missing, so the Playwright MCP server cannot run: sudo pacman -S nodejs npm"
         return 0
@@ -270,7 +304,13 @@ install_mcp() {
         if [ -n "${BROWSER_AGENT_CHROMIUM:-}" ]; then
             note "BROWSER_AGENT_CHROMIUM names $BROWSER_AGENT_CHROMIUM, which is not a program, so the Playwright MCP server was not set up"
         else
-            note "no Chromium for the Playwright MCP server to drive: sudo pacman -S chromium, or set BROWSER_AGENT_CHROMIUM"
+            # pacman is what --no-system rules out; Playwright's own build
+            # needs no sudo, wherever the venv has Playwright to fetch it.
+            fetch="sudo pacman -S chromium"
+            if [ -x "$PY" ] && "$PY" -c "import playwright" >/dev/null 2>&1; then
+                fetch=".venv/bin/python -m playwright install chromium (no sudo), or $fetch"
+            fi
+            note "no Chromium for the Playwright MCP server to drive: $fetch, or set BROWSER_AGENT_CHROMIUM; then scripts/claude_tools.sh install"
         fi
         return 0
     fi

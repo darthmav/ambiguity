@@ -101,9 +101,11 @@ interactive() { [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; }
 # committed.
 INSTALL_REPORTS="reports/diagnostics/install-$(date +%Y%m%d-%H%M%S)"
 
-# The Chromium the browser agent and the Playwright MCP server drive, found the
-# way scripts/claude_tools.sh finds it -- the binary before Arch's launcher,
-# which adds ~/.config/chromium-flags.conf to every start. Empty when none.
+# The system's Chromium, found the way scripts/claude_tools.sh looks first --
+# the binary before Arch's launcher, which adds ~/.config/chromium-flags.conf to
+# every start. Empty when none, and then Playwright's own build is fetched
+# (steps 6b and 12): the MCP server's last resort, and the browser agent's
+# first choice whenever it is there.
 system_chromium() {
     local name
     if [ -n "${BROWSER_AGENT_CHROMIUM:-}" ]; then
@@ -144,8 +146,8 @@ net_groups=(pypi ollama hf tokenizer github)
 # seat needs Claude Code, and npx fetches the MCP server again when it starts.
 net_groups+=(--optional research cloud)
 [ "$CLAUDE" -eq 1 ] && net_groups+=(npm claude)
-# Playwright's own browser builds, fetched by the browser agent step only on a
-# machine that will have no chromium: --no-system installs none.
+# Playwright's own browser builds, fetched (steps 6b and 12) only on a machine
+# that will have no chromium: --no-system installs none.
 if [ "$BROWSER_AGENT" -eq 1 ] && [ "$SYSTEM" -eq 0 ] && [ -z "$(system_chromium)" ]; then
     net_groups+=(playwright)
 fi
@@ -730,6 +732,17 @@ if [ "$CLAUDE" -eq 1 ]; then
     # the sign-ins sit together. scripts/claude_tools.sh says exactly what it
     # does; its notes -- the steps only you can take, like the one click Claude
     # in Chrome needs -- join this script's own.
+    #
+    # --no-system installs no chromium, and the browser agent's step fetches
+    # Playwright's own build only after this one has looked for a browser, so
+    # the MCP server went unregistered until the next run. Fetched here first;
+    # the browser agent's step then finds it.
+    if [ "$BROWSER_AGENT" -eq 1 ] && [ "$SYSTEM" -eq 0 ] && [ -z "$(system_chromium)" ]; then
+        echo "  no system Chromium, and --no-system installs none: fetching Playwright's own, for the MCP server and the browser agent"
+        if ! "$PY" -m playwright install chromium; then
+            echo "  Playwright's Chromium was not fetched; the browser agent's step tries again"
+        fi
+    fi
     claude_tools=(scripts/claude_tools.sh install)
     [ "$ASSUME_YES" -eq 1 ] && claude_tools+=(--yes)
     claude_notes="$(mktemp)"
@@ -1347,7 +1360,8 @@ if [ "$BROWSER_AGENT" -eq 1 ]; then
     doctor_json="$("$PY" scripts/browser_agent.py doctor --json 2>/dev/null)" || doctor_status=$?
     if [ "$doctor_status" -eq 2 ] && [ "$SYSTEM" -eq 0 ]; then
         # --no-system installs no chromium, so Playwright's own build is
-        # fetched into its cache instead (the playwright group in step 0).
+        # fetched into its cache instead (the playwright group in step 0):
+        # by step 6b already, unless --no-claude or that fetch failed.
         echo "  no browser here, and --no-system installs none: fetching Playwright's own Chromium"
         if "$PY" -m playwright install chromium; then
             doctor_status=0

@@ -99,6 +99,7 @@ SELECTORS: dict[str, str] = {
     "exit": "#exit",
     "exit_confirm": "#exit-confirm",
     "exit_yes": "#exit-yes",
+    "exit_no": "#exit-no",
     "gone": "#gone",
     "director": "#director",
     "prompt": "#eng-prompt",
@@ -268,11 +269,14 @@ def parse_allow(text: str | Iterable[str] | None) -> frozenset[str]:
     return keys
 
 
-def rpc_refusal(method: str, allow: Collection[str], target: str) -> str:
+def rpc_refusal(method: str, allow: Collection[str], target: str,
+                params: Any = None) -> str:
     """Why `method` may not be sent to the console at `target`, or "" when it may.
 
     Reads and heavy reads always go. A mutation goes only with its `--allow`
     key and only to loopback; `NEVER_ALLOWED` and anything unclassified never.
+    A `stop_run` must name its run: the server reads an empty `run_id` as
+    whatever run is armed, which need not be one the agent started.
     """
     kind = RPC_KINDS.get(method)
     if method in NEVER_ALLOWED:
@@ -287,6 +291,8 @@ def rpc_refusal(method: str, allow: Collection[str], target: str) -> str:
     if not target_is_loopback(target):
         host = urlsplit(target).hostname or target
         return f"{method} changes the console, and {host} is not this machine's loopback"
+    if method == "stop_run" and not (isinstance(params, Mapping) and params.get("run_id")):
+        return "a stop_run that names no run stops whichever run is armed, so it is not sent"
     return ""
 
 
@@ -311,7 +317,7 @@ def console_status(base: str, timeout: float = 5.0) -> dict[str, Any] | None:
 def rpc_call(base: str, method: str, params: dict[str, Any] | None = None, *,
              allow: Collection[str] = (), timeout: float = RPC_TIMEOUT_S) -> dict[str, Any]:
     """One RPC from the agent itself, under the same guard the page is under."""
-    refusal = rpc_refusal(method, allow, base)
+    refusal = rpc_refusal(method, allow, base, params or {})
     if refusal:
         raise RpcRefused(refusal)
     body = json.dumps({"method": method, "params": params or {}}).encode()
@@ -434,11 +440,15 @@ def launch_options(executable: str, headed: bool = False, euid: int | None = Non
     the sandbox is on for every user but root, where chromium cannot have one.
     Nothing here passes `--no-sandbox`; at root Playwright adds it itself, and
     the report reads the real argv to say so.
+
+    Shared workers are switched off: what one sends never meets the page's
+    route, so it would carry a refused RPC past the guard, and the console
+    starts none.
     """
     env = os.environ if env is None else env
     if euid is None:
         euid = os.geteuid() if hasattr(os, "geteuid") else 1
-    args: list[str] = []
+    args: list[str] = ["--disable-shared-workers"]
     if headed and env.get("WAYLAND_DISPLAY"):
         # Launched directly, the binary skips the launcher and whatever Wayland
         # flags the desktop gives it, and would come up under XWayland.
@@ -895,8 +905,11 @@ class Session:
         self.label = ""
         self.next_dialog: tuple[str, str | None] | None = None
         self.snapshotted: dict[int, bool] = {}
+        # Service workers blocked: like shared workers, their requests never
+        # meet the route, and the console registers none.
         self.context = handle.browser.new_context(
             viewport={"width": viewport[0], "height": viewport[1]}, accept_downloads=True,
+            service_workers="block",
         )
         self.context.route(is_rpc_url, self._guard)
         self.pages: list[Any] = []
@@ -928,7 +941,7 @@ class Session:
             method, params = _rpc_request(request.post_data_buffer)
         except Exception:
             method, params = "", None
-        refusal = rpc_refusal(method, self.allow, request.url)
+        refusal = rpc_refusal(method, self.allow, request.url, params)
         if not refusal:
             route.continue_()
             return
@@ -1496,8 +1509,35 @@ def _wait_until_running(c: Check, before: int, limit_s: float) -> bool:
     return False
 
 
+PAGE_RUN_ID_JS = "() => (typeof CURRENT === 'object' && CURRENT && CURRENT.runId) || ''"
+
+
+def _not_our_run(c: Check) -> str:
+    """Why the run in flight is not one this agent started, or "" when it is.
+
+    Stop is pressed only on the agent's own run: the console holds one run at
+    a time, and the one in flight may be the operator's, started between the
+    agent's look and its click. Ours carries `DISCUSSION_GOAL` under the id
+    the page learned for it.
+    """
+    try:
+        progress = rpc_call(c.base, "run_progress", timeout=10)
+    except AgentError as exc:
+        return f"could not tell whose run is in flight: {exc}"
+    page_id = str(c.session.page.evaluate(PAGE_RUN_ID_JS) or "")
+    if not progress.get("running"):
+        return "no run is in flight"
+    if progress.get("goal") != DISCUSSION_GOAL:
+        return "the run in flight is not the agent's, and the agent never stops another's run"
+    if not page_id or progress.get("run_id") != page_id:
+        return "the page does not know the run in flight as its own, so its Stop is not pressed"
+    return ""
+
+
 def _stop_and_wait(c: Check, before: int) -> bool:
     p = c.session.page
+    if _not_our_run(c):
+        return False
     with contextlib.suppress(Exception):
         if p.is_enabled(S["stop"]):
             p.click(S["stop"])
@@ -1536,22 +1576,29 @@ def pass_run(c: Check) -> Outcome:
 
 
 def pass_stop(c: Check) -> Outcome:
-    """Stop pressed the moment it is offered; how long until the run is stopped.
+    """Stop pressed as soon as the page knows its run; how long until it stops.
 
-    The page enables Stop as Run is pressed, and a Stop sent before the page
-    has learned the run's id stops whatever run is armed -- here, the one this
-    pass just started, since it refuses to start beside another.
+    The page enables Stop as Run is pressed, but a Stop sent before the page
+    has learned its run's id names no run, and the server reads that as
+    whatever run is armed -- possibly the operator's, started in between. So
+    the pass waits for the id, checks the run is its own, and only then
+    presses (the guard refuses a `stop_run` with no id regardless).
     """
     p = c.session.page
     refusal, before = _start_run(c)
     if refusal:
         return Outcome("refused", refusal)
-    # Offered, or already over: a stub run can finish inside the click itself.
-    p.wait_for_function(f"(before) => !document.querySelector('#eng-stop').disabled || ({RUN_ENDED_JS})(before)",
+    # Known, or already over: a stub run can finish inside the click itself.
+    p.wait_for_function(f"(before) => (!document.querySelector('#eng-stop').disabled"
+                        f" && ({PAGE_RUN_ID_JS})() !== '') || ({RUN_ENDED_JS})(before)",
                         arg=before, timeout=30_000)
     if p.evaluate("() => document.querySelector('#eng-stop').disabled"):
         _wait_for_run_end(c, before, 30)
         return Outcome("skip", "the run finished before Stop could be pressed")
+    whose = _not_our_run(c)
+    if whose:
+        _wait_for_run_end(c, before, 30)
+        return Outcome("refused", whose)
     pressed = time.monotonic()
     try:
         p.click(S["stop"], timeout=5000)
@@ -1601,6 +1648,11 @@ def pass_reattach(c: Check) -> Outcome:
     s.shot("reattached")
     if not reattached:
         return Outcome("skip", "the run ended while the page reloaded", obs)
+    # A reloaded page shows whatever run is in flight, the operator's
+    # included; it is stopped only if it is the one this pass started.
+    whose = _not_our_run(c)
+    if whose:
+        return Outcome("refused", whose, obs)
     before = int(p.evaluate(SYS_COUNT_JS))
     if not _stop_and_wait(c, before):
         return Outcome("fail", "the reattached run did not stop", obs)
@@ -1684,13 +1736,23 @@ def pass_circuit(c: Check) -> Outcome:
 
 
 def pass_exit(c: Check) -> Outcome:
-    """The console's own way out, and proof the server went."""
+    """The console's own way out, and proof the server went.
+
+    Never through "Stop & exit": a run in flight is the operator's or one the
+    agent already finished with, and either way not the agent's to stop on
+    its way out. The pass is refused while one is in flight, and cancels the
+    confirm if a run started between the look and the click.
+    """
     s, p = c.session, c.session.page
+    try:
+        if rpc_call(c.base, "run_progress", timeout=10).get("running"):
+            return Outcome("refused", "a run is in flight; the agent does not stop it to exit")
+    except AgentError as exc:
+        return Outcome("refused", f"could not tell whether a run is in flight: {exc}")
     p.click(S["exit"])
-    confirmed = False
     if p.evaluate("() => document.querySelector('#exit-confirm').classList.contains('on')"):
-        p.click(S["exit_yes"])
-        confirmed = True
+        p.click(S["exit_no"])
+        return Outcome("refused", "a run started as the pass reached Exit; it was left running")
     p.wait_for_function(
         "() => { const g = document.querySelector('#gone');"
         " return !!g && /Console closed|Still running/.test(g.textContent); }",
@@ -1701,8 +1763,7 @@ def pass_exit(c: Check) -> Outcome:
     s.shot("exit")
     gone = console_status(c.base, timeout=3.0) is None
     c.console_gone = gone
-    obs = {"said": said.splitlines()[0] if said else "", "confirmed_a_run": confirmed,
-           "server_gone": gone}
+    obs = {"said": said.splitlines()[0] if said else "", "server_gone": gone}
     if "Console closed" in said and gone:
         return Outcome("pass", "", obs)
     return Outcome("fail", said.splitlines()[0] if said else "no exit notice", obs)
@@ -2272,6 +2333,15 @@ def run_check(args: argparse.Namespace) -> int:
         print(line, flush=True)
 
     try:
+        alone = [flag for flag, given in (("--stub-seats", args.stub_seats),
+                                          ("--no-rebuild", args.no_rebuild)) if given]
+        if alone and not args.spawn:
+            # Said, not ignored: a run sent to the operator's console under a
+            # --stub-seats it never honoured would reach the real seats.
+            results["problems"].append(
+                f"{' and '.join(alone)} apply only to a console the agent spawns; add --spawn, "
+                "or leave them out to check the console at --base as it is")
+            return 2
         for refusal in refusals:
             say(f"refused {refusal['name']}: {refusal['reason']}")
         if not chosen:
@@ -3439,6 +3509,27 @@ def _mcp_text(result: Mapping[str, Any]) -> str:
 MCP_PROBE_MARKER = "browser agent mcp check"
 
 
+# What the MCP server's process needs: to find node and npm's cache, reach the
+# registry through the machine's proxy and trust its certificates, and open a
+# browser on the desktop. `npx -y` fetches and runs a third-party package, so
+# the caller's keys and tokens are left behind.
+_MCP_ENV_NAMES = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TMPDIR", "TZ", "TERM",
+    "XDG_RUNTIME_DIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+    "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+    "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+})
+_MCP_ENV_PREFIXES = ("LC_", "PLAYWRIGHT_", "npm_config_", "NPM_CONFIG_")
+
+
+def mcp_environment(env: Mapping[str, str]) -> dict[str, str]:
+    """The part of `env` the MCP server is handed."""
+    return {k: v for k, v in env.items()
+            if k in _MCP_ENV_NAMES or k.startswith(_MCP_ENV_PREFIXES)}
+
+
 def mcp_check(args: argparse.Namespace) -> int:
     """The pinned Playwright MCP server: started, its tools listed, driven once."""
     report: dict[str, Any] = {"ok": False, "package": MCP_PACKAGE, "problems": [], "warnings": []}
@@ -3468,7 +3559,7 @@ def mcp_check(args: argparse.Namespace) -> int:
     MCP_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     command = [npx, "-y", MCP_PACKAGE, "--headless", "--isolated", "--executable-path", executable,
                "--output-dir", str(MCP_OUTPUT_DIR)]
-    env = dict(os.environ)
+    env = mcp_environment(os.environ)
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         # Chromium cannot sandbox as root; for everyone else the server's own
         # default -- sandbox on -- stands.

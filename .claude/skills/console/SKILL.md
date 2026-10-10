@@ -62,8 +62,8 @@ interpreter <checkout>/.venv/bin/python
 venv        present
 import      langgraph_agent OK
 playwright  OK
-browser     OK  /usr/lib/chromium/chromium (system, 141.0.7390.37), sandbox on
-chromium    /usr/bin/chromium
+browser     OK  /usr/lib/chromium/chromium (the system chromium, 141.0.7390.37), sandbox on
+chromium    /usr/lib/chromium/chromium
 server      up
 ```
 
@@ -153,8 +153,9 @@ Five tabs: Engineer, Graph (default), Retrieval, Corpus, State.
 Playwright for Python (Apache-2.0): it clicks, types and reads the page the way
 a person does, and records what the page and the server said while it did.
 It needs the `browser` extra (`pip install -e ".[dev,browser]"`, which
-`install.sh` does) and a Chromium: it finds `/usr/lib/chromium/chromium`,
-`chromium` on PATH, or Playwright's own build. `driver.py browse ARGS` is the
+`install.sh` does) and a Chromium: `--chromium` or `BROWSER_AGENT_CHROMIUM`
+first, then Playwright's own build when one is installed, then
+`/usr/lib/chromium/chromium`, then `chromium` on PATH. `driver.py browse ARGS` is the
 same command under the venv.
 
 ```bash
@@ -185,10 +186,16 @@ four seats report a stub. It stops the console through `shutdown` and drops its
 schema afterwards. Use it to try the UI without touching the real console.
 
 **The RPC guard.** Every page the agent opens has its `/rpc` calls checked
-before they leave the browser: a mutating method not enabled by `--allow` is
-answered by the agent with an error envelope and never reaches the server.
-`clear_corpus`, `set_seat`, `set_thinking`, `embed_project` and
-`dismiss_pull_request` are never sent, whatever is allowed.
+before they leave the browser, and so are the agent's own: a mutating method
+not enabled by `--allow` is answered by the agent with an error envelope and
+never sent. `clear_corpus`, `set_seat`, `set_thinking`, `embed_project` and
+`dismiss_pull_request` are never sent, whatever is allowed, and a `stop_run`
+goes only with a run id -- the passes press Stop only on a run they started,
+and `exit` is refused while any run is in flight. Shared and service workers
+are switched off, since their requests never meet the page's route. What the
+guard cannot see is code you hand the page with `eval`: it has the page's own
+powers (a beacon sent as the page unloads goes around the route), so use
+`eval` to read the page, never to call the console.
 
 **One-shot tools and `batch`.** The same vocabulary Claude in Chrome uses, built
 on Playwright (`browser_agent.py tools` prints the table with each tool's
@@ -282,14 +289,15 @@ skip into a failure, as CI does.
 
 ## Gotchas
 
-- **A container can be "up" and healthy while running stale code.** If
-  `:8080` is being served by the root `docker-compose.yml` (`docker ps` shows
-  `ambiguity-console-1`), the code is bind-mounted read-only so the *files* on
+- **A container can be "up" and healthy while running stale code.** Both
+  compose stacks serve the console on `:8081` (`AMBIGUITY_PORT`) as
+  `ambiguity-console-1` -- one at a time, since they share a project name. The
+  root `docker-compose.yml` bind-mounts the code read-only, so the *files* on
   disk are current, but the *process* only re-imports them on its own
   restart -- an hours-old container keeps running whatever
   `graphrag_server.py` looked like when it last started. The Docker-only stack
-  (`docker/compose.yml`, on :8081) mounts no code at all: it runs what its
-  image was built from, so a pull needs `docker/up.sh --build`. `driver.py doctor`'s
+  (`docker/compose.yml`) mounts no code at all: it runs what its image was
+  built from, so a pull needs `docker/up.sh --build`. `driver.py doctor`'s
   `server up` cannot tell the difference; it only checks that something
   answers `/api/status`. Confirmed this session: `rag_stats` kept reporting
   pre-fix behavior until `docker restart ambiguity-console-1` (not
@@ -357,8 +365,8 @@ skip into a failure, as CI does.
 | `run failed: ... status code: 410` | An Ollama Cloud tag the seat points at was retired upstream. `rpc list_seats` for a `"live": true` tag, `rpc set_seat` onto it. |
 | `run failed: ... status code: 402 -- not included in your free usage` | Account has no credits for that tag. Try another from `rpc llm_options`. |
 | `driver.py rpc search_documents` errors `model "qwen3-embedding:latest" not found` | Embedder isn't pulled. `ollama pull qwen3-embedding:latest` (~4.7GB). |
-| A merged code change doesn't show up in `rag_stats`/behavior | `:8080` may be a `docker compose` container running stale in-memory code, not a process `driver.py` manages. `docker ps` for `ambiguity-console-1`; if present, `docker restart ambiguity-console-1`, not `driver.py restart`. |
-| `driver.py shot` says "no chromium on PATH" | Install chromium, or screenshot from a browser against http://localhost:8080. |
+| A merged code change doesn't show up in `rag_stats`/behavior | `:8081` is a `docker compose` container running stale in-memory code, not a process `driver.py` manages. `docker ps` for `ambiguity-console-1`; if present, `docker restart ambiguity-console-1`, not `driver.py restart`. |
+| `driver.py shot` says "no chromium at /usr/lib/chromium/chromium or on PATH" | Install chromium, or screenshot from a browser against http://localhost:8080. |
 | `browser_agent.py doctor`: "No usable sandbox" | The kernel refuses Chromium's user namespaces; doctor prints the sysctl values and the fix. Never work around it with `--no-sandbox`. |
 | `browser_agent.py` says Playwright is missing | `.venv/bin/pip install -e ".[dev,browser]"` -- the `browser` extra is not in `dev`. |
 | A pass reads "refused by the browser agent" | The RPC guard stopped a mutating call. Add the `--allow` key the report names, against a loopback console. |

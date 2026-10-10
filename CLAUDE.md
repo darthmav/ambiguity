@@ -448,7 +448,10 @@ a Builder that runs programs. No CORS header is sent; the page is same-origin.
   `scripts/browser_agent.py` routes every `/rpc` call its pages make through a
   guard: a mutating method needs its `--allow` key *and* a loopback console, and
   `clear_corpus`, `set_seat`, `set_thinking`, `embed_project` and
-  `dismiss_pull_request` are never sent. `--spawn` runs a console of its own
+  `dismiss_pull_request` are never sent; a `stop_run` must name its run, and
+  Stop is pressed only on a run the agent started. The guard is the page's
+  route, so shared and service workers are off and `eval` is for reading
+  only: code it runs has the page's powers. `--spawn` runs a console of its own
   from a temporary directory (own corpus schema, `RUNS_DIR`,
   `FOLLOW_PULL_REQUESTS=0`); `--stub-seats` sets every key to an empty string,
   which `load_dotenv` cannot refill, and refuses to go on unless all four seats
