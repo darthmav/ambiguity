@@ -255,9 +255,13 @@ those out. When anything is left as a problem, the installer ends by
 diagnosing the machine (below) and says where the report is.
 
 The Ollama daemon serves every default seat and the embedder, so the installer
-keeps it running: `ollama.service` is enabled at boot and a systemd drop-in
-restarts it whenever it exits, with no start limit to give up at
-(`scripts/ollama_keepalive.sh check` reports both).
+keeps it running: `ollama.service` is enabled at boot, a systemd drop-in
+restarts it whenever it exits, with no start limit to give up at, and a
+watchdog timer restarts it when it hangs -- alive but no longer answering
+three asks in a row, a minute apart (never within three minutes of its own
+start, and never one someone stopped). `scripts/ollama_keepalive.sh check`
+reports all three, `journalctl -u ollama-watchdog` every restart it made, and
+`scripts/ollama_keepalive.sh remove-watchdog` takes the watchdog away.
 
 Its first step asks every host it will download from — the package mirrors,
 PyPI, the Ollama and Hugging Face registries, Docker Hub, GitHub — and names
