@@ -12,10 +12,11 @@ import functools
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, Literal, TypeVar, cast
 
 from dotenv import load_dotenv
@@ -544,7 +545,8 @@ class _SeatLLM:
     `GPU_ARBITER`, and a local tag evicts whatever else is resident. `build` is
     kept so a forced load that did not fit can be rebuilt unforced. `provider`
     picks the call's circuit, and tells `bind_tools` to ask the daemon whether a
-    tag can call tools.
+    tag can call tools. `model` is the seat's model as configured, which the
+    run's record names even when a missing key put the stub in its place.
     """
 
     def __init__(
@@ -556,6 +558,7 @@ class _SeatLLM:
         force_gpu: bool = True,
         bound: "tuple[Any, dict[str, Any]] | None" = None,
         provider: str = "",
+        model: str = "",
     ) -> None:
         self._agent = agent
         self._inner = inner
@@ -563,6 +566,7 @@ class _SeatLLM:
         self._force_gpu = force_gpu
         self._bound = bound
         self._provider = provider
+        self._model = model
 
     def _model_tag(self) -> str:
         """The tag this seat calls, for the arbiter and the eviction."""
@@ -628,6 +632,10 @@ class _SeatLLM:
 
         tag = self._model_tag()
         local = bool(tag) and is_local_ollama_model(tag)
+        _count_seat_call(
+            self._agent, self._provider, self._model or tag,
+            bool(getattr(self._inner, "is_stub", False)),
+        )
         with GPU_ARBITER.exclusive(f"seat:{self._agent}"):
             if local:
                 # Held inside the arbiter, so nothing loads into the gap
@@ -685,6 +693,7 @@ class _SeatLLM:
             force_gpu=self._force_gpu,
             bound=(tools, kwargs),
             provider=self._provider,
+            model=self._model,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -811,8 +820,8 @@ def thinking_support(provider: str, model: str) -> tuple[ThinkingSupport, str]:
     return "unknown", f"thinking is not switchable for {provider}"
 
 
-# Per-seat thinking choices from the console, for the life of the process; kept
-# per seat, so they survive a model change.
+# Per-seat thinking choices from the console, kept between starts as the seats
+# are (`seat_choices`); kept per seat, so they survive a model change.
 _agent_thinking: dict[str, bool] = {}
 
 
@@ -822,7 +831,7 @@ def get_agent_thinking(agent: str) -> bool:
 
 
 def set_agent_thinking(agent: str, on: bool) -> None:
-    """Switch one seat's thinking on or off, for the life of the process.
+    """Switch one seat's thinking on or off, in memory.
 
     Refused for a model with no switch, rather than stored and ignored. A failure
     recorded against the seat stays: thinking fixes no credit balance.
@@ -845,13 +854,14 @@ def _thinking_for_call(agent: str) -> bool | None:
     return get_agent_thinking(agent) if support == "switch" else None
 
 
-# Per-seat model choices from the console, for the life of the process; they
-# win over the environment.
+# Per-seat model choices from the console; they win over the environment. In
+# memory here, and kept between starts by the console (`seat_choices`,
+# `restore_seat_choices`).
 _agent_llm_overrides: dict[str, dict[str, str]] = {}
 
 
 def set_agent_llm(agent: str, provider: str, model: str) -> None:
-    """Seat `provider`/`model` on `agent`, in memory, for the life of the process.
+    """Seat `provider`/`model` on `agent`, in memory.
 
     Moving a seat clears its recorded failure -- that described the old seat --
     but re-selecting the seat it already has does not, so a dead seat cannot be
@@ -862,6 +872,93 @@ def set_agent_llm(agent: str, provider: str, model: str) -> None:
         _seat_failures.pop(agent, None)
 
     _agent_llm_overrides[agent] = {"provider": provider, "model": model}
+
+
+def seat_choices() -> dict[str, Any]:
+    """The console's seat and thinking choices, in the form the console saves.
+
+    Each seat carries what `.env` or the default gave it when it was chosen
+    (`configured`), so a later edit to either is not masked by a stale choice:
+    `restore_seat_choices` drops the choice instead. A choice that is what the
+    seat is configured to anyway is left out -- there is nothing to restore,
+    and the seat then keeps its `{ROLE}_BASE_URL` / `{ROLE}_API_KEY`.
+    """
+    seats = {}
+    for agent, choice in _agent_llm_overrides.items():
+        configured = _configured_info(agent)
+        if (choice["provider"], choice["model"]) != (configured["provider"], configured["model"]):
+            seats[agent] = {**choice, "configured": configured}
+    return {"seats": seats, "thinking": dict(_agent_thinking)}
+
+
+def restore_seat_choices(saved: Mapping[str, Any]) -> list[str]:
+    """Seat the choices `seat_choices` returned, before this process started.
+
+    Returns a line for each choice left out, and why. A seat whose `.env` or
+    default moved since it was chosen keeps what it is configured to now: a
+    new default is what an update installs, and an `.env` edit is the
+    operator's newer word. Nothing is asked of the daemon, which may not be up
+    yet: a model it no longer has reads NOT PULLED on the card, as it would
+    from `.env`. Thinking is restored as chosen; only a switchable model is
+    ever sent it (`_thinking_for_call`).
+    """
+    notes: list[str] = []
+    seats = saved.get("seats")
+    for agent, choice in (seats.items() if isinstance(seats, Mapping) else ()):
+        if agent not in AGENTS or not isinstance(choice, Mapping):
+            notes.append(f"{agent!r}: not a seat choice this console can read")
+            continue
+        provider, model = choice.get("provider"), choice.get("model")
+        if provider not in PROVIDERS or not isinstance(model, str) or not model:
+            notes.append(f"{agent}: {provider}/{model} is not a seat this console can run")
+            continue
+        configured = _configured_info(agent)
+        if choice.get("configured") != configured:
+            notes.append(
+                f"{agent}: .env or the default seat changed since {model} was chosen, "
+                f"so it runs {configured['model']} as configured now"
+            )
+            continue
+        set_agent_llm(agent, provider, model)
+
+    thinking = saved.get("thinking")
+    for agent, on in (thinking.items() if isinstance(thinking, Mapping) else ()):
+        if agent in AGENTS and isinstance(on, bool):
+            _agent_thinking[agent] = on
+    return notes
+
+
+# The models each seat called during the current run, for the run's record:
+# `{agent: {(provider, model, stub): calls}}`. What a seat was set to is not
+# what it ran -- a seat moved mid-run called two models, and one whose turn
+# retrieval answered called none. Counted as a call starts, so a call abandoned
+# at its deadline still counts, and a late one cannot land in the next run.
+_seat_calls: dict[str, dict[tuple[str, str, bool], int]] = {}
+_seat_calls_lock = threading.Lock()
+
+
+def begin_seat_calls() -> None:
+    """Forget the previous run's calls, as a new run is claimed."""
+    with _seat_calls_lock:
+        _seat_calls.clear()
+
+
+def seat_calls() -> dict[str, list[dict[str, Any]]]:
+    """Each seat's calls this run: `provider`, `model`, `stub`, `calls`, first used first."""
+    with _seat_calls_lock:
+        return {
+            agent: [
+                {"provider": provider, "model": model, "stub": stub, "calls": count}
+                for (provider, model, stub), count in calls.items()
+            ]
+            for agent, calls in _seat_calls.items()
+        }
+
+
+def _count_seat_call(agent: str, provider: str, model: str, stub: bool) -> None:
+    with _seat_calls_lock:
+        calls = _seat_calls.setdefault(agent, {})
+        calls[(provider, model, stub)] = calls.get((provider, model, stub), 0) + 1
 
 
 def get_llm(
@@ -990,7 +1087,11 @@ def _resolve_seat(agent: str) -> dict[str, str | None]:
             "base_url": os.getenv(f"{chosen.upper()}_BASE_URL"),
             "api_key": None,
         }
+    return _configured_seat(agent)
 
+
+def _configured_seat(agent: str) -> dict[str, str | None]:
+    """`agent`'s seat as `.env` or the default gives it, whatever the console chose."""
     prefix = agent.upper()
     provider: str | None = os.getenv(f"{prefix}_PROVIDER")
     model: str | None = os.getenv(f"{prefix}_MODEL")
@@ -1033,7 +1134,9 @@ def get_agent_llm(agent: AgentName, temperature: float = 0.1) -> Any:
             force_gpu=force_gpu,
         )
 
-    return _SeatLLM(agent, build(True), build, provider=seat["provider"] or "")
+    return _SeatLLM(
+        agent, build(True), build, provider=seat["provider"] or "", model=seat["model"] or ""
+    )
 
 
 def get_agent_model_info(agent: AgentName) -> dict[str, str]:
@@ -1043,6 +1146,12 @@ def get_agent_model_info(agent: AgentName) -> dict[str, str]:
     `get_agent_status` reports and `get_llm` refuses.
     """
     seat = _resolve_seat(agent)
+    return {"provider": seat["provider"] or DEFAULT_PROVIDER, "model": seat["model"] or ""}
+
+
+def _configured_info(agent: str) -> dict[str, str]:
+    """`get_agent_model_info` for the seat `.env` or the default gives, console aside."""
+    seat = _configured_seat(agent)
     return {"provider": seat["provider"] or DEFAULT_PROVIDER, "model": seat["model"] or ""}
 
 

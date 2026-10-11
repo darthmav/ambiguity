@@ -47,6 +47,7 @@ from langgraph_agent import create_agent_graph, initial_state  # noqa: E402
 from langgraph_agent.config import (  # noqa: E402
     AGENTS,
     ANTHROPIC_SEAT_MODELS,
+    begin_seat_calls,
     daemon_request,
     get_agent_model_info,
     get_agent_status,
@@ -54,6 +55,9 @@ from langgraph_agent.config import (  # noqa: E402
     ollama_base_url,
     ollama_daemon_tags,
     ollama_model_capabilities,
+    restore_seat_choices,
+    seat_calls,
+    seat_choices,
     set_agent_llm,
     set_agent_thinking,
 )
@@ -626,6 +630,51 @@ def rpc_clear_corpus(_: dict[str, Any]) -> dict[str, Any]:
         return {**kb_or_none.clear(), **sources}
 
 
+# The seats chosen in the console, kept between starts: a choice that lasted
+# only as long as the process was gone at every restart. Under `RUNS_DIR`, so a
+# console started beside this one (the installer's check, the browser agent's
+# `--spawn`) runs the configured seats and never replaces these.
+_seats_lock = threading.Lock()
+
+
+def _seats_path() -> Path:
+    return RUNS_DIR / "seats.json"
+
+
+def _save_seat_choices() -> None:
+    """Write every seat and thinking choice. A disk failure is journalled, not raised:
+    the seat has already moved, and the choice lasts until the console stops."""
+    with _seats_lock:
+        try:
+            _replace_json(_seats_path(), seat_choices())
+        except OSError as exc:
+            HEALING.warning(f"Could not save the seat choices: {exc}", action="seat_save_failed")
+
+
+def _restore_seat_choices() -> None:
+    """Seat what was chosen before the console last stopped.
+
+    No file is a console nobody has moved a seat on -- a fresh install -- and
+    the configured seats stand: `.env`'s, else `DEFAULT_SEATS`.
+    """
+    path = _seats_path()
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[Seats] {path} could not be read ({exc}); the configured seats stand")
+        return
+    if not isinstance(saved, dict):
+        print(f"[Seats] {path} is not a seat record; the configured seats stand")
+        return
+    for note in restore_seat_choices(saved):
+        print(f"[Seats] {note}")
+    for agent in AGENTS:
+        info = get_agent_model_info(agent)
+        print(f"[Seats] {agent}: {info['provider']} {info['model']}")
+
+
 def rpc_list_seats(_: dict[str, Any]) -> dict[str, Any]:
     """The four seats and whether each can actually run."""
     return {
@@ -634,7 +683,7 @@ def rpc_list_seats(_: dict[str, Any]) -> dict[str, Any]:
 
 
 def rpc_set_seat(params: dict[str, Any]) -> dict[str, Any]:
-    """Reassign one seat for the lifetime of this process."""
+    """Reassign one seat, and keep the choice for the console's next start."""
     agent = _str_param(params, "agent") or _str_param(params, "role")
     provider = _str_param(params, "provider")
     model = _str_param(params, "model")
@@ -660,11 +709,12 @@ def rpc_set_seat(params: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"{model!r} is not a seat model the console offers: {offered}")
 
     set_agent_llm(agent, provider, model)
+    _save_seat_choices()
     return {"ok": True, "role": agent, **get_agent_status(agent)}
 
 
 def rpc_set_thinking(params: dict[str, Any]) -> dict[str, Any]:
-    """Switch one seat's thinking on or off for the lifetime of this process.
+    """Switch one seat's thinking on or off, and keep it for the next start.
 
     `thinking` must be a JSON boolean. Anything else is refused rather than
     coerced, because the obvious coercion reads the string "false" as on.
@@ -678,6 +728,7 @@ def rpc_set_thinking(params: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("thinking must be true or false")
 
     set_agent_thinking(agent, thinking)
+    _save_seat_choices()
     return {"ok": True, "role": agent, **get_agent_status(agent)}
 
 
@@ -841,7 +892,8 @@ def _runs_dir() -> Path:
     """Where a run's record lives: `runs/` beside this file, unless `RUNS_DIR` says.
 
     Everything this console keeps about its runs is under it -- the last run's
-    snapshot and the pull requests the monitor follows -- so a second console
+    snapshot, the pull requests the monitor follows and the seats the operator
+    chose -- so a second console
     started beside the operator's own (the browser agent's `--spawn`) is given
     a directory of its own and neither reads nor replaces theirs. A relative
     path is taken from where the console was started, once, at import.
@@ -856,24 +908,32 @@ RUNS_DIR = _runs_dir()
 LAST_RUN_PATH = RUNS_DIR / "last_run.json"
 
 
+def _replace_json(path: Path, data: Any) -> None:
+    """Write `data` to `path` whole: to a temp file beside it, then renamed.
+
+    A reader arriving mid-write would otherwise get half a JSON document.
+    Raises OSError; each caller decides what a disk failure costs it.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", dir=path.parent, suffix=".tmp", delete=False, encoding="utf-8"
+    ) as handle:
+        json.dump(data, handle, default=str, indent=2)
+        temp_name = handle.name
+    os.replace(temp_name, path)
+
+
 def _save_snapshot(snapshot: dict[str, Any]) -> None:
     """Keep the run's outcome in memory and on disk.
 
-    Written to a temp file and renamed, because the console fetches this on
-    load: a reader arriving mid-write would otherwise get half a JSON document.
-    A disk failure is swallowed -- the in-memory copy is what the current page
-    reads, and losing the file is not worth failing a run that already finished.
+    Replaced whole, because the console fetches this on load. A disk failure
+    is swallowed -- the in-memory copy is what the current page reads, and
+    losing the file is not worth failing a run that already finished.
     """
     global _last_run_snapshot
     _last_run_snapshot = snapshot
     try:
-        RUNS_DIR.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            "w", dir=RUNS_DIR, suffix=".tmp", delete=False, encoding="utf-8"
-        ) as handle:
-            json.dump(snapshot, handle, default=str, indent=2)
-            temp_name = handle.name
-        os.replace(temp_name, LAST_RUN_PATH)
+        _replace_json(LAST_RUN_PATH, snapshot)
     except OSError:
         pass
 
@@ -1725,9 +1785,15 @@ def _run_payload(
     over_budget: bool,
     elapsed_s: int,
     web_research: dict[str, Any],
+    seats: Mapping[str, Mapping[str, str]],
     **extra: Any,
 ) -> dict[str, Any]:
-    """The run's final state, plus how the run ended -- which AgentState does not hold."""
+    """The run's final state, plus how the run ended -- which AgentState does not hold.
+
+    `seats` is what each seat held when the run started; each gains `used`, the
+    models it actually called (`seat_calls`) -- empty for a seat never called.
+    """
+    called = seat_calls()
     payload = dict(last)
     payload.update(
         run_id=run_id,
@@ -1738,6 +1804,7 @@ def _run_payload(
         finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
         web_research=web_research,
         healing=HEALING.events(session_id=run_id),
+        seats={agent: {**seat, "used": called.get(agent, [])} for agent, seat in seats.items()},
         **extra,
     )
     return payload
@@ -1804,6 +1871,8 @@ def rpc_run_goal(params: dict[str, Any]) -> dict[str, Any]:
         # Under the lock `run_progress` reads the record through, so no reply
         # can hand this run's console the last run's turns.
         ACTIVITY.begin_run()
+        begin_seat_calls()
+        seats: dict[str, dict[str, str]] = {agent: get_agent_model_info(agent) for agent in AGENTS}
         _run_progress.update(
             running=True,
             goal=goal,
@@ -1893,6 +1962,7 @@ def rpc_run_goal(params: dict[str, Any]) -> dict[str, Any]:
             over_budget=over_budget,
             elapsed_s=elapsed,
             web_research=research_report,
+            seats=seats,
             project_embedded=bool(project) and project in embedded_projects(),
             project_removed=_drop_unused_project(output_dir, created_project),
         )
@@ -1908,6 +1978,7 @@ def rpc_run_goal(params: dict[str, Any]) -> dict[str, Any]:
             over_budget=over_budget,
             elapsed_s=int(time.monotonic() - started),
             web_research=research_report,
+            seats=seats,
             error=str(exc),
             project_removed=_drop_unused_project(output_dir, created_project),
         ))
@@ -2094,13 +2165,7 @@ def _read_pull_requests() -> list[dict[str, Any]]:
 def _write_pull_requests(entries: list[dict[str, Any]]) -> None:
     """Replace the file whole, through a rename. The caller holds `_pull_requests_lock`."""
     try:
-        RUNS_DIR.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            "w", dir=RUNS_DIR, suffix=".tmp", delete=False, encoding="utf-8"
-        ) as handle:
-            json.dump(entries, handle, indent=2)
-            temp_name = handle.name
-        os.replace(temp_name, _pull_requests_path())
+        _replace_json(_pull_requests_path(), entries)
     except OSError as exc:
         HEALING.warning(f"Could not save the followed pull requests: {exc}",
                         action="pull_request_save_failed")
@@ -2568,6 +2633,11 @@ def main() -> None:
         # from other machines -- see CONSOLE_HOST.
         print(f"Serving at http://{CONSOLE_HOST}:{port} (CONSOLE_HOST: reachable beyond this machine)")
     print("Press Ctrl+C to stop, or use the console's exit button")
+
+    # Before the first request, so the first seat card already shows the
+    # choice; here and never at import, so a test or a script that imports
+    # this file runs the configured seats.
+    _restore_seat_choices()
 
     # Threaded: a run takes as long as four seat models take, and a
     # single-threaded server would stall every status poll behind it.

@@ -189,8 +189,12 @@ Later cycles route as the Planner asks.
 Every seat is reassignable live from its dropdown in the console, which lists
 exactly what `ollama ls` reports (embedders excluded), so a tag you pull appears
 on the next poll, plus the Anthropic models a seat takes from `.env` (marked
-when `ANTHROPIC_API_KEY` is unset, since the seat then runs canned stub output);
-selections last for the life of the process. `qwen3-embedding:latest`
+when `ANTHROPIC_API_KEY` is unset, since the seat then runs canned stub output).
+A selection is kept in `runs/seats.json` and seated again when the console
+starts, unless `.env` or the default for that seat has changed since; delete
+the file to go back to the configured seats. A fresh install has none, so it
+runs the defaults above. Each run's snapshot (`runs/last_run.json`) records the
+model each seat held and the ones it actually called. `qwen3-embedding:latest`
 is the embedder's, not a seat's: it cannot chat. Only `qwen3.8:latest`
 reports `tools`, which is why it -- not either dolphin -- holds the Builder.
 

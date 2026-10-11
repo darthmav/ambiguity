@@ -595,7 +595,8 @@ def test_runs_live_beside_the_console_unless_runs_dir_says(tmp_path, monkeypatch
 
 def test_runs_dir_moves_everything_a_console_keeps_about_its_runs(tmp_path):
     """A console started with `RUNS_DIR` -- the browser agent's spawned one --
-    writes its last run and the pull requests it follows there, and nothing to
+    writes its last run, the pull requests it follows and its seat choices
+    there, and nothing to
     the checkout's runs/, which holds the operator's own.
 
     In a process of its own: the paths are fixed at import, and the fixtures
@@ -613,8 +614,9 @@ def test_runs_dir_moves_everything_a_console_keeps_about_its_runs(tmp_path):
         f"serve._save_snapshot({{'run_id': {marker!r}}})\n"
         "serve._track_pull_request({'status': 'pending', 'number': 7, 'head': 'abc123',\n"
         f"                           'branch': 'agent/x', 'cwd': ''}}, {marker!r}, 'goal')\n"
+        "serve._save_seat_choices()\n"
         "print(json.dumps([str(serve.RUNS_DIR), str(serve.LAST_RUN_PATH),\n"
-        "                  str(serve._pull_requests_path())]))\n"
+        "                  str(serve._pull_requests_path()), str(serve._seats_path())]))\n"
     )
     env = {**os.environ, "RUNS_DIR": "spawned-runs", "REBUILD_CORPUS": "0",
            "PYTHONDONTWRITEBYTECODE": "1"}
@@ -622,10 +624,12 @@ def test_runs_dir_moves_everything_a_console_keeps_about_its_runs(tmp_path):
                           capture_output=True, text=True, timeout=120)
 
     assert done.returncode == 0, done.stderr[-2000:]
-    runs, last_run, pull_requests = map(Path, json.loads(done.stdout.strip().splitlines()[-1]))
+    runs, last_run, pull_requests, seats = map(
+        Path, json.loads(done.stdout.strip().splitlines()[-1]))
     moved = (tmp_path / "spawned-runs").resolve()
-    assert (runs, last_run, pull_requests) == (
-        moved, moved / "last_run.json", moved / "pull_requests.json")
+    assert (runs, last_run, pull_requests, seats) == (
+        moved, moved / "last_run.json", moved / "pull_requests.json", moved / "seats.json")
+    assert seats.exists()
     assert json.loads(last_run.read_text())["run_id"] == marker
     assert [e["run_id"] for e in json.loads(pull_requests.read_text())] == [marker]
     for name in ("last_run.json", "pull_requests.json"):

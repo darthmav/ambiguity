@@ -95,6 +95,7 @@ python example_usage.py
 │   ├── test_graph.py          # Pytest suite
 │   ├── test_diagnose_seats.py # Guards the seat diagnostic's verdicts
 │   ├── test_thinking.py       # Per-seat capability: the thinking switch, and tool support
+│   ├── test_seat_choices.py   # Seat choices kept between starts; the seats a run held and called
 │   ├── test_console_stop.py   # Emergency stop, deferred exit, snapshot
 │   ├── test_chunking.py       # Document chunking, chunk ids, search collapse
 │   ├── test_corpus_admin.py   # Corpus clear / export / reindex guards
@@ -221,9 +222,11 @@ Every node reads/writes `AgentState`:
 }
 ```
 
-`stopped`, `stop_reason`, `run_id` and `elapsed_s` are added to the payload
-`run_goal` returns, not to `AgentState`: that schema describes what the agents
-write, not how the run ended.
+`stopped`, `stop_reason`, `run_id`, `elapsed_s` and `seats` are added to the
+payload `run_goal` returns, not to `AgentState`: that schema describes what the
+agents write, not how the run ended. `seats` is what each seat held when the
+run was claimed, each with `used` -- the models it actually called
+(`seat_calls`, counted in `_SeatLLM.invoke`), empty for a seat never called.
 
 The Architect writes `architecture` and `verdict`; the verdict is what routes
 the loop and what ends it. `step_count` is incremented by the Architect gate,
@@ -427,6 +430,14 @@ a Builder that runs programs. No CORS header is sent; the page is same-origin.
 - The seat lights come from `ACTIVITY` and `run_progress.turns`, never
   `run_progress["node"]`, which names the seat that just *finished*; the
   embedder's light comes from `EMBEDDER_ACTIVITY`.
+- **Seat choices outlast the process.** `set_seat` and `set_thinking` write
+  `RUNS_DIR/seats.json` (`seat_choices`), and `main()` -- never the import --
+  seats them again (`restore_seat_choices`). Each choice carries the seat
+  `.env` or `DEFAULT_SEATS` gave when it was made, and is dropped once that
+  has moved, so an update's new default or an `.env` edit is never masked; a
+  choice equal to the configured seat is not written. No file means the
+  configured seats, which is what a fresh install and every second console
+  (own `RUNS_DIR`) runs; `install.sh` reads `config` alone and pulls those.
 - A seat with no credentials silently becomes `StubLLM`. Key presence is not
   liveness: `get_agent_status()` reports the real outcome of each call
   (`_seat_failures`), and `stubbed` and `live` failures are worded apart.
