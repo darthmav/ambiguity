@@ -16,6 +16,7 @@ counts bytes, and guessing in either direction invents an accusation.
 
 from __future__ import annotations
 
+import networkx as nx
 import pytest
 
 from langgraph_agent.corpus_health import (
@@ -208,6 +209,15 @@ def test_the_stale_verdict_is_withheld_while_a_run_is_in_flight(monkeypatch, tmp
     assert during["missing_count"] == 1
 
 
+class _EmptyKB:
+    """An open corpus that holds nothing."""
+
+    graph = nx.DiGraph()
+
+    def stats(self):
+        return {"total_documents": 0, "total_chunks": 0, "total_nodes": 0, "total_edges": 0}
+
+
 def test_an_empty_corpus_missing_archive_files_is_stale(monkeypatch, tmp_path):
     """An empty corpus is held to the walk like any other.
 
@@ -220,19 +230,9 @@ def test_an_empty_corpus_missing_archive_files_is_stale(monkeypatch, tmp_path):
     """
     import serve
 
-    class _KB:
-        graph = __import__("networkx").DiGraph()
-
-        def __init__(self, chunks):
-            self._chunks = chunks
-
-        def stats(self):
-            return {"total_documents": 0, "total_chunks": self._chunks,
-                    "total_nodes": 0, "total_edges": 0}
-
     monkeypatch.setitem(serve._run_progress, "running", False)
     monkeypatch.setitem(serve._background_rebuild, "running", False)
-    monkeypatch.setattr(serve, "_open_kb", lambda: _KB(0))
+    monkeypatch.setattr(serve, "_open_kb", _EmptyKB)
 
     # As Clear leaves it: an empty store and nothing for a rebuild to walk.
     cleared_root = str(tmp_path / "cleared")
@@ -281,23 +281,14 @@ def test_an_empty_corpus_of_unreadable_files_has_no_archive_to_rebuild_from(
 ):
     """The hint read "a restart or the next run rebuilds it from the archive"
     over an archive of Latin-1 files, and both left the corpus empty again."""
-    import networkx as nx
-
     import serve
-
-    class _EmptyKB:
-        graph = nx.DiGraph()
-
-        def stats(self):
-            return {"total_documents": 0, "total_chunks": 0,
-                    "total_nodes": 0, "total_edges": 0}
 
     (tmp_path / "latin").mkdir()
     (tmp_path / "latin" / "notes.md").write_bytes("caf\xe9 au lait".encode("latin-1"))
     root = str(tmp_path / "latin")
     monkeypatch.setitem(serve._run_progress, "running", False)
     monkeypatch.setitem(serve._background_rebuild, "running", False)
-    monkeypatch.setattr(serve, "_open_kb", lambda: _EmptyKB())
+    monkeypatch.setattr(serve, "_open_kb", _EmptyKB)
     monkeypatch.setattr(serve, "corpus_staleness",
                         lambda docs: corpus_staleness(docs, root, use_cache=False))
 

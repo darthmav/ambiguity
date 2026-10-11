@@ -61,6 +61,8 @@ def skipped_dir(name: str) -> bool:
 # a name with it before sending one (`project_name_rule`).
 _PROJECT_NAME = re.compile(r"^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
+_PROJECT_NAME_RULE = {"pattern": _PROJECT_NAME.pattern, "reserved": sorted(_RESERVED_NAMES)}
+
 
 def project_name_error(name: Any) -> str | None:
     """Why `name` cannot name a project, or None when it can."""
@@ -80,7 +82,7 @@ def project_name_rule() -> dict[str, Any]:
     A copy written into the console went without the reserved names, and a
     name it passed was refused only after the goal had gone into the transcript.
     """
-    return {"pattern": _PROJECT_NAME.pattern, "reserved": sorted(_RESERVED_NAMES)}
+    return dict(_PROJECT_NAME_RULE)
 
 
 def project_dir(name: str) -> str:

@@ -344,13 +344,18 @@ def test_a_failed_trial_reopens_the_circuit_for_another_cooldown():
         circuit.call(lambda: "refused")
 
 
+def _mark(journal) -> int:
+    events = journal.events()
+    return events[-1]["seq"] if events else 0
+
+
 def test_an_outage_is_journalled_once_however_long_it_lasts():
     """A daemon left down with the console open wrote the same refusal seventy
     times a minute, and a failed trial re-announced "OPENED after 3 failures"
     every cooldown: the 500-event journal held six minutes of one line. Now a
     spell says each thing once and counts the rest, and the close reports them."""
     journal = get_healing_logger()
-    mark = journal.events()[-1]["seq"] if journal.events() else 0
+    mark = _mark(journal)
     circuit = Circuit("long_outage", failure_threshold=1, recovery_timeout=0.05)
 
     def down() -> None:
@@ -381,7 +386,7 @@ def test_a_new_outage_is_journalled_afresh():
     """The counts belong to one spell: after a close, the next outage's first
     refusal and first failed trial are news again."""
     journal = get_healing_logger()
-    mark = journal.events()[-1]["seq"] if journal.events() else 0
+    mark = _mark(journal)
     circuit = Circuit("second_outage", failure_threshold=1, recovery_timeout=0.05)
     for _ in range(2):
         with pytest.raises(ConnectionError):
@@ -402,7 +407,7 @@ def test_a_run_that_starts_mid_outage_carries_the_refusal_in_its_own_record():
     Each healing session the spell reaches is told once; nothing more."""
     journal = get_healing_logger()
     journal.end_healing_session()
-    mark = journal.events()[-1]["seq"] if journal.events() else 0
+    mark = _mark(journal)
     circuit = Circuit("outage_across_runs", failure_threshold=1, recovery_timeout=60)
     with pytest.raises(ConnectionError):
         circuit.call(lambda: (_ for _ in ()).throw(ConnectionError("down")))
@@ -432,7 +437,7 @@ def test_a_trip_during_the_trial_keeps_the_spell_s_counts():
     """`trip` from half-open went through `open`, which started the books
     again, so the line that closed the spell under-reported it."""
     journal = get_healing_logger()
-    mark = journal.events()[-1]["seq"] if journal.events() else 0
+    mark = _mark(journal)
     circuit = Circuit("tripped_mid_trial", failure_threshold=1, recovery_timeout=0.05)
     with pytest.raises(ConnectionError):
         circuit.call(lambda: (_ for _ in ()).throw(ConnectionError("down")))

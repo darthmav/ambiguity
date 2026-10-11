@@ -244,27 +244,25 @@ def _tags(*models: str) -> Any:
     return lambda path, payload=None, *, timeout: {"models": [{"name": m} for m in models]}
 
 
-def _refused_request(path: str, payload: Any = None, *, timeout: float) -> Any:
-    raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
-
-
 @pytest.fixture
 def planner_on_ollama(monkeypatch):
     """The planner seated on the local dolphin, with no failure and no tag list remembered."""
-
-
-def test_a_daemon_with_nothing_pulled_is_not_called_unreachable(monkeypatch):
-    """Both used to be an empty list, so every seat on a fresh daemon read
-    OFFLINE "daemon unreachable" and sent the operator after the wrong thing."""
     monkeypatch.setattr(config, "_seat_failures", {})
     monkeypatch.setattr(config, "_ollama_tags_cache", (0.0, None))
+    monkeypatch.setattr(config, "_agent_llm_overrides", {})
+    config.set_agent_llm("planner", "ollama", config.DOLPHIN_9B)
+
+
+def test_a_daemon_with_nothing_pulled_is_not_called_unreachable(planner_on_ollama, monkeypatch):
+    """Both used to be an empty list, so every seat on a fresh daemon read
+    OFFLINE "daemon unreachable" and sent the operator after the wrong thing."""
     monkeypatch.setattr(config, "daemon_request", lambda path, payload=None, *, timeout: {})
 
     assert config.get_agent_status("planner")["badge"] == "NOT PULLED"
 
     monkeypatch.setattr(config, "_ollama_tags_cache", (0.0, None))
 
-    monkeypatch.setattr(config, "daemon_request", _refused_request)
+    monkeypatch.setattr(config, "daemon_request", _refused)
     assert config.get_agent_status("planner")["badge"] == "OFFLINE"
 
 
@@ -281,7 +279,7 @@ def test_a_seat_that_met_the_down_daemon_reads_like_every_other_seat(
         "ollama", CircuitOpenError(config.OLLAMA_DAEMON.name, 5.0)
     )
 
-    monkeypatch.setattr(config, "daemon_request", _refused_request)
+    monkeypatch.setattr(config, "daemon_request", _refused)
     down = config.get_agent_status("planner")
     assert (down["badge"], down["reason"]) == ("OFFLINE", config.DAEMON_UNREACHABLE)
 
@@ -300,7 +298,7 @@ def test_a_seat_that_just_lost_the_daemon_does_not_read_live_off_the_cached_tags
     monkeypatch.setattr(config, "daemon_request", _tags(config.DOLPHIN_9B))
     assert config.get_agent_status("planner")["live"] is True
 
-    monkeypatch.setattr(config, "daemon_request", _refused_request)
+    monkeypatch.setattr(config, "daemon_request", _refused)
     inner = _Model(99, _raised_from(httpx.ConnectError("refused"), ConnectionRefusedError()))
     with pytest.raises(httpx.ConnectError):
         config._SeatLLM("planner", inner, provider="ollama").invoke(["prompt"])
@@ -329,7 +327,7 @@ def test_a_seat_whose_call_the_daemon_dropped_stays_failing_once_it_is_back(
     assert config._seat_failures["planner"] == config.DAEMON_DROPPED_CALL
 
     # While the daemon is down, it reads like every other seat.
-    monkeypatch.setattr(config, "daemon_request", _refused_request)
+    monkeypatch.setattr(config, "daemon_request", _refused)
     assert config.get_agent_status("planner")["badge"] == "OFFLINE"
 
     # Back, the seat's own last call is what it reports.

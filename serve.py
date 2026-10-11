@@ -1526,21 +1526,22 @@ def _corpus_feed_line(report: dict[str, Any], *, when: str = "before the run") -
             "The next run carries on from there: what is already embedded keeps its "
             "vectors."
         )
-    if source == "unavailable" and report.get("unavailable_circuit") == EMBEDDER_LOAD.name:
-        return (
-            f"[Corpus] {EMBEDDING_MODEL_NAME} could not be loaded onto the cards "
-            f"{when}, so the rebuild stopped after {report.get('indexed', 0)} "
-            f"document(s): {report.get('unavailable')}.{note} The console rebuilds "
-            "the corpus once a load fits; `nvidia-smi` names what else holds the "
-            "cards."
-        )
-    if source == "unavailable" and report.get("unavailable_circuit") == TOKENIZER_UNAVAILABLE:
-        return (
-            f"[Corpus] The rebuild stopped {when} after {report.get('indexed', 0)} "
-            f"document(s): {report.get('unavailable')}{note} The console rebuilds "
-            "the corpus once the tokenizer arrives."
-        )
     if source == "unavailable":
+        circuit = report.get("unavailable_circuit")
+        if circuit == EMBEDDER_LOAD.name:
+            return (
+                f"[Corpus] {EMBEDDING_MODEL_NAME} could not be loaded onto the cards "
+                f"{when}, so the rebuild stopped after {report.get('indexed', 0)} "
+                f"document(s): {report.get('unavailable')}.{note} The console rebuilds "
+                "the corpus once a load fits; `nvidia-smi` names what else holds the "
+                "cards."
+            )
+        if circuit == TOKENIZER_UNAVAILABLE:
+            return (
+                f"[Corpus] The rebuild stopped {when} after {report.get('indexed', 0)} "
+                f"document(s): {report.get('unavailable')}{note} The console rebuilds "
+                "the corpus once the tokenizer arrives."
+            )
         return (
             f"[Corpus] The embedder could not be reached {when}, so the rebuild "
             f"stopped after {report.get('indexed', 0)} document(s): "
@@ -1938,16 +1939,21 @@ _health_lock = threading.Lock()
 _last_rebuild: dict[str, Any] = {}
 
 
+# Why a rebuild stopped on each circuit, and when the monitor redoes it.
+_REBUILD_STOPS: dict[str, tuple[str, str]] = {
+    EMBEDDER_LOAD.name: ("the embedding model would not load", "after the embedder came back"),
+    TOKENIZER_UNAVAILABLE: (
+        "the embedding tokenizer could not be fetched",
+        "on asking for the tokenizer again",
+    ),
+    POSTGRES.name: ("the database could not be reached", "after the database came back"),
+}
+_REBUILD_STOP_DEFAULT = ("the embedder could not be reached", "after the embedder came back")
+
+
 def _rebuild_stop(circuit: str | None) -> tuple[str, str]:
     """Why a rebuild stopped on `circuit`, and when the monitor redoes it."""
-    return {
-        EMBEDDER_LOAD.name: ("the embedding model would not load", "after the embedder came back"),
-        TOKENIZER_UNAVAILABLE: (
-            "the embedding tokenizer could not be fetched",
-            "on asking for the tokenizer again",
-        ),
-        POSTGRES.name: ("the database could not be reached", "after the database came back"),
-    }.get(circuit or "", ("the embedder could not be reached", "after the embedder came back"))
+    return _REBUILD_STOPS.get(circuit or "", _REBUILD_STOP_DEFAULT)
 
 
 def _check_health() -> dict[str, dict[str, str]]:

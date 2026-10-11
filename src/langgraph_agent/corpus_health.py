@@ -34,7 +34,10 @@ STALENESS_SAMPLE = 12
 _walk_cache: dict[str, tuple[float, frozenset[str], tuple[str, ...]]] = {}
 # `_indexer_can_read`'s verdicts, keyed by path and good while the file's
 # (mtime, size) holds: a poll over an unchanged archive stats and never reads.
-_read_verdicts: dict[str, tuple[int, int, bool]] = {}
+# Pruned to the walk whenever it is taken afresh.
+_read_verdicts: dict[str, tuple[tuple[int, int], bool]] = {}
+# `archive_size`'s answer, good for as long as the walk it was counted from.
+_archive_counts: dict[str, tuple[float, int]] = {}
 
 
 def _walk(root: str, use_cache: bool) -> tuple[frozenset[str], tuple[str, ...]]:
@@ -71,6 +74,8 @@ def _walk(root: str, use_cache: bool) -> tuple[frozenset[str], tuple[str, ...]]:
             # Unreadable is what the indexer would hit too, and it skips.
             continue
 
+    for gone in _read_verdicts.keys() - indexable:
+        del _read_verdicts[gone]
     answer = (frozenset(indexable), tuple(sorted(oversized)))
     _walk_cache[root] = (time.monotonic(), answer[0], answer[1])
     return answer
@@ -87,7 +92,14 @@ def archive_size(root: str = ".") -> int:
     unreadable files, an archive of Latin-1 notes promised a rebuild that then
     indexed nothing.
     """
-    return int(corpus_staleness((), root)["archive"])
+    _walk(root, True)
+    stamp = _walk_cache[root][0]
+    cached = _archive_counts.get(root)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    count = int(corpus_staleness((), root)["archive"])
+    _archive_counts[root] = (stamp, count)
+    return count
 
 
 def forget_cached_walk() -> None:
@@ -97,7 +109,6 @@ def forget_cached_walk() -> None:
     changes the moment someone acts on it.
     """
     _walk_cache.clear()
-    _read_verdicts.clear()
 
 
 def _indexer_can_read(path: str) -> bool:
@@ -112,9 +123,10 @@ def _indexer_can_read(path: str) -> bool:
         return True
     except OSError:
         return False
+    key = (stat.st_mtime_ns, stat.st_size)
     cached = _read_verdicts.get(path)
-    if cached is not None and cached[:2] == (stat.st_mtime_ns, stat.st_size):
-        return cached[2]
+    if cached is not None and cached[0] == key:
+        return cached[1]
     try:
         Path(path).read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -123,7 +135,7 @@ def _indexer_can_read(path: str) -> bool:
         readable = False
     else:
         readable = True
-    _read_verdicts[path] = (stat.st_mtime_ns, stat.st_size, readable)
+    _read_verdicts[path] = (key, readable)
     return readable
 
 
