@@ -214,7 +214,7 @@ On Arch / Omarchy, one command does all of it: system packages, `.env`, a
 `.venv`, the Ollama daemon and its sign-in, the seat and embedding models (the
 embedding model included, by `ollama pull`), the embedding model's tokenizer, a
 SearxNG for online research, PostgreSQL with pgvector in Docker, the checks,
-and an "Ambiguity Console" entry in the app launcher. Then it proves the result
+and an "Lawdog Console" entry in the app launcher. Then it proves the result
 rather than assuming it: the embedder embeds, the database stores and finds a
 vector of the embedding model's width, git and gh
 can finish the Builder's pipeline, the console starts, and every seat answers a
@@ -287,9 +287,9 @@ pip install -e ".[dev]"
 `.venv` from the first interpreter that meets `requires-python` and installs
 the project with the Builder's tools (`.[tools]`), and it reinstalls whenever
 `pyproject.toml` no longer matches the stamp the venv was installed from
-(`.venv/.ambiguity-deps`, which `install.sh` writes too) or a declared
+(`.venv/.lawdog-deps`, which `install.sh` writes too) or a declared
 dependency is missing -- so a pull that changes the dependencies needs no
-step of its own. The log is `/tmp/ambiguity-install.log`. It does none of the
+step of its own. The log is `/tmp/lawdog-install.log`. It does none of the
 system half: Ollama, its models, PostgreSQL and SearxNG are `install.sh`'s.
 
 ### Docker-only install
@@ -332,7 +332,7 @@ docker compose up --build        # http://localhost:8081
 `pgvector/pgvector:pg18-trixie` -- the image `install.sh` runs on the host --
 on a volume of its own (`pgdata`), and the console starts only once it is
 healthy. It is published on **127.0.0.1:5433** and nowhere else
-(`AMBIGUITY_DB_PORT` moves it), which is why it can use trust authentication,
+(`LAWDOG_DB_PORT` moves it), which is why it can use trust authentication,
 and why it is not the host's `postgres18` on 5432: a console in the container
 and one on the host keep separate corpora in separate servers. Compose sets the
 console's `DATABASE_URL` to it, over whatever `.env` says.
@@ -362,10 +362,10 @@ dependencies: then `docker compose up --build`. Everything the app writes to dis
 Docker volume, and the corpus is in the stack's own database, so the container
 and a console started on the host (`./launch_console.sh`, port 8080, the host's
 `postgres18`) never share a corpus, a run snapshot or a generated project, and
-can run at once. The container is on **8081** (`AMBIGUITY_PORT` moves it). Volumes survive
+can run at once. The container is on **8081** (`LAWDOG_PORT` moves it). Volumes survive
 a rebuild; `docker compose down -v` forgets them. To hand the container a
 document, upload it through its console. It runs as uid 1000
-(`AMBIGUITY_UID`/`AMBIGUITY_GID` for any other account).
+(`LAWDOG_UID`/`LAWDOG_GID` for any other account).
 
 `git_dwell`'s remote stages -- `push` through `cleanup` -- need your own
 credentials: uncomment the `~/.gitconfig` and `~/.config/gh` mounts in
@@ -391,8 +391,8 @@ If Docker is still behind sudo (the `docker` group applies after a reboot), the
 same files work rootless with Podman:
 
 ```bash
-podman build --format docker -f dockerfile -t ambiguity-console .
-podman run --rm --network host --userns=keep-id --stop-timeout 1800 -v "$PWD":/app ambiguity-console
+podman build --format docker -f dockerfile -t lawdog-console .
+podman run --rm --network host --userns=keep-id --stop-timeout 1800 -v "$PWD":/app lawdog-console
 ```
 
 `--stop-timeout` is the same allowance: without it `podman stop` kills the
@@ -403,9 +403,9 @@ containers to a network of their own, name the database by container, and tell
 the daemon to listen past loopback.
 
 ```bash
-docker network create ambiguity-net
-docker network connect ambiguity-net postgres18
-# then, in docker-compose.yml: drop network_mode, join ambiguity-net, and set
+docker network create lawdog-net
+docker network connect lawdog-net postgres18
+# then, in docker-compose.yml: drop network_mode, join lawdog-net, and set
 #   DATABASE_URL=postgresql://postgres@postgres18:5432/postgres
 #   OLLAMA_BASE_URL=http://host.docker.internal:11434
 #   CONSOLE_HOST=0.0.0.0          # the container's own interfaces

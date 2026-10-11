@@ -120,7 +120,7 @@ system_chromium() {
 }
 
 echo "============================================"
-echo "  Ambiguity 4-Agent Console -- install"
+echo "  Lawdog 4-Agent Console -- install"
 echo "============================================"
 
 if [ "$(id -u)" -eq 0 ]; then
@@ -357,11 +357,11 @@ else
     for candidate in python3 python python3.14 python3.13 python3.12 /usr/bin/python3; do
         candidate="$(command -v "$candidate" 2>/dev/null)" || continue
         floor_ok "$candidate" || continue
-        if "$candidate" -m venv "$VENV" >/tmp/ambiguity-venv.log 2>&1; then
+        if "$candidate" -m venv "$VENV" >/tmp/lawdog-venv.log 2>&1; then
             BASE_PY="$candidate"
             break
         fi
-        echo "  $candidate could not create a venv (see /tmp/ambiguity-venv.log); trying the next interpreter"
+        echo "  $candidate could not create a venv (see /tmp/lawdog-venv.log); trying the next interpreter"
         rm -rf "$VENV"
     done
     if [ -z "$BASE_PY" ]; then
@@ -394,7 +394,7 @@ ok "langgraph-agent installed in editable mode"
 # What the venv was installed from. launch_console.sh reinstalls when
 # pyproject.toml no longer matches it, so a launch right after this one installs
 # nothing, and a pull that changes the dependencies is picked up at the next.
-sha256sum pyproject.toml | cut -d' ' -f1 >"$VENV/.ambiguity-deps"
+sha256sum pyproject.toml | cut -d' ' -f1 >"$VENV/.lawdog-deps"
 
 # pip installs what pyproject.toml asks for and never removes what it stopped
 # asking for, so a venv older than these changes still carries the packages
@@ -628,7 +628,7 @@ PY
                 problem "cuda-embed-ollama.sh is missing, and these NVIDIA cards need the CUDA 12 build it installs"
             else
                 echo "  NVIDIA cards below compute 7.5: ${gpu_fix[*]}"
-                if AMBIGUITY_ROOT="$ROOT" AMBIGUITY_VENV="$VENV" "${gpu_fix[@]}"; then
+                if LAWDOG_ROOT="$ROOT" LAWDOG_VENV="$VENV" "${gpu_fix[@]}"; then
                     ok "Ollama's CUDA 12 build holds the embedding model 100% on the GPU, 0% on the CPU"
                 elif [ "$SYSTEM" -eq 0 ]; then
                     problem "these NVIDIA cards need Ollama's CUDA 12 build, and --no-system does not install it: ./cuda-embed-ollama.sh"
@@ -650,14 +650,14 @@ step "Embedding tokenizer"
 # cuts passages with, so the first search is not also a download and a machine
 # that goes offline later still has them. The name comes from graphrag_server,
 # where the corpus and the relevance floor live too.
-if "$PY" - 2>/tmp/ambiguity-embedder.log <<'PY'
+if "$PY" - 2>/tmp/lawdog-embedder.log <<'PY'
 from langgraph_agent.graphrag_server import EMBEDDING_TOKENIZER_NAME
 from transformers import AutoTokenizer
 
 AutoTokenizer.from_pretrained(EMBEDDING_TOKENIZER_NAME)
 print(f"  ✓ {EMBEDDING_TOKENIZER_NAME} tokenizer cached")
 PY
-then :; else problem "could not fetch the embedding tokenizer; see /tmp/ambiguity-embedder.log"; fi
+then :; else problem "could not fetch the embedding tokenizer; see /tmp/lawdog-embedder.log"; fi
 
 # The corpus is not built here, and there is no step that builds one. It holds
 # researched archive data only -- pages online research fetched, documents the
@@ -797,8 +797,8 @@ if [ "$SEARXNG" -eq 1 ]; then
     # image's entrypoint otherwise chowns its config volume to its own user,
     # which under rootless podman leaves the host file owned by a subordinate
     # uid you cannot edit.
-    searxng_conf="${XDG_CONFIG_HOME:-$HOME/.config}/ambiguity/searxng"
-    searxng_unit="${XDG_CONFIG_HOME:-$HOME/.config}/containers/systemd/ambiguity-searxng.container"
+    searxng_conf="${XDG_CONFIG_HOME:-$HOME/.config}/lawdog/searxng"
+    searxng_unit="${XDG_CONFIG_HOME:-$HOME/.config}/containers/systemd/lawdog-searxng.container"
     searxng_image="docker.io/searxng/searxng:latest"
     searxng_up() { [ "$(curl -s -m 3 -o /dev/null -w '%{http_code}' "$1/healthz" || true)" = "200" ]; }
 
@@ -821,13 +821,13 @@ if [ "$SEARXNG" -eq 1 ]; then
         if [ ! -f "$searxng_conf/settings.yml" ]; then
             secret="$("$PY" -c 'import secrets; print(secrets.token_hex(32))')"
             cat >"$searxng_conf/settings.yml" <<EOF
-# Written by install.sh for the Ambiguity console's online research, and never
-# overwritten by it: edit freely, then systemctl --user restart ambiguity-searxng.
+# Written by install.sh for the Lawdog console's online research, and never
+# overwritten by it: edit freely, then systemctl --user restart lawdog-searxng.
 # Only what differs from SearxNG's own defaults is here.
 use_default_settings: true
 
 general:
-  instance_name: "Ambiguity research"
+  instance_name: "Lawdog research"
 
 server:
   secret_key: "$secret"
@@ -858,16 +858,16 @@ EOF
         # No network-online.target: a user unit cannot wait on a system target,
         # and quadlet adds its own wait (podman-user-wait-network-online).
         unit_text="$(cat <<EOF
-# Written by install.sh for the Ambiguity console's online research.
+# Written by install.sh for the Lawdog console's online research.
 [Unit]
-Description=SearxNG for the Ambiguity console's online research
+Description=SearxNG for the Lawdog console's online research
 
 [Container]
 Image=$searxng_image
-ContainerName=ambiguity-searxng
+ContainerName=lawdog-searxng
 PublishPort=127.0.0.1:$SEARXNG_PORT:8080
 Volume=$searxng_conf/settings.yml:/etc/searxng/settings.yml:ro
-Volume=ambiguity-searxng-data:/var/cache/searxng
+Volume=lawdog-searxng-data:/var/cache/searxng
 Environment=FORCE_OWNERSHIP=false
 Environment=SEARXNG_BASE_URL=$SEARXNG_LOCAL/
 
@@ -902,9 +902,9 @@ EOF
 
         systemctl --user daemon-reload || true
         if [ "$changed" -eq 1 ]; then
-            systemctl --user restart ambiguity-searxng.service || true
+            systemctl --user restart lawdog-searxng.service || true
         else
-            systemctl --user start ambiguity-searxng.service || true
+            systemctl --user start lawdog-searxng.service || true
         fi
         for _ in $(seq 1 60); do searxng_up "$SEARXNG_LOCAL" && break; sleep 1; done
 
@@ -914,7 +914,7 @@ EOF
         # routes) until it can. Three tries, spaced, and never fatal: a machine
         # that is genuinely offline is reported by the search test below.
         searxng_egress() {
-            podman exec ambiguity-searxng python3 -c \
+            podman exec lawdog-searxng python3 -c \
                 'import socket; socket.create_connection(("1.1.1.1", 443), timeout=5)' >/dev/null 2>&1
         }
         if searxng_up "$SEARXNG_LOCAL"; then
@@ -922,12 +922,12 @@ EOF
                 searxng_egress && break
                 echo "  SearxNG's container has no route out (attempt $attempt); restarting it"
                 for _ in $(seq 1 30); do ip route show default 2>/dev/null | grep -q . && break; sleep 1; done
-                systemctl --user restart ambiguity-searxng.service || true
+                systemctl --user restart lawdog-searxng.service || true
                 for _ in $(seq 1 60); do searxng_up "$SEARXNG_LOCAL" && break; sleep 1; done
                 sleep 2
             done
             searxng_egress && ok "SearxNG's container can reach the internet" \
-                || NOTES+=("SearxNG's container has no route out; is this machine online? then: systemctl --user restart ambiguity-searxng")
+                || NOTES+=("SearxNG's container has no route out; is this machine online? then: systemctl --user restart lawdog-searxng")
         fi
 
         if searxng_up "$SEARXNG_LOCAL"; then
@@ -941,11 +941,11 @@ EOF
                 export SEARXNG_URL="$SEARXNG_LOCAL"
                 ok "SEARXNG_URL=$SEARXNG_LOCAL added to .env"
             fi
-        elif ! systemctl --user is-active --quiet ambiguity-searxng.service \
+        elif ! systemctl --user is-active --quiet lawdog-searxng.service \
                 && [ -n "$(ss -ltnH "sport = :$SEARXNG_PORT" 2>/dev/null)" ]; then
             problem "port $SEARXNG_PORT is taken by another program, so SearxNG cannot bind it: set SEARXNG_PORT in .env to a free port and re-run"
         else
-            problem "SearxNG did not answer at $SEARXNG_LOCAL; see: journalctl --user -u ambiguity-searxng"
+            problem "SearxNG did not answer at $SEARXNG_LOCAL; see: journalctl --user -u lawdog-searxng"
         fi
     fi
 
@@ -1283,7 +1283,7 @@ if [ "$CHECKS" -eq 1 ]; then
         problem "no checks found under 'Run all checks' in CLAUDE.md"
     fi
     for check in "${checks[@]}"; do
-        log="/tmp/ambiguity-check-${check%% *}.log"
+        log="/tmp/lawdog-check-${check%% *}.log"
         if PATH="$VENV/bin:$PATH" bash -c "$check" >"$log" 2>&1; then
             ok "$check"
         else
@@ -1304,10 +1304,10 @@ if [ "$DESKTOP" -eq 1 ]; then
     # opens the page.
     apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
     mkdir -p "$apps"
-    cat >"$apps/ambiguity-console.desktop" <<EOF
+    cat >"$apps/lawdog-console.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=Ambiguity Console
+Name=Lawdog Console
 Comment=Architect, Planner, Researcher and Builder, in the browser
 Exec="$ROOT/launch_console.sh"
 Path=$ROOT
@@ -1316,7 +1316,7 @@ Terminal=false
 Categories=Development;
 EOF
     command -v update-desktop-database >/dev/null && update-desktop-database "$apps" 2>/dev/null || true
-    ok "\"Ambiguity Console\" added to the app launcher"
+    ok "\"Lawdog Console\" added to the app launcher"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1336,7 +1336,7 @@ step "Console"
 # keep its monitor from following a pull request a real run left pending in
 # runs/ -- reading its checks, merging it -- which it starts on as soon as it
 # is up.
-console_log=/tmp/ambiguity-console-check.log
+console_log=/tmp/lawdog-console-check.log
 console_port="$("$PY" -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
 console_runs="$(mktemp -d)"
 PORT="$console_port" REBUILD_CORPUS=0 FOLLOW_PULL_REQUESTS=0 RUNS_DIR="$console_runs" \
@@ -1582,8 +1582,8 @@ if [ "${#PROBLEMS[@]}" -gt 0 ] && [ -f scripts/diagnose_machine.py ]; then
         fi
     } >"$install_summary"
     # Only logs this run wrote: the venv's is written only when one is made.
-    logs=("$install_summary" /tmp/ambiguity-embedder.log "$console_log")
-    if [ "$CHECKS" -eq 1 ]; then logs+=(/tmp/ambiguity-check-*.log); fi
+    logs=("$install_summary" /tmp/lawdog-embedder.log "$console_log")
+    if [ "$CHECKS" -eq 1 ]; then logs+=(/tmp/lawdog-check-*.log); fi
     save_logs=()
     for log in "${logs[@]}"; do
         if [ -f "$log" ]; then save_logs+=(--save-log "$log"); fi
@@ -1600,7 +1600,7 @@ echo "============================================"
 if [ "${#PROBLEMS[@]}" -eq 0 ]; then
     echo "  Ready. Start the console with:"
     echo "    ./launch_console.sh"
-    [ "$DESKTOP" -eq 1 ] && echo "  or pick \"Ambiguity Console\" from the app launcher."
+    [ "$DESKTOP" -eq 1 ] && echo "  or pick \"Lawdog Console\" from the app launcher."
     print_notes
     echo "  To diagnose this machine later: .venv/bin/python scripts/diagnose_machine.py"
     echo "============================================"

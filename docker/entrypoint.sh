@@ -64,8 +64,8 @@ fi
 # avoid. With the host's ~/.gitconfig mounted this is skipped and the commits
 # carry the operator's own name.
 if [ -z "$(git config user.email 2>/dev/null)" ] && [ -z "${GIT_AUTHOR_EMAIL:-}" ]; then
-    export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-Ambiguity Builder}"
-    export GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-builder@ambiguity.local}"
+    export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-Lawdog Builder}"
+    export GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-builder@lawdog.local}"
     export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
     export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
 fi
@@ -150,7 +150,7 @@ fi
 # from. A pull that adds a dependency leaves a container whose code imports a
 # package its venv does not have -- a ModuleNotFoundError with nothing to say
 # that a rebuild is the fix -- so it is said here first.
-deps_stamp="${VIRTUAL_ENV:-/opt/venv}/.ambiguity-deps"
+deps_stamp="${VIRTUAL_ENV:-/opt/venv}/.lawdog-deps"
 if [ -f "$deps_stamp" ] && [ -f pyproject.toml ]; then
     if [ "$(sha256sum pyproject.toml | cut -d' ' -f1)" = "$(cat "$deps_stamp")" ]; then
         echo "  dependencies: as pyproject.toml declares them"

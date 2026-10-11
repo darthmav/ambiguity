@@ -1,6 +1,6 @@
 # 4-Agent Console — Frontend
 
-The web interface for the 4-Agent AI System, modelled on the original Ambiguity
+The web interface for the 4-Agent AI System, modelled on the original Lawdog
 console: five tabs, a crew rail, and a force-directed view of the knowledge
 graph.
 
@@ -18,7 +18,7 @@ API, so the page needs the server behind it.
 
 ```
 ┌──────────────┬──────────────────────────────────────────────────────────┐
-│ ● AMBIGUITY  │ ENGINEER GRAPH RETRIEVAL CORPUS STATE   docs · chunks ·  │
+│ ● LAWDOG     │ ENGINEER GRAPH RETRIEVAL CORPUS STATE   docs · chunks ·  │
 │   CONSOLE    │                                         nodes · edges    │
 ├──────────────┴──────────────────────────────────────────────────────────┤
 │ ⚠ degraded-seat banner (hidden when every seat can run)                  │
@@ -236,4 +236,4 @@ serve.py              # Python HTTP server + /rpc backend
 
 No npm, no bundler, no framework, no external requests — one file of plain
 HTML, CSS and vanilla JS, with the layout, spring layout and theme carried over
-from the original Ambiguity console.
+from the original Lawdog console.

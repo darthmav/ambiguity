@@ -383,7 +383,7 @@ def test_every_installer_writes_and_reads_one_dependency_stamp():
     launch right after it installs nothing; the image bakes one too, which its
     entrypoint compares. Four places agreeing on one file and one hash, or the
     launcher reinstalls on every start -- or never."""
-    stamp = ".ambiguity-deps"
+    stamp = ".lawdog-deps"
     command = "sha256sum pyproject.toml | cut -d' ' -f1"
     for name in ("launch_console.sh", "install.sh", "dockerfile", "docker/entrypoint.sh"):
         text = (ROOT / name).read_text(encoding="utf-8")

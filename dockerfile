@@ -93,7 +93,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # write on the host. Compose mounts the code, and pyproject.toml with it, from
 # the checkout, so an image older than the code can be missing a package it
 # imports; the entrypoint compares the two and says to rebuild.
-RUN sha256sum pyproject.toml | cut -d' ' -f1 >"$VIRTUAL_ENV/.ambiguity-deps"
+RUN sha256sum pyproject.toml | cut -d' ' -f1 >"$VIRTUAL_ENV/.lawdog-deps"
 
 # Debug symbols from 145 compiled extensions, and nothing reads them
 # here -- a segfault in scipy is not a thing this project debugs from inside
@@ -162,7 +162,7 @@ RUN chmod -R a+rwX "$HF_HOME"
 RUN useradd --create-home --uid 1000 --shell /bin/bash agent \
     && chmod 0777 /home/agent
 
-COPY docker/entrypoint.sh /usr/local/bin/ambiguity-entrypoint
+COPY docker/entrypoint.sh /usr/local/bin/lawdog-entrypoint
 COPY --chown=1000:1000 . /app
 
 # Every directory the app writes, created here and owned by the container's
@@ -188,5 +188,5 @@ USER 1000:1000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD ["sh", "-c", "curl -fsS \"http://127.0.0.1:${PORT}/api/status\" | grep -q '\"indexes_on_run\"' || exit 1"]
 
-ENTRYPOINT ["/usr/local/bin/ambiguity-entrypoint"]
+ENTRYPOINT ["/usr/local/bin/lawdog-entrypoint"]
 CMD ["python", "serve.py"]

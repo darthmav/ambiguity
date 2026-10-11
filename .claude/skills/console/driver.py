@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drive the Ambiguity 4-agent console without a human at the keyboard.
+"""Drive the Lawdog 4-agent console without a human at the keyboard.
 
 Stdlib only, on purpose: `up` and `doctor` have to be able to run and give a
 useful answer on a machine where `pip install -e .` has not happened yet, so
@@ -44,7 +44,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[3]
 PORT = int(os.getenv("PORT", "8080"))
 BASE = f"http://localhost:{PORT}"
-SERVER_LOG = Path(os.getenv("CONSOLE_LOG", "/tmp/ambiguity-console.log"))
+SERVER_LOG = Path(os.getenv("CONSOLE_LOG", "/tmp/lawdog-console.log"))
 
 # The venv this repo installs into. CI uses the runner's bare interpreter, but
 # on a developer box the deps live here and `python serve.py` off PATH would
@@ -180,7 +180,7 @@ def cmd_shot(args: list[str]) -> int:
     over SSH on a box with no display. For anything more than one picture --
     clicking, waiting on the page, reading its console -- use `browse`.
     """
-    out = Path(args[0] if args else "/tmp/ambiguity-console.png").resolve()
+    out = Path(args[0] if args else "/tmp/lawdog-console.png").resolve()
     browser = _chromium()
     if browser is None:
         print(f"!! no chromium at {SYSTEM_CHROMIUM} or on PATH", file=sys.stderr)
