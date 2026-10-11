@@ -158,16 +158,19 @@ is_server_ready() {
     fi
 }
 
+# The browser's own logging goes nowhere: a browser this starts inherits the
+# terminal, and Chromium's startup chatter (Vulkan on Wayland, GCM's
+# DEPRECATED_ENDPOINT) read there as the console failing.
 open_browser() {
     local url="$1"
     if command -v xdg-open &> /dev/null; then
-        xdg-open "$url" &
+        xdg-open "$url" >/dev/null 2>&1 &
     elif command -v open &> /dev/null; then
-        open "$url" &
+        open "$url" >/dev/null 2>&1 &
     elif command -v python3 &> /dev/null; then
-        python3 -c "import webbrowser; webbrowser.open('$url')" &
+        python3 -c "import webbrowser; webbrowser.open('$url')" >/dev/null 2>&1 &
     elif command -v python &> /dev/null; then
-        python -c "import webbrowser; webbrowser.open('$url')" &
+        python -c "import webbrowser; webbrowser.open('$url')" >/dev/null 2>&1 &
     else
         echo "Please open your browser manually: $url"
         return 1
