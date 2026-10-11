@@ -21,7 +21,7 @@
 # Port 5433, so it never meets the host's own postgres18 on 5432 (install.sh's,
 # which a console started on the host uses): the two corpora never mix.
 
-name: lawdog
+name: ambiguity
 
 services:
   postgres:
@@ -33,7 +33,7 @@ services:
       # over the loopback publish below.
       POSTGRES_HOST_AUTH_METHOD: trust
     ports:
-      - "127.0.0.1:${LAWDOG_DB_PORT:-5433}:5432"
+      - "127.0.0.1:${AMBIGUITY_DB_PORT:-5433}:5432"
     volumes:
       # postgres:18 keeps PGDATA under /var/lib/postgresql/18/, so the volume
       # goes on the parent, as the image documents.
@@ -54,7 +54,7 @@ services:
     build:
       context: .
       dockerfile: dockerfile
-    image: lawdog-console:latest
+    image: ambiguity-console:latest
 
     network_mode: host
 
@@ -66,8 +66,8 @@ services:
 
     # The uid that owns the checkout on the host, so a run's products are not
     # left root-owned in your working tree. 1000 is the first human account on an
-    # Arch/Omarchy install; override for any other (LAWDOG_UID=$(id -u)).
-    user: "${LAWDOG_UID:-1000}:${LAWDOG_GID:-1000}"
+    # Arch/Omarchy install; override for any other (AMBIGUITY_UID=$(id -u)).
+    user: "${AMBIGUITY_UID:-1000}:${AMBIGUITY_GID:-1000}"
 
     # The container never writes into your checkout, and nothing a host console
     # writes reaches the container: the two cannot share a corpus, a run
@@ -135,14 +135,14 @@ services:
       # sets it in both halves rather than only one. PORT is the exception.
       # Its own port, not .env's PORT: a console started on the host from the
       # same .env takes 8080, and on the host network two cannot share it.
-      PORT: "${LAWDOG_PORT:-8081}"
+      PORT: "${AMBIGUITY_PORT:-8081}"
       OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
       # The stack's own database, never .env's: that URL names the host's
       # postgres18, and this container's corpus belongs with this stack. Set
       # here, the environment wins over the .env config.py loads. The console
       # also exports it to everything it runs, so a script the Builder writes
       # finds the database here.
-      DATABASE_URL: "postgresql://postgres@127.0.0.1:${LAWDOG_DB_PORT:-5433}/postgres"
+      DATABASE_URL: "postgresql://postgres@127.0.0.1:${AMBIGUITY_DB_PORT:-5433}/postgres"
       # A GitHub token for git_dwell, when started as
       # GH_TOKEN="$(gh auth token)" docker compose up -- the way when gh keeps
       # its login in the keyring, which a ~/.config/gh mount does not carry.

@@ -388,7 +388,7 @@ def test_a_check_with_everything_refused_exits_2_before_any_browser(tmp_path, ca
     capsys.readouterr()
     assert code == 2
     results = json.loads((tmp_path / "results.json").read_text())
-    assert results["schema"] == "lawdog-browser/1"
+    assert results["schema"] == "ambiguity-browser/1"
     assert {p["name"]: p["status"] for p in results["passes"]} == {"run": "refused", "upload": "refused"}
     assert results["browser"] is None
     assert "# browser check" in (tmp_path / "report.md").read_text()

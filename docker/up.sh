@@ -38,7 +38,7 @@ fi
 # Docker directly when the socket is ours, through sudo while the docker group
 # has not applied yet (it does after a reboot). sudo resets the environment, so
 # the variables compose interpolates are named for it to keep.
-PASSED=(GH_TOKEN GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL LAWDOG_UID LAWDOG_GID)
+PASSED=(GH_TOKEN GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL AMBIGUITY_UID AMBIGUITY_GID)
 docker_cmd=(docker)
 if [ -e /var/run/docker.sock ] && [ ! -w /var/run/docker.sock ]; then
     docker_cmd=(sudo "--preserve-env=$(IFS=,; echo "${PASSED[*]}")" docker)
@@ -49,9 +49,9 @@ if [ "$DOWN" -eq 1 ]; then
     exec "${compose[@]}" stop
 fi
 
-export LAWDOG_UID LAWDOG_GID
-LAWDOG_UID="$(id -u)"
-LAWDOG_GID="$(id -g)"
+export AMBIGUITY_UID AMBIGUITY_GID
+AMBIGUITY_UID="$(id -u)"
+AMBIGUITY_GID="$(id -g)"
 
 export GH_TOKEN=""
 if command -v gh >/dev/null && gh auth status --hostname github.com >/dev/null 2>&1; then
@@ -75,7 +75,7 @@ up=(up -d)
 [ "$BUILD" -eq 1 ] && up+=(--build)
 "${compose[@]}" "${up[@]}"
 
-port="$(sed -n 's/^[[:space:]]*LAWDOG_PORT=//p' docker/.env | tail -n 1)"
+port="$(sed -n 's/^[[:space:]]*AMBIGUITY_PORT=//p' docker/.env | tail -n 1)"
 port="${port:-8081}"
 for _ in $(seq 1 60); do
     if curl -sf -m 2 "http://127.0.0.1:$port/api/status" | grep -q '"indexes_on_run"'; then

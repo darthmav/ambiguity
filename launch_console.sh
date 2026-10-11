@@ -6,7 +6,7 @@ set -e
 cd "$(dirname "$0")"
 
 echo "============================================"
-echo "  Lawdog 4-Agent Console"
+echo "  Ambiguity 4-Agent Console"
 echo "============================================"
 echo ""
 
@@ -15,7 +15,7 @@ echo ""
 fail() {
     echo "✗ $1" >&2
     if command -v notify-send >/dev/null 2>&1; then
-        notify-send -u critical "Lawdog Console" "$1" 2>/dev/null || true
+        notify-send -u critical "Ambiguity Console" "$1" 2>/dev/null || true
     fi
     exit 1
 }
@@ -27,10 +27,10 @@ fail() {
 # serve.py died on its first import. Activated, the venv is also first on PATH
 # for the Builder's own terminal commands.
 VENV=.venv
-INSTALL_LOG=/tmp/lawdog-install.log
+INSTALL_LOG=/tmp/ambiguity-install.log
 # What the venv was last installed from; install.sh writes the same stamp, so
 # the first launch after it installs nothing.
-DEPS_STAMP="$VENV/.lawdog-deps"
+DEPS_STAMP="$VENV/.ambiguity-deps"
 PY_FLOOR="$(sed -n 's/^requires-python *= *">=\([0-9][0-9.]*\)".*/\1/p' pyproject.toml)"
 PY_FLOOR="${PY_FLOOR:-3.12}"
 floor_ok() {
@@ -218,7 +218,7 @@ if command -v psql >/dev/null 2>&1; then
     fi
 fi
 
-python serve.py > /tmp/lawdog-console.log 2>&1 &
+python serve.py > /tmp/ambiguity-console.log 2>&1 &
 SERVER_PID=$!
 
 # Wait for server to be ready (generous timeout for slower CPUs)
@@ -236,7 +236,7 @@ done
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     echo ""
     echo "✗ Server failed to start. Log:"
-    cat /tmp/lawdog-console.log
+    cat /tmp/ambiguity-console.log
     exit 1
 fi
 
