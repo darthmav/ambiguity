@@ -282,7 +282,7 @@ def test_redaction_takes_out_keys_tokens_passwords_addresses_and_paths(monkeypat
         "OLLAMA_API_KEY: plainvalue",
         "postgresql://postgres:hunter2@127.0.0.1:5432/postgres",
         "mail someone.else@example.org, remote git@github.com:owner/repo.git",
-        "/home/alice/ambiguity/.env and /home/bob/x and /run/user/1000/bus",
+        "/home/alice/lawdog/.env and /home/bob/x and /run/user/1000/bus",
     ])
     counts: Counter[str] = Counter()
     cleaned = dm.redact(text, counts)
@@ -291,7 +291,7 @@ def test_redaction_takes_out_keys_tokens_passwords_addresses_and_paths(monkeypat
                    "/run/user/1000"):
         assert secret not in cleaned, secret
     assert "git@github.com:owner/repo.git" in cleaned
-    assert "~/ambiguity/.env" in cleaned and "/run/user/<uid>/bus" in cleaned
+    assert "~/lawdog/.env" in cleaned and "/run/user/<uid>/bus" in cleaned
     assert {"anthropic-key", "github-token", "huggingface-token", "bearer", "url-password",
             "email", "home", "runtime-dir", "assigned-secret"} <= set(counts)
 
@@ -444,7 +444,7 @@ def _browser_agent(calls: list[list[str]]) -> Any:
         out = Path(cmd[cmd.index("--out") + 1])
         (out / "shots").mkdir(parents=True, exist_ok=True)
         (out / "results.json").write_text(json.dumps({
-            "schema": "ambiguity-browser/1",
+            "schema": "lawdog-browser/1",
             "passes": [{"name": "tour", "status": "pass"}, {"name": "run", "status": "pass"}]}))
         (out / "report.md").write_text(f"# browser\nthe page said {PLANTED_KEY}\n")
         (out / "shots" / "tour.png").write_bytes(b"\x89PNG")
@@ -508,7 +508,7 @@ def test_a_browser_report_with_secret_shaped_text_is_still_read(tmp_path):
         out = Path(cmd[cmd.index("--out") + 1])
         out.mkdir(parents=True, exist_ok=True)
         (out / "results.json").write_text(json.dumps({
-            "schema": "ambiguity-browser/1",
+            "schema": "lawdog-browser/1",
             "passes": [{"name": "tour", "status": "pass"}, {"name": "graph", "status": "fail",
                                                             "reason": 'the page said token="abc"'}],
             "page_errors": [{"text": "API key:\nnone"}, {"text": "auth: password=hunter2"}],
@@ -605,7 +605,7 @@ def test_a_machine_with_nothing_on_it_still_gets_a_report(tmp_path):
     assert code == 1
     results = json.loads((out / "results.json").read_text())
     report = (out / "report.md").read_text()
-    assert results["schema"] == "ambiguity-diagnostics/1"
+    assert results["schema"] == "lawdog-diagnostics/1"
     assert results["verdict"] == "problems"
     assert list(results["sections"]) == [n for n in dm.SECTIONS if n != "suite"]
     assert not [n for n, s in results["sections"].items() if s["status"] == "error"]

@@ -89,7 +89,7 @@ def _make_kb(tmp_path) -> GraphRAGKnowledgeBase:
 
     for path, content in (
         ("serve.py", "The Architect rules on the plan."),
-        ("README.md", "Ambiguity console."),
+        ("README.md", "Lawdog console."),
     ):
         kb.collection.add(path, content, {"path": path, "type": "python"})
         kb.graph.add_node(path, type="document", content=content[:200], path=path)
@@ -110,7 +110,7 @@ def _make_pg_kb(tmp_path) -> GraphRAGKnowledgeBase:
     kb = GraphRAGKnowledgeBase(str(tmp_path / "knowledge"))
     for path, content in (
         ("serve.py", "The Architect rules on the plan."),
-        ("README.md", "Ambiguity console."),
+        ("README.md", "Lawdog console."),
     ):
         kb.collection.upsert(
             ids=[path],

@@ -207,7 +207,7 @@ NEVER_ALLOWED = frozenset({
 # recorder can tell the agent's refusals from the server's.
 BLOCKED_PREFIX = "refused by the browser agent:"
 
-REPORT_SCHEMA = "ambiguity-browser/1"
+REPORT_SCHEMA = "lawdog-browser/1"
 MCP_PACKAGE = "@playwright/mcp@0.0.83"
 DIAGNOSTICS = ROOT / "reports" / "diagnostics"
 MCP_OUTPUT_DIR = DIAGNOSTICS / "playwright-mcp"
@@ -2028,7 +2028,7 @@ class SpawnedConsole:
 
     def __init__(self, *, stub_seats: bool, no_rebuild: bool) -> None:
         self.stub_seats, self.no_rebuild = stub_seats, no_rebuild
-        self.workdir = Path(tempfile.mkdtemp(prefix="ambiguity-browser-agent-"))
+        self.workdir = Path(tempfile.mkdtemp(prefix="lawdog-browser-agent-"))
         (self.workdir / "frontend").symlink_to(ROOT / "frontend", target_is_directory=True)
         self.port = free_port()
         self.base = f"http://127.0.0.1:{self.port}"
@@ -2291,7 +2291,7 @@ def _notify(title: str, body: str) -> None:
     if not tool or not has_display():
         return
     with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-        subprocess.run([tool, "--app-name=ambiguity", title, body], timeout=5,
+        subprocess.run([tool, "--app-name=lawdog", title, body], timeout=5,
                        capture_output=True, stdin=subprocess.DEVNULL)
 
 
@@ -3583,7 +3583,7 @@ def mcp_check(args: argparse.Namespace) -> int:
         # The first run downloads the package, hence the long first wait.
         init = client.request("initialize", {
             "protocolVersion": "2025-06-18", "capabilities": {},
-            "clientInfo": {"name": "ambiguity-browser-agent", "version": "1"},
+            "clientInfo": {"name": "lawdog-browser-agent", "version": "1"},
         }, timeout_s=240)
         report["server"] = init.get("serverInfo")
         client.send({"jsonrpc": "2.0", "method": "notifications/initialized"})

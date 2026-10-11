@@ -9,7 +9,7 @@
 # keeps generated projects in a volume. This one mounts no code at all -- what
 # runs is what `docker/install.sh` (or `up.sh --build`) baked in -- and
 # instead mounts the folder your projects live in, so a run given project
-# `silver_surfer` works in $AMBIGUITY_PROJECTS/silver_surfer on the host.
+# `silver_surfer` works in $LAWDOG_PROJECTS/silver_surfer on the host.
 #
 # Same compose project name as the other stack, so they are one console, not
 # two: starting either replaces the other's console container, and both use
@@ -21,7 +21,7 @@
 # the ${...} below, and env_file passes it into the console, where an
 # environment variable wins over the image's own .env.
 
-name: ambiguity
+name: lawdog
 
 services:
   postgres:
@@ -31,7 +31,7 @@ services:
     environment:
       POSTGRES_HOST_AUTH_METHOD: trust
     ports:
-      - "127.0.0.1:${AMBIGUITY_DB_PORT:-5433}:5432"
+      - "127.0.0.1:${LAWDOG_DB_PORT:-5433}:5432"
     volumes:
       - pgdata:/var/lib/postgresql
     healthcheck:
@@ -62,7 +62,7 @@ services:
     build:
       context: ..
       dockerfile: dockerfile
-    image: ambiguity-console:latest
+    image: lawdog-console:latest
     # Host networking for the reason ../docker-compose.yml gives: the Ollama
     # daemon and SearxNG listen on the host's loopback only.
     network_mode: host
@@ -70,14 +70,14 @@ services:
       postgres:
         condition: service_healthy
     # Your uid, so what a run writes into your projects is yours.
-    user: "${AMBIGUITY_UID:-1000}:${AMBIGUITY_GID:-1000}"
+    user: "${LAWDOG_UID:-1000}:${LAWDOG_GID:-1000}"
     env_file:
       - path: .env
         required: true
     environment:
-      PORT: "${AMBIGUITY_PORT:-8081}"
+      PORT: "${LAWDOG_PORT:-8081}"
       OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
-      DATABASE_URL: "postgresql://postgres@127.0.0.1:${AMBIGUITY_DB_PORT:-5433}/postgres"
+      DATABASE_URL: "postgresql://postgres@127.0.0.1:${LAWDOG_DB_PORT:-5433}/postgres"
       # GitHub, as you. up.sh reads the token from gh's login on the host
       # (your keyring) at every start, so it is never written to disk here;
       # the entrypoint makes gh git's credential helper when it is set, which
@@ -92,7 +92,7 @@ services:
       # Your projects folder, read-write: every directory in it is a project
       # the console offers, and a run on one works on the real repository.
       - type: bind
-        source: "${AMBIGUITY_PROJECTS:?set AMBIGUITY_PROJECTS in docker/.env}"
+        source: "${LAWDOG_PROJECTS:?set LAWDOG_PROJECTS in docker/.env}"
         target: /app/projects
         bind:
           create_host_path: false

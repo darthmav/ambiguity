@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ambiguity console</title>
+<title>Lawdog console</title>
 <!-- No icon, said out loud: otherwise every load asks for /favicon.ico and logs a 404. -->
 <link rel="icon" href="data:,">
 <style>
@@ -354,7 +354,7 @@ pre#state-dump{font:11px/1.7 var(--mono);color:var(--ink-2);white-space:pre-wrap
 </head>
 <body>
 
-<div id="brand"><span class="pulse" id="pulse"></span><b>Ambiguity</b><span class="sub">CONSOLE</span></div>
+<div id="brand"><span class="pulse" id="pulse"></span><b>Lawdog</b><span class="sub">CONSOLE</span></div>
 
 <div id="top">
   <button class="tab" data-p="engineer">Engineer</button>
@@ -1889,7 +1889,7 @@ async function waitForExit(detail){
   // process believing it is gone.
   exitNotice("Still running",
     "The server did not exit. " + (detail || ""),
-    `Stop it from the terminal with Ctrl+C, or check <code>/tmp/ambiguity-console.log</code>.`);
+    `Stop it from the terminal with Ctrl+C, or check <code>/tmp/lawdog-console.log</code>.`);
 }
 
 async function requestExit(stopFirst){

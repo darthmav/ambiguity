@@ -1,9 +1,9 @@
 ---
 name: console
-description: Build, run, and drive the Ambiguity 4-agent console. Use when asked to start the console or web UI, run the server, take a screenshot of the console, check its self-healing state, run the tests, or interact with the running app.
+description: Build, run, and drive the Lawdog 4-agent console. Use when asked to start the console or web UI, run the server, take a screenshot of the console, check its self-healing state, run the tests, or interact with the running app.
 ---
 
-# Ambiguity 4-agent console
+# Lawdog 4-agent console
 
 A LangGraph + GraphRAG console: a `ThreadingHTTPServer` on :8080 that serves
 the SPA in `frontend/` and answers `POST /rpc` with `{method, params}`. Drive
@@ -37,7 +37,7 @@ systemctl is-active  ollama.service   # active
 
 There is no venv in a fresh checkout. On Arch / Omarchy `./install.sh` builds
 it, and `./launch_console.sh` builds it on first launch too -- and reinstalls
-whenever `pyproject.toml` no longer matches `.venv/.ambiguity-deps`, the stamp
+whenever `pyproject.toml` no longer matches `.venv/.lawdog-deps`, the stamp
 both write, or a declared dependency is missing. Nothing in the project
 touches torch or a card itself -- the embedding model is
 `qwen3-embedding:latest`, served by the local Ollama daemon, which owns its
@@ -140,7 +140,7 @@ header chip; it closes by itself once the daemon answers a trial call.
 
 Builds or refreshes `.venv` when it has to (first launch, a changed
 `pyproject.toml`, a missing dependency; the log is
-`/tmp/ambiguity-install.log`), prints seat status, starts the server, opens a
+`/tmp/lawdog-install.log`), prints seat status, starts the server, opens a
 browser at http://localhost:8080, tails the log, stops on Ctrl+C. It runs
 `python serve.py` from that venv, activated, never from whatever is first on
 PATH.
@@ -291,8 +291,8 @@ skip into a failure, as CI does.
 ## Gotchas
 
 - **A container can be "up" and healthy while running stale code.** Both
-  compose stacks serve the console on `:8081` (`AMBIGUITY_PORT`) as
-  `ambiguity-console-1` -- one at a time, since they share a project name. The
+  compose stacks serve the console on `:8081` (`LAWDOG_PORT`) as
+  `lawdog-console-1` -- one at a time, since they share a project name. The
   root `docker-compose.yml` bind-mounts the code read-only, so the *files* on
   disk are current, but the *process* only re-imports them on its own
   restart -- an hours-old container keeps running whatever
@@ -301,7 +301,7 @@ skip into a failure, as CI does.
   built from, so a pull needs `docker/up.sh --build`. `driver.py doctor`'s
   `server up` cannot tell the difference; it only checks that something
   answers `/api/status`. Confirmed this session: `rag_stats` kept reporting
-  pre-fix behavior until `docker restart ambiguity-console-1` (not
+  pre-fix behavior until `docker restart lawdog-console-1` (not
   `driver.py restart` -- see next bullet) picked up a merged code change.
 - **`driver.py up`/`down`/`restart` assume they own the process**, via a
   `subprocess.Popen` + HTTP liveness poll (`is_up()`). Against a container:
@@ -311,7 +311,7 @@ skip into a failure, as CI does.
   as a bare process -- so it *will* stop the container's main process (and
   the container with it), not just "your copy" of the server. When the
   console is containerized, restart it with `docker restart
-  ambiguity-console-1`, not `driver.py restart`.
+  lawdog-console-1`, not `driver.py restart`.
 - **An Ollama Cloud tag can be dead on arrival even if you point a seat at
   one.** Ollama retires tags outright sometimes -- `run_goal` then fails
   immediately with `status code: 410`, and
@@ -366,7 +366,7 @@ skip into a failure, as CI does.
 | `run failed: ... status code: 410` | An Ollama Cloud tag the seat points at was retired upstream. `rpc list_seats` for a `"live": true` tag, `rpc set_seat` onto it. |
 | `run failed: ... status code: 402 -- not included in your free usage` | Account has no credits for that tag. Try another from `rpc llm_options`. |
 | `driver.py rpc search_documents` errors `model "qwen3-embedding:latest" not found` | Embedder isn't pulled. `ollama pull qwen3-embedding:latest` (~4.7GB). |
-| A merged code change doesn't show up in `rag_stats`/behavior | `:8081` is a `docker compose` container running stale in-memory code, not a process `driver.py` manages. `docker ps` for `ambiguity-console-1`; if present, `docker restart ambiguity-console-1`, not `driver.py restart`. |
+| A merged code change doesn't show up in `rag_stats`/behavior | `:8081` is a `docker compose` container running stale in-memory code, not a process `driver.py` manages. `docker ps` for `lawdog-console-1`; if present, `docker restart lawdog-console-1`, not `driver.py restart`. |
 | `driver.py shot` says "no chromium at /usr/lib/chromium/chromium or on PATH" | Install chromium, or screenshot from a browser against http://localhost:8080. |
 | `browser_agent.py doctor`: "No usable sandbox" | The kernel refuses Chromium's user namespaces; doctor prints the sysctl values and the fix. Never work around it with `--no-sandbox`. |
 | `browser_agent.py` says Playwright is missing | `.venv/bin/pip install -e ".[dev,browser]"` -- the `browser` extra is not in `dev`. |
