@@ -302,6 +302,8 @@ label.go:hover{filter:brightness(1.4)}
 .project{display:block;margin-top:8px;padding:7px 10px;border-radius:6px;
   background:#4ea3ff0d;border:1px solid #4ea3ff44;font:11px/1.6 var(--mono);color:var(--ink-2)}
 .project button{margin-left:6px}
+/* Which model each seat ran: a record, so muted rather than a notice. */
+.seats-used{display:block;margin-top:8px;font:11px/1.6 var(--mono);color:var(--ink-3)}
 .splitlbl{display:flex;align-items:center;gap:5px;font:11px var(--mono);color:var(--ink-3);cursor:pointer}
 /* Bridge verdicts. The colour carries the same three-way distinction the
    backend does -- found / certified-absent / could-not-tell -- because the
@@ -2265,6 +2267,18 @@ function recoveryBlock(r){
   return parts.join("\n\n");
 }
 
+// What each seat ran, read off the run's own record rather than the cards,
+// which show what the seats hold now. A seat moved mid-run lists both models;
+// one whose turn retrieval answered was never called.
+function seatsLine(r){
+  const parts = Object.entries(r.seats || {}).map(([role, s]) => {
+    const used = (s.used || []).map(u =>
+      `${u.model}${u.stub ? " (stub)" : ""} \u00d7${u.calls}`);
+    return `${role} ${used.length ? used.join(", ") : `${s.model} (not called)`}`;
+  });
+  return parts.length ? `<span class="seats-used">Seats: ${esc(parts.join(" \u00b7 "))}</span>` : "";
+}
+
 function renderRun(r, note){
   $("#state-dump").textContent = JSON.stringify(r, null, 2);
 
@@ -2300,7 +2314,7 @@ function renderRun(r, note){
       `<div class="msg sys"><b>Run failed</b> <span class="badge bad">FAIL</span>${tag}`+
       `\n\n${esc(r.error)}\n\n${esc(recoveryBlock(r))}`+
       (r.builder_report ? `\n\nBuilder: ${esc(r.builder_report)}` : "")+
-      touched+project+
+      touched+project+seatsLine(r)+
       `</div>`;
   }else if(r.stopped){
     // A stopped run has no verdict to report -- nobody ruled -- so it is
@@ -2310,7 +2324,7 @@ function renderRun(r, note){
       (r.stop_reason ? ` ${esc(r.stop_reason)}` : "")+
       `\n\n${esc(recoveryBlock(r))}`+
       (r.builder_report ? `\n\nBuilder: ${esc(r.builder_report)}` : "")+
-      touched+project+
+      touched+project+seatsLine(r)+
       `</div>`;
   }else{
     const verdict = r.verdict || "(none)";
@@ -2319,7 +2333,7 @@ function renderRun(r, note){
       `<div class="msg sys"><b>Architect verdict:</b> <span class="badge ${cls}">${esc(verdict)}</span>${tag}`+
       (r.architecture ? `\n\n${esc(r.architecture)}` : "")+
       (r.builder_report ? `\n\nBuilder: ${esc(r.builder_report)}` : "")+
-      touched+project+
+      touched+project+seatsLine(r)+
       `</div>`;
   }
   $("#director").scrollTop = $("#director").scrollHeight;

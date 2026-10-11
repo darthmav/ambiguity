@@ -53,7 +53,7 @@ RUNTIME_PATHS = (
 # Artifacts named in prose that are written at runtime and never committed.
 RUNTIME_NAMES = frozenset({
     "knowledge_graph.json", "last_run.json", "report.md", "results.json",
-    "floor_calibration.json",
+    "floor_calibration.json", "seats.json",
 })
 
 PATH_LIKE = re.compile(
