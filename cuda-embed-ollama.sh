@@ -45,14 +45,14 @@
 #   ./cuda-embed-ollama.sh --yes         no prompts (pacman --noconfirm)
 #
 # Environment overrides:
-#   LAWDOG_ROOT      project checkout   (default: this script's directory)
-#   LAWDOG_VENV      venv to clean      (default $LAWDOG_ROOT/.venv)
+#   AMBIGUITY_ROOT   project checkout   (default: this script's directory)
+#   AMBIGUITY_VENV   venv to clean      (default $AMBIGUITY_ROOT/.venv)
 #   CONSOLE_URL      console checked for a run in flight (default http://localhost:8080)
 
 set -euo pipefail
 
-ROOT="${LAWDOG_ROOT:-$(cd "$(dirname "$0")" && pwd)}"
-VENV="${LAWDOG_VENV:-$ROOT/.venv}"
+ROOT="${AMBIGUITY_ROOT:-$(cd "$(dirname "$0")" && pwd)}"
+VENV="${AMBIGUITY_VENV:-$ROOT/.venv}"
 PY="$VENV/bin/python"
 CONSOLE_URL="${CONSOLE_URL:-http://localhost:8080}"
 OLLAMA_URL="${OLLAMA_BASE_URL:-http://localhost:11434}"
@@ -73,7 +73,7 @@ done
 say()  { printf '\n==> %s\n' "$*"; }
 die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
-[ -x "$PY" ] || die "no venv at $VENV (run ./install.sh, or set LAWDOG_VENV)"
+[ -x "$PY" ] || die "no venv at $VENV (run ./install.sh, or set AMBIGUITY_VENV)"
 [ -z "${OLLAMA_BASE_URL:-}" ] || die "OLLAMA_BASE_URL points at $OLLAMA_BASE_URL: that daemon is not this machine's to change"
 
 # --------------------------------------------------------------------------
@@ -247,7 +247,7 @@ version="$(pacman -Q ollama 2>/dev/null | awk '{print $2}' | sed -E 's/^[0-9]+:/
 [ "$(uname -m)" = x86_64 ] || die "Ollama's CUDA 12 build is only fetched for x86_64"
 build_dir="/opt/ollama/$version"
 dropin=/etc/systemd/system/ollama.service.d/cuda12.conf
-cache="${XDG_CACHE_HOME:-$HOME/.cache}/lawdog/ollama/v$version"
+cache="${XDG_CACHE_HOME:-$HOME/.cache}/ambiguity/ollama/v$version"
 release="https://github.com/ollama/ollama/releases/download/v$version"
 asset=ollama-linux-amd64.tar.zst
 dropin_text="$(printf '%s\n' \

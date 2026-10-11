@@ -65,7 +65,7 @@ from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 
-SCHEMA = "lawdog-diagnostics/1"
+SCHEMA = "ambiguity-diagnostics/1"
 
 # What a report must never carry, each with the kind the report counts it as.
 # Ordered: a provider's own key shape is named before the generic `NAME=value`
@@ -386,7 +386,7 @@ class Section:
 # holds this table to that.
 FIXES: dict[str, str] = {
     "console-down": (
-        "start it with `./launch_console.sh` (its log is /tmp/lawdog-console.log); this "
+        "start it with `./launch_console.sh` (its log is /tmp/ambiguity-console.log); this "
         "diagnostic never starts the console itself"),
     "venv-missing": "run `./install.sh`, or `./launch_console.sh`, which builds .venv on first launch",
     "low-disk": (
@@ -496,16 +496,16 @@ FIXES: dict[str, str] = {
         "the database stopped answering: `docker ps | grep postgres18`, then "
         "`docker logs postgres18`"),
     "corpus-stale": (
-        "read the [Corpus] line in /tmp/lawdog-console.log (excerpted under console-after): "
+        "read the [Corpus] line in /tmp/ambiguity-console.log (excerpted under console-after): "
         "it names each file that failed and why, usually a model load short of GPU memory"),
     "circuit-open": (
         "a circuit closes by itself once its service answers a trial call; clicking its chip "
         "in the console header lets the next call through now"),
     "searxng-json": (
         "add json under search.formats in its settings.yml, then "
-        "`systemctl --user restart lawdog-searxng`"),
+        "`systemctl --user restart ambiguity-searxng`"),
     "searxng-down": (
-        "`systemctl --user restart lawdog-searxng`, and `podman logs lawdog-searxng` says "
+        "`systemctl --user restart ambiguity-searxng`, and `podman logs ambiguity-searxng` says "
         "why it stopped; re-running `./install.sh` rewrites it"),
     "pr-checks-failed": (
         "a red check is shown, never fixed: start a run to fix it, or finish the pull request "
@@ -773,7 +773,7 @@ _GPU_FIT_MARKS = ("out of memory", "cudamalloc", "unable to allocate", "insuffic
 # --------------------------------------------------------------------------
 
 DEFAULT_BASE = "http://localhost:8080"
-DEFAULT_CONSOLE_LOG = "/tmp/lawdog-console.log"
+DEFAULT_CONSOLE_LOG = "/tmp/ambiguity-console.log"
 DEFAULT_OLLAMA = "http://localhost:11434"
 
 # The variables that take Claude Code off a claude.ai sign-in. `.env` is
@@ -792,7 +792,7 @@ PACKAGES = (
     "wl-clipboard",
 )
 MIN_FREE_GIB = 10.0
-SEARXNG_CONTAINER = "lawdog-searxng"
+SEARXNG_CONTAINER = "ambiguity-searxng"
 POSTGRES_CONTAINER = "postgres18"
 CONSOLE_READS = ("status", "rag_stats", "healing", "list_seats", "run_progress",
                  "embedding_activity", "last_run")
@@ -1945,7 +1945,7 @@ def section_searxng(ctx: Context) -> Section:
         return skipped("SEARXNG_URL is not set: online research asks DuckDuckGo directly")
     data: dict[str, Any] = {"url": url}
     problems: list[Problem] = []
-    answer = ctx.http("GET", f"{url}/search?q=lawdog&format=json", None, 15)
+    answer = ctx.http("GET", f"{url}/search?q=ambiguity&format=json", None, 15)
     data["status"] = answer.status
     if answer.status == 200:
         payload = answer.json()
@@ -2443,7 +2443,7 @@ def share_as_gist(ctx: Context, members: list[Path], say: Callable[[str], None])
         say("Nothing was uploaded.")
         return 1
     ran = ctx.cmd(["gh", "gist", "create", "--desc",
-                   f"lawdog machine diagnostic {ctx.out.name}",
+                   f"ambiguity machine diagnostic {ctx.out.name}",
                    *[str(ctx.out / f) for f in files]], 120)
     say(first_line(ran) if ran.ok else f"gh gist create failed: {first_line(ran)}")
     return 0 if ran.ok else 1
@@ -2587,7 +2587,7 @@ def diagnose(ctx: Context, names: list[str]) -> int:
         print(json.dumps(results, indent=2, default=str))
 
     # A desktop without notifications is not a problem: the outcome is ignored.
-    ctx.cmd(["notify-send", "--app-name=lawdog", "machine diagnostic finished",
+    ctx.cmd(["notify-send", "--app-name=ambiguity", "machine diagnostic finished",
              f"{results['verdict']}: {problems} problem(s)"], 5)
     if ctx.args.gist and share_as_gist(ctx, members, say) != 0 and code == 0:
         code = 1

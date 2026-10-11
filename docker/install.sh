@@ -74,7 +74,7 @@ env_set() {
 env_get() { sed -n "s/^[[:space:]]*$1=//p" "$DENV" 2>/dev/null | tail -n 1; }
 
 echo "============================================"
-echo "  Lawdog 4-Agent Console -- Docker install"
+echo "  Ambiguity 4-Agent Console -- Docker install"
 echo "============================================"
 
 if [ "$(id -u)" -eq 0 ]; then
@@ -199,12 +199,12 @@ else
 fi
 
 if [ -z "$PROJECTS_DIR" ]; then
-    PROJECTS_DIR="$(env_get LAWDOG_PROJECTS)"
+    PROJECTS_DIR="$(env_get AMBIGUITY_PROJECTS)"
     PROJECTS_DIR="${PROJECTS_DIR:-$HOME/Projects}"
 fi
 PROJECTS_DIR="$(realpath -m "${PROJECTS_DIR/#\~/$HOME}")"
 mkdir -p "$PROJECTS_DIR"
-env_set LAWDOG_PROJECTS "$PROJECTS_DIR"
+env_set AMBIGUITY_PROJECTS "$PROJECTS_DIR"
 ok "projects folder: $PROJECTS_DIR -> /app/projects in the container"
 mapfile -t repos < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -name .git -printf '%h\n' 2>/dev/null | sort)
 if [ "${#repos[@]}" -gt 0 ]; then
@@ -225,7 +225,7 @@ step "Image (built from this checkout)"
 # Built before the models are pulled: which models to pull is read from the
 # code, and the image is the only Python here.
 if "${compose[@]}" build console; then
-    ok "lawdog-console:latest built"
+    ok "ambiguity-console:latest built"
 else
     problem "the image did not build; see the docker output above"
 fi
@@ -342,7 +342,7 @@ fi
 if [ -n "$(git config --global user.name || true)" ] && [ -n "$(git config --global user.email || true)" ]; then
     ok "commits are authored as $(git config --global user.name) <$(git config --global user.email)>"
 else
-    NOTES+=("git has no global name/email, so the container commits as 'Lawdog Builder': git config --global user.name ...; git config --global user.email ...")
+    NOTES+=("git has no global name/email, so the container commits as 'Ambiguity Builder': git config --global user.name ...; git config --global user.email ...")
 fi
 
 # ---------------------------------------------------------------------------
@@ -368,7 +368,7 @@ if [ "$SEARXNG" -eq 1 ]; then
 # Written by docker/install.sh, never overwritten: edit, then ./docker/up.sh.
 use_default_settings: true
 general:
-  instance_name: "Lawdog research"
+  instance_name: "Ambiguity research"
 server:
   secret_key: "$secret"
   limiter: false

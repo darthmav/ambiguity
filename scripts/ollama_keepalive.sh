@@ -40,8 +40,8 @@ SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
 # Overridable only so the tests can write somewhere harmless.
 DROPIN="${OLLAMA_KEEPALIVE_DROPIN:-/etc/systemd/system/ollama.service.d/keep-alive.conf}"
 UNIT_DIR="${OLLAMA_WATCHDOG_UNIT_DIR:-/etc/systemd/system}"
-PROBE_BIN="${OLLAMA_WATCHDOG_BIN:-/usr/local/lib/lawdog/ollama-keepalive}"
-STATE_DIR="${OLLAMA_WATCHDOG_STATE:-/run/lawdog-ollama-watchdog}"
+PROBE_BIN="${OLLAMA_WATCHDOG_BIN:-/usr/local/lib/ambiguity/ollama-keepalive}"
+STATE_DIR="${OLLAMA_WATCHDOG_STATE:-/run/ambiguity-ollama-watchdog}"
 UPTIME_FILE="${OLLAMA_WATCHDOG_UPTIME_FILE:-/proc/uptime}"
 
 # How the watchdog judges: one ask may take this long, this many unanswered in
@@ -61,7 +61,7 @@ RestartSec=2
 RestartPreventExitStatus='
 
 WATCHDOG_SERVICE_BODY="[Unit]
-Description=Restart the Ollama daemon when it stops answering (lawdog)
+Description=Restart the Ollama daemon when it stops answering (ambiguity)
 After=ollama.service
 
 [Service]
@@ -71,7 +71,7 @@ ExecStart=$PROBE_BIN probe"
 # Every minute from three minutes after boot. A oneshot that is still asking
 # when the next tick comes is not started twice.
 WATCHDOG_TIMER_BODY='[Unit]
-Description=Ask the Ollama daemon every minute whether it still answers (lawdog)
+Description=Ask the Ollama daemon every minute whether it still answers (ambiguity)
 
 [Timer]
 OnBootSec=3min

@@ -593,7 +593,7 @@ every checkout has, so `uploads/`, `projects/` and fetched pages are out.
   read that way. Two models resident at once means something reached the daemon
   around `GPU_ARBITER`.
 - **The header reads `stale: N not indexed` right after startup** -- Read the
-  `[Corpus]` line in `/tmp/lawdog-console.log`: it names each file that
+  `[Corpus]` line in `/tmp/ambiguity-console.log`: it names each file that
   failed and why, usually a model load short of GPU memory.
 - **The header shows `ollama-daemon down`** -- the daemon stopped answering and
   its circuit opened, so calls fail at once instead of each waiting it out.
